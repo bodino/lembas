@@ -66,8 +66,11 @@ The **fallback** switch in the app header turns this off (direct only, no borrow
   settings so new sessions talk to Anthropic directly, keeps serving sessions that were
   already open, and removes itself once they're gone.
 
-**Updates** come from the pool: when its owner publishes a new build, lembas shows
-**Install latest build…** at the bottom; one click updates and relaunches.
+**Updates** come only from this repository's GitHub releases, built by GitHub Actions
+from the public source, never from a pool, so whoever runs your pool can't ship code to
+your Mac. When a new release is out, lembas shows **Install latest build…** at the
+bottom; one click updates and relaunches. Check where a download came from with
+`gh attestation verify lembas.zip --repo bodino/lembas`.
 
 ## Running a pool
 
@@ -103,7 +106,10 @@ newer to build the app.
 6. Invite friends: **Invite to Pool…** in the app copies a one-time link (valid 7 days)
    that opens the invite page described above. Nobody is added until it's used. Admins
    can also **Remove from Pool** on a person's page, which revokes their access at once.
-7. Ship an update: run `./build.sh` again. Members get it from the pool within a minute.
+7. Updates are released from this repository: bump `CFBundleShortVersionString` in
+   `resources/Info.plist`, push, then push a matching tag (`git tag v1.2.0 && git push
+   origin v1.2.0`). The release workflow builds and publishes it; members get it within
+   a minute. A pool's own `./build.sh` output is only offered to apps older than 1.2.
 
 ### What protects a public pool
 

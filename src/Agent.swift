@@ -199,7 +199,8 @@ final class Agent {
       var body = Data()
       for try await byte in bytes { body.append(byte) }
       let text = String(decoding: body, as: UTF8.self)
-      if text.range(of: "usage limit|limit reached", options: [.regularExpression, .caseInsensitive]) == nil {
+      log("429 from Anthropic: \(describeLimit(upstream, text))")
+      if !isUsageLimit(upstream, text) {
         return await sendFixed(out, upstream, body) // transient rate limit: Claude Code retries direct
       }
 
@@ -321,7 +322,30 @@ func modelName(_ body: Data) -> String? {
   return object["model"] as? String
 }
 
+// A usage limit (5-hour, weekly, …) as opposed to a short rate limit. Anthropic marks it
+// with the unified rate-limit status header, which is what Claude Code itself reads;
+// the message wording is only a fallback, since it varies between limit kinds.
+func isUsageLimit(_ response: HTTPURLResponse, _ text: String) -> Bool {
+  if response.value(forHTTPHeaderField: "anthropic-ratelimit-unified-status")?.lowercased() == "rejected" { return true }
+  return text.range(of: "usage limit|limit reached|reached your .{0,20}limit|weekly limit|5-hour limit",
+                    options: [.regularExpression, .caseInsensitive]) != nil
+}
+
+// For the log: which limit, and Anthropic's short message (never prompt content).
+func describeLimit(_ response: HTTPURLResponse, _ text: String) -> String {
+  let status = response.value(forHTTPHeaderField: "anthropic-ratelimit-unified-status") ?? "-"
+  let claim = response.value(forHTTPHeaderField: "anthropic-ratelimit-unified-representative-claim") ?? "-"
+  let message = ((try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any])
+    .flatMap { ($0["error"] as? [String: Any])?["message"] as? String } ?? String(text.prefix(120))
+  return "unified-status=\(status) claim=\(claim) message=\"\(message.prefix(160))\""
+}
+
 func retryAfterSeconds(_ response: HTTPURLResponse) -> Double? {
+  // When the limit lifts, from the unified reset header (epoch seconds) if present.
+  if let reset = response.value(forHTTPHeaderField: "anthropic-ratelimit-unified-reset").flatMap(Double.init) {
+    let seconds = reset - Date().timeIntervalSince1970
+    if seconds > 0 { return min(seconds, maxLimitSeconds) }
+  }
   guard let value = response.value(forHTTPHeaderField: "retry-after") else { return nil }
   var seconds = Double(value) ?? 0
   if seconds == 0 {

@@ -36,7 +36,7 @@ struct Config: Codable {
 // The pool rejected our token: we were removed, or left from another copy.
 struct NotAMember: Error {}
 
-// A newer build published by the pool (./build.sh writes /version.json).
+// A newer build published as a GitHub release (see .github/workflows/release.yml).
 struct AvailableUpdate {
   var version: String
   var build: Int
@@ -129,6 +129,8 @@ final class Store: ObservableObject {
   @Published var borrowedByMe5h = 0.0
   @Published var utilizationFiveHour: Double?
   @Published var utilizationSevenDay: Double?
+  @Published var lentFiveHour: Double?  // the friends' part of each window (estimate)
+  @Published var lentSevenDay: Double?
   @Published var policy = LendPolicy()
   @Published var away = false
   @Published var statusLine = "Not connected."
@@ -212,7 +214,7 @@ final class Store: ObservableObject {
     }
     setupInvite = invite
     joinError = nil
-    openPopover()
+    SetupWindow.show()
   }
 
   // The pool an invite (or pasted message) points at, to show before joining.
@@ -220,20 +222,6 @@ final class Store: ObservableObject {
     let word = setupInvite.split(whereSeparator: \.isWhitespace).last { $0.contains("/") }.map(String.init)
     guard let word, let url = URL(string: word.hasPrefix("http") ? word : "https://" + word) else { return nil }
     return url.host
-  }
-
-  // Clicks our own menu bar item so the popover opens (e.g. after an invite link).
-  func openPopover() {
-    for window in NSApp.windows where String(describing: type(of: window)).contains("StatusBarWindow") {
-      func find(_ view: NSView) -> NSStatusBarButton? {
-        if let button = view as? NSStatusBarButton { return button }
-        return view.subviews.lazy.compactMap(find).first
-      }
-      if let button = window.contentView.flatMap(find) {
-        button.performClick(nil)
-        return
-      }
-    }
   }
 
   // Joining from an invite code like "https://mac.tail1234.ts.net/abcd-efgh-…" (or a
@@ -405,6 +393,8 @@ final class Store: ObservableObject {
       if let util = user["utilization"] as? [String: Any] {
         utilizationFiveHour = number(util["fiveHour"])
         utilizationSevenDay = number(util["sevenDay"])
+        lentFiveHour = number(util["lentFiveHour"])
+        lentSevenDay = number(util["lentSevenDay"])
       } else {
         utilizationFiveHour = nil
         utilizationSevenDay = nil
@@ -631,7 +621,12 @@ final class Store: ObservableObject {
     if firstInstall { setRouted(true) } // fresh Terminal install: point Claude Code at the agent
   }
 
-  // ----- updates, published by the pool (./build.sh writes /version.json + /lembas.zip) -----
+  // ----- updates, from GitHub releases built by CI from the public source -----
+  // Never from the pool: whoever runs a pool must not be able to ship code to members.
+  // LEMBAS_UPDATES points elsewhere for testing (a folder served like a release).
+
+  static let releases = ProcessInfo.processInfo.environment["LEMBAS_UPDATES"]
+    ?? "https://github.com/bodino/lembas/releases"
 
   @Published var update: AvailableUpdate?
   @Published var updateStatus: String?
@@ -641,7 +636,8 @@ final class Store: ObservableObject {
   static let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
 
   func checkForUpdate(force: Bool = false) async {
-    // Polled about once a minute (and when the popover opens); /version.json is tiny.
+    // Polled about once a minute (and when the popover opens); version.json is tiny and
+    // served from GitHub's download CDN, not its rate-limited API.
     guard force || Date().timeIntervalSince(lastUpdateCheck) > 55 else { return }
     lastUpdateCheck = Date()
     guard let latest = await latestBuild() else { return }
@@ -656,12 +652,9 @@ final class Store: ObservableObject {
     }
   }
 
-  // Downloads the new app from the pool, checks it, then swaps it in after quitting:
-  // a small script waits for this process to exit, replaces the bundle, restarts the
-  // agent on the new binary and relaunches.
-  // What the pool is publishing right now.
+  // The latest release's version.json.
   private func latestBuild() async -> AvailableUpdate? {
-    guard let cfg = config, let url = URL(string: cleanURL(cfg.url) + "/version.json"),
+    guard let url = URL(string: Self.releases + "/latest/download/version.json"),
           let (data, response) = try? await URLSession.shared.data(from: url),
           (response as? HTTPURLResponse)?.statusCode == 200,
           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -669,19 +662,23 @@ final class Store: ObservableObject {
     return AvailableUpdate(version: obj["version"] as? String ?? "", build: build, sha256: sha)
   }
 
-  // Downloads the build the pool publishes right now. If it changes mid-download (a
-  // newer build was just published) the checksum won't match: re-read and retry once.
+  // Downloads that release's lembas.zip (by its tag, so a newer release appearing
+  // mid-download can't mix them up) and checks it against version.json.
   private func downloadVerifiedBuild() async throws -> Data {
-    guard let cfg = config, let url = URL(string: cleanURL(cfg.url) + "/lembas.zip") else { throw URLError(.badURL) }
-    for _ in 0..<2 {
-      guard let latest = await latestBuild() else { throw URLError(.cannotConnectToHost) }
-      let (file, _) = try await URLSession.shared.download(from: url)
-      let data = try Data(contentsOf: file)
-      if SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == latest.sha256 { return data }
+    guard let latest = await latestBuild() else { throw URLError(.cannotConnectToHost) }
+    guard let url = URL(string: Self.releases + "/download/v\(latest.version)/lembas.zip") else { throw URLError(.badURL) }
+    let (file, response) = try await URLSession.shared.download(from: url)
+    guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.fileDoesNotExist) }
+    let data = try Data(contentsOf: file)
+    guard SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == latest.sha256 else {
+      throw LoginError("the download didn't match the published checksum")
     }
-    throw LoginError("the download didn't match the published checksum")
+    return data
   }
 
+  // Downloads the new app, checks it, then swaps it in after quitting: a small script
+  // waits for this process to exit, replaces the bundle, restarts the agent on the new
+  // binary and relaunches.
   func installUpdate() async {
     guard update != nil else { return }
     updateStatus = "Downloading…"
@@ -917,6 +914,7 @@ enum Typography {
   static let figure = Font.system(size: 20, weight: .semibold, design: .rounded) // the two weekly totals
 }
 private let accent = Color.accentColor // follows System Settings › Appearance
+private let friendsColor = Color.orange // friends' share of your usage
 
 // The menu bar window is see-through glass, so whatever is behind it (often a light
 // wallpaper) washes the content out. A solid window background keeps text and
@@ -1117,6 +1115,7 @@ struct InputBackground: View {
 struct UsageBar: View {
   let label: String
   let percent: Double?
+  var lent: Double? = nil // the part of `percent` friends used, drawn in its own color
   var labelWidth: CGFloat = 34
   var body: some View {
     HStack(spacing: 8) {
@@ -1125,9 +1124,15 @@ struct UsageBar: View {
         .foregroundStyle(.secondary)
         .frame(width: labelWidth, alignment: .leading)
       GeometryReader { geo in
+        let total = min(max(percent ?? 0, 0), 100)
+        let friends = min(max(lent ?? 0, 0), total)
         ZStack(alignment: .leading) {
           Capsule().fill(.quaternary)
-          Capsule().fill(accent).frame(width: geo.size.width * min(max(percent ?? 0, 0), 100) / 100)
+          HStack(spacing: 0) {
+            Rectangle().fill(accent).frame(width: geo.size.width * (total - friends) / 100)
+            Rectangle().fill(friendsColor).frame(width: geo.size.width * friends / 100)
+          }
+          .clipShape(Capsule())
         }
       }
       .frame(height: 4)
@@ -1730,8 +1735,16 @@ struct MainView: View {
         .padding(.top, Spacing.section)
       // Anthropic's own live numbers for this subscription (what lending limits use).
       VStack(spacing: 8) {
-        UsageBar(label: "5h", percent: store.utilizationFiveHour)
-        UsageBar(label: "Week", percent: store.utilizationSevenDay)
+        UsageBar(label: "5h", percent: store.utilizationFiveHour, lent: store.lentFiveHour)
+        UsageBar(label: "Week", percent: store.utilizationSevenDay, lent: store.lentSevenDay)
+        HStack(spacing: 12) {
+          Label { Text("You") } icon: { Circle().fill(accent).frame(width: 7, height: 7) }
+          Label { Text("Friends") } icon: { Circle().fill(friendsColor).frame(width: 7, height: 7) }
+          Spacer()
+        }
+        .font(Typography.caption)
+        .foregroundStyle(.secondary)
+        .padding(.leading, 42)
       }
       .padding(Spacing.card)
       .background(card)
@@ -1909,6 +1922,7 @@ enum PopoverPin {
     didSet { if !pinned && closeWasIgnored { closeOnNextClickOutside() } }
   }
   private static weak var window: NSWindow?
+  static var isShowing: Bool { window?.isVisible == true }
   private static var closeWasIgnored = false
   private static var monitors: [Any] = []
 
@@ -2064,7 +2078,8 @@ struct RootView: View {
     .background(popoverBackground.ignoresSafeArea())
     .background(WindowAccessor { PopoverPin.attach($0) })
     .animation(.easeInOut(duration: 0.25), value: store.screen)
-    .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+      if !SetupWindow.owns(note.object as? NSWindow) { SetupWindow.close() } // they found the menu bar icon
       Task {
         await store.refresh()
         await store.checkForUpdate()
@@ -2095,8 +2110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       for _ in 0..<50 where store.config != nil && !store.loaded {
         try? await Task.sleep(nanoseconds: 100_000_000)
       }
-      try? await Task.sleep(nanoseconds: 300_000_000) // let the menu bar item appear
-      if [.move, .join, .setup].contains(store.screen) { store.openPopover() }
+      if [.move, .join, .setup].contains(store.screen) { SetupWindow.show() }
     }
   }
 
@@ -2106,6 +2120,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       for _ in 0..<20 where Self.store == nil { try? await Task.sleep(nanoseconds: 100_000_000) }
       urls.forEach { Self.store?.handleInviteLink($0) }
     }
+  }
+}
+
+// First run (and an invite link before joining) shows a small hint window pointing at
+// the menu bar icon: an app that only adds an icon leaves new people wondering where it
+// went. Setup itself happens in the menu bar popover. The hint closes as soon as the
+// popover opens (or with its close button).
+@MainActor
+enum SetupWindow {
+  private static var window: NSWindow?
+
+  static func show() {
+    if window == nil {
+      let made = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 270),
+                          styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+      made.titlebarAppearsTransparent = true
+      made.titleVisibility = .hidden
+      made.isReleasedWhenClosed = false
+      made.contentView = NSHostingView(rootView: MenuBarHintView().environmentObject(Store.shared))
+      made.center()
+      window = made
+    }
+    window?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  static func close() {
+    window?.close()
+    window = nil
+  }
+
+  static func owns(_ other: NSWindow?) -> Bool { other != nil && other === window }
+
+  // Our menu bar icon. macOS keeps a status-item window per display, most of them
+  // parked off screen; the real one sits on screen with a height.
+  static func statusButton() -> NSStatusBarButton? {
+    func find(_ view: NSView) -> NSStatusBarButton? {
+      if let button = view as? NSStatusBarButton { return button }
+      return view.subviews.lazy.compactMap(find).first
+    }
+    return NSApp.windows
+      .filter { String(describing: type(of: $0)).contains("StatusBarWindow") && $0.frame.height > 0 && $0.frame.minY >= 0 }
+      .lazy.compactMap { $0.contentView.flatMap(find) }.first
+  }
+
+  // Direction from the hint window to the icon, as a clockwise rotation from "right".
+  static func angleToIcon() -> Angle? {
+    guard let window, let icon = statusButton()?.window?.frame else { return nil }
+    let dx = icon.midX - window.frame.midX
+    let dy = icon.midY - window.frame.midY // screen y grows upward
+    return .radians(-atan2(dy, dx))
+  }
+}
+
+struct MenuBarHintView: View {
+  @EnvironmentObject var store: Store
+  @State private var arrow = Angle.degrees(-45) // up and to the right until we know better
+  private let placed = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect() // icon may appear late
+
+  var body: some View {
+    VStack(spacing: 0) {
+      Spacer(minLength: 12)
+      Image(nsImage: LembasLogo.tile(size: 56))
+      Text("lembas is in your menu bar")
+        .font(Typography.title)
+        .padding(.top, Spacing.section)
+      Text(store.setupInvite.isEmpty ? "Click it to join your pool." : "Click it to join — your invite is filled in.")
+        .font(Typography.body)
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+        .padding(.top, Spacing.header)
+      HStack(spacing: 8) {
+        Image(nsImage: LembasLogo.menuBar)
+        Image(systemName: "arrow.right")
+          .font(.system(size: 11, weight: .semibold))
+          .foregroundStyle(.secondary)
+          .rotationEffect(arrow) // points at the icon wherever the window is
+        Text("menu bar").font(Typography.caption).foregroundStyle(.secondary)
+      }
+      .padding(.horizontal, 12)
+      .padding(.vertical, 6)
+      .background(Capsule().fill(.quaternary))
+      .padding(.top, Spacing.section)
+      .onReceive(NotificationCenter.default.publisher(for: NSWindow.didMoveNotification)) { note in
+        if SetupWindow.owns(note.object as? NSWindow), let angle = SetupWindow.angleToIcon() { arrow = angle }
+      }
+      .onReceive(placed) { _ in
+        if let angle = SetupWindow.angleToIcon() { arrow = angle }
+      }
+      Spacer(minLength: 12)
+    }
+    .padding(.horizontal, Spacing.edge + 10)
+    .frame(width: 300, height: 270)
+    .background(popoverBackground.ignoresSafeArea())
   }
 }
 

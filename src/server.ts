@@ -165,6 +165,16 @@ async function fetchUtilization(name: string): Promise<Utilization | null> {
 
 const FIVE_HOURS_MS = 5 * 3_600_000;
 
+// The part of an owner's window utilization that friends used: utilization split by
+// estimated dollars spent in the window (own direct use is reported by the agent,
+// borrowed use is metered here). Use outside lembas (claude.ai web, desktop) isn't seen,
+// so heavy off-lembas use makes this read high rather than low.
+function lentShare(owner: string, utilization: number, resetsAt: number | null, spanMs: number): number {
+  const since = resetsAt !== null ? resetsAt - spanMs : Date.now() - spanMs;
+  const { total, borrowed } = ledger.spendSince(owner, since);
+  return total > 0 ? utilization * (borrowed / total) : 0;
+}
+
 type Availability = {
   headroom: number; // percentage points left in the 5-hour window (> 0 only if the week has room too)
   // Points left in each window, each in its own unit: a percent of a week is worth many
@@ -286,7 +296,14 @@ function parkDuration(status: number, headers: Headers, body: string): number | 
         : Math.max(0, Date.parse(retryAfter) - Date.now());
       if (ms > 0) return Math.min(ms, 6 * 60 * 60_000);
     }
-    if (/usage limit|limit reached/i.test(body)) return LIMIT_COOLDOWN_MS;
+    // A usage limit (5-hour, weekly, …): the unified status header says so reliably; the
+    // wording varies, so it's only a fallback.
+    const unified = headers.get("anthropic-ratelimit-unified-status")?.toLowerCase() === "rejected";
+    if (unified || /usage limit|limit reached|reached your .{0,20}limit|weekly limit|5-hour limit/i.test(body)) {
+      const reset = Number(headers.get("anthropic-ratelimit-unified-reset"));
+      const untilReset = Number.isFinite(reset) ? reset * 1000 - Date.now() : 0;
+      return untilReset > 0 ? Math.min(untilReset, 6 * 60 * 60_000) : LIMIT_COOLDOWN_MS;
+    }
     return null; // transient rate limit: let Claude Code retry the same token
   }
   if ((status === 400 || status === 402 || status === 403) && /credit balance/i.test(body)) {
@@ -396,7 +413,14 @@ async function status(caller: string): Promise<unknown> {
         subscriptionConnected: Boolean(ledger.oauth(name)),
         // Joined with an invite and not set up yet: going back is safe and gives it back.
         inviteReturnable: Boolean(users[name].invite),
-        utilization: usage ? { fiveHour: usage.fiveHour, sevenDay: usage.sevenDay, fiveHourResetsAt: usage.resetsAt } : null,
+        utilization: usage ? {
+          fiveHour: usage.fiveHour,
+          sevenDay: usage.sevenDay,
+          fiveHourResetsAt: usage.resetsAt,
+          // How much of each window friends used (estimate, see lentShare).
+          lentFiveHour: round1(lentShare(name, usage.fiveHour, usage.resetsAt, FIVE_HOURS_MS)),
+          lentSevenDay: round1(lentShare(name, usage.sevenDay, usage.sevenDayResetsAt, 7 * 86_400_000)),
+        } : null,
         policy: ledger.policy(name),
         presence: ledger.presence(name),
         lending,
@@ -555,8 +579,10 @@ function serveInstaller(req: http.IncomingMessage, res: http.ServerResponse, fil
     "join.sh": "text/x-shellscript; charset=utf-8",
     "login.mjs": "text/javascript; charset=utf-8",
     "agent.mjs": "text/javascript; charset=utf-8",
+    // Apps before 1.2 updated from the pool; these two let them reach 1.2, which updates
+    // from GitHub releases instead. Remove once no member runs an older app.
     "lembas.zip": "application/zip",
-    "version.json": "application/json", // the build lembas.zip holds; apps poll it for updates
+    "version.json": "application/json",
     "logo.png": "image/png", // for the invite page
   };
   if (!types[file]) return sendError(res, 404, "not_found_error", "Not found.");
@@ -707,7 +733,7 @@ function invitePage(req: http.IncomingMessage, res: http.ServerResponse, code: s
       <div class="card">
         <div class="row"><span class="step">1</span>
           <div class="text"><div>Download lembas</div><small>Unzip into Applications</small></div>
-          <a class="button" href="/lembas.zip">Download</a></div>
+          <a class="button" href="${PROJECT_URL}/releases/latest/download/lembas.zip">Download</a></div>
         <div class="row"><span class="step">2</span>
           <div class="text"><div>Join the pool</div><small>Opens lembas with your invite</small></div>
           <a class="button" href="lembas://join?invite=${encodeURIComponent(link)}">Join</a></div>

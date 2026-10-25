@@ -119,6 +119,19 @@ export class Ledger {
 
   // The reverse direction: USD `consumer` has spent on friends' tokens, keyed by owner.
   // Pass `ms` for a rolling window instead of the current ISO week.
+  // Estimated USD spent on `owner`'s subscription since `since`: everything, and the
+  // part friends borrowed. Basis for splitting the owner's usage bars.
+  spendSince(owner: string, since: number): { total: number; borrowed: number } {
+    let total = 0;
+    let borrowed = 0;
+    for (const e of this.state.usageLog) {
+      if (e.owner !== owner || e.t < since) continue;
+      total += e.usd;
+      if (e.consumer !== owner) borrowed += e.usd;
+    }
+    return { total, borrowed };
+  }
+
   borrowedByFrom(consumer: string, ms?: number, now = Date.now()): Record<string, number> {
     const since = ms === undefined ? weekStartTs(now) : now - ms;
     const by: Record<string, number> = {};

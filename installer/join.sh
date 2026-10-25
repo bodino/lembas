@@ -17,7 +17,8 @@ chmod 600 "$HOME/.config/lembas.json"
 
 echo "==> installing the lembas menu bar app"
 TMP=$(mktemp -d)
-curl -fsSL -o "$TMP/lembas.zip" "$URL/lembas.zip"
+# From the GitHub release (built from the public source), not from the pool.
+curl -fsSL -o "$TMP/lembas.zip" "https://github.com/bodino/lembas/releases/latest/download/lembas.zip"
 DEST="/Applications"
 if ! touch "$DEST/.lembas-test-write" 2>/dev/null; then
   DEST="$HOME/Applications"
@@ -31,9 +32,9 @@ open "$DEST/lembas.app"
 
 cat <<MSG
 
-done! The droplet icon is in your menu bar. lembas has set up its background agent
+done! lembas is in your menu bar. lembas has set up its background agent
 and pointed Claude Code at it; Claude Code keeps its normal claude.ai login.
 
-next: click the droplet and choose "Connect Subscription…" once.
+next: click the lembas icon and connect your subscription.
 
 MSG

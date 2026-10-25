@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds lembas.app (menu bar app + bundled agent, universal arm64 + x86_64) and
-# installer/lembas.zip, which the pool serves at /lembas.zip and releases attach.
+# installer/lembas.zip + installer/version.json. Releases are built by
+# .github/workflows/release.yml from a version tag; members update only from those.
 set -e
 cd "$(dirname "$0")"
 
@@ -44,7 +45,7 @@ codesign --force -s - "$APP/MacOS/lembas-agent"
 codesign --force -s - build/lembas.app
 rm -f installer/lembas.zip
 (cd build && zip -qry ../installer/lembas.zip lembas.app)
-# Members' apps poll this through the pool and offer "Update to …" when it changes.
+# Members' apps read this from the latest GitHub release and offer the update.
 SHA=$(shasum -a 256 installer/lembas.zip | cut -d' ' -f1)
 printf '{"version": "%s", "build": %s, "sha256": "%s"}\n' "$VERSION" "$BUILD" "$SHA" > installer/version.json
 echo "built lembas $VERSION ($BUILD): build/lembas.app, installer/lembas.zip, installer/version.json"
