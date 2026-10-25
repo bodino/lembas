@@ -28,19 +28,27 @@ enum SubscriptionLogin {
     ]
 
     let result = ResultBox()
-    let server = try await HTTPServer(port: port) { req, out in
+    let attempt = Attempt(verifier: verifier, state: state, redirectURI: redirectURI, pool: pool, poolToken: poolToken)
+    let html = [("Content-Type", "text/html; charset=utf-8")]
+    // Stays up until the subscription is connected (or we time out), so a failed attempt
+    // can be retried from the browser instead of leaving the person stuck.
+    let server = try await listen { req, out in
       guard let url = URLComponents(string: "http://localhost\(req.path)"), url.path == "/callback" else {
         return await out.send(status: 404)
       }
       let query = Dictionary((url.queryItems ?? []).map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { a, _ in a })
       do {
         guard let code = query["code"], query["state"] == state else { throw LoginError("the login was not approved") }
-        try await deposit(code: code, verifier: verifier, state: state, redirectURI: redirectURI, pool: pool, poolToken: poolToken)
-        await out.send(status: 200, headers: [("Content-Type", "text/html; charset=utf-8")], body: page(ok: true, "Subscription connected", "lembas can now lend and borrow for you. You can close this tab."))
+        try await attempt.complete(code: code)
+        await out.send(status: 200, headers: html,
+                       body: page(ok: true, "Subscription connected", "lembas can now lend and borrow for you. You can close this tab."))
         result.finish(nil)
       } catch {
-        await out.send(status: 500, headers: [("Content-Type", "text/html; charset=utf-8")], body: page(ok: false, "Couldn't connect", sentence(error.localizedDescription) + " Try again from the lembas menu."))
-        result.finish(error)
+        FileHandle.standardError.write(Data("[lembas] connecting subscription failed: \(error)\n".utf8))
+        // Retry with the tokens we already have, or sign in again if we never got any.
+        let retry = await attempt.hasTokens ? "javascript:location.reload()" : auth.url!.absoluteString
+        await out.send(status: 500, headers: html,
+                       body: page(ok: false, "Couldn't connect", sentence(error.localizedDescription), retry: retry))
       }
     }
     defer { server.stop() }
@@ -48,36 +56,75 @@ enum SubscriptionLogin {
     try await result.wait(timeout: 600)
   }
 
-  private static func deposit(code: String, verifier: String, state: String, redirectURI: String,
-                              pool: String, poolToken: String) async throws {
-    var exchange = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
-    exchange.httpMethod = "POST"
-    exchange.setValue("application/json", forHTTPHeaderField: "content-type")
-    exchange.httpBody = try JSONSerialization.data(withJSONObject: [
-      "grant_type": "authorization_code", "code": code, "redirect_uri": redirectURI,
-      "client_id": clientID, "code_verifier": verifier, "state": state,
-    ])
-    let (data, _) = try await URLSession.shared.data(for: exchange)
-    let tokens = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-    guard let access = tokens["access_token"] as? String, let refresh = tokens["refresh_token"] as? String else {
-      throw LoginError("Anthropic did not return tokens")
-    }
-    let expiresIn = (tokens["expires_in"] as? NSNumber)?.doubleValue ?? 3600
+  // One login: Anthropic's code can be exchanged only once, so the tokens are kept and
+  // only the hand-off to the pool is retried. Serialized, because browsers sometimes
+  // load the callback twice; once connected, later loads just succeed.
+  private actor Attempt {
+    let verifier: String, state: String, redirectURI: String, pool: String, poolToken: String
+    private var tokens: (access: String, refresh: String, expiresAt: Int)?
+    private var done = false
 
-    var put = URLRequest(url: URL(string: pool + "/pool/tokens")!)
-    put.httpMethod = "PUT"
-    put.setValue("application/json", forHTTPHeaderField: "content-type")
-    put.setValue("Bearer \(poolToken)", forHTTPHeaderField: "authorization")
-    put.httpBody = try JSONSerialization.data(withJSONObject: [
-      "accessToken": access, "refreshToken": refresh,
-      "expiresAt": Int((Date().timeIntervalSince1970 + expiresIn) * 1000),
-    ])
-    let (_, response) = try await URLSession.shared.data(for: put)
-    guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw LoginError("the pool rejected the tokens") }
+    init(verifier: String, state: String, redirectURI: String, pool: String, poolToken: String) {
+      (self.verifier, self.state, self.redirectURI, self.pool, self.poolToken) = (verifier, state, redirectURI, pool, poolToken)
+    }
+
+    var hasTokens: Bool { tokens != nil }
+
+    func complete(code: String) async throws {
+      if done { return }
+      if tokens == nil { tokens = try await exchange(code: code) }
+      try await deposit(tokens!)
+      done = true
+    }
+
+    private func exchange(code: String) async throws -> (String, String, Int) {
+      var request = URLRequest(url: URL(string: "https://platform.claude.com/v1/oauth/token")!)
+      request.httpMethod = "POST"
+      request.setValue("application/json", forHTTPHeaderField: "content-type")
+      request.httpBody = try JSONSerialization.data(withJSONObject: [
+        "grant_type": "authorization_code", "code": code, "redirect_uri": redirectURI,
+        "client_id": SubscriptionLogin.clientID, "code_verifier": verifier, "state": state,
+      ])
+      let (data, _) = try await URLSession.shared.data(for: request)
+      let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+      guard let access = body["access_token"] as? String, let refresh = body["refresh_token"] as? String else {
+        throw LoginError("Anthropic didn't accept the login")
+      }
+      let expiresIn = (body["expires_in"] as? NSNumber)?.doubleValue ?? 3600
+      return (access, refresh, Int((Date().timeIntervalSince1970 + expiresIn) * 1000))
+    }
+
+    private func deposit(_ tokens: (access: String, refresh: String, expiresAt: Int)) async throws {
+      var put = URLRequest(url: URL(string: pool + "/pool/tokens")!)
+      put.httpMethod = "PUT"
+      put.timeoutInterval = 15
+      put.setValue("application/json", forHTTPHeaderField: "content-type")
+      put.setValue("Bearer \(poolToken)", forHTTPHeaderField: "authorization")
+      put.httpBody = try JSONSerialization.data(withJSONObject: [
+        "accessToken": tokens.access, "refreshToken": tokens.refresh, "expiresAt": tokens.expiresAt,
+      ])
+      do {
+        let (_, response) = try await URLSession.shared.data(for: put)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw LoginError("the pool didn't accept the login") }
+      } catch let error as URLError {
+        throw LoginError("couldn't reach the pool (\(error.localizedDescription))")
+      }
+    }
   }
 
+
   // Same look as the menu bar app: system blue accent, neutral card, light and dark.
-  private static func page(ok: Bool, _ title: String, _ message: String) -> Data {
+  // A cancelled attempt (Retry) may still be releasing the port; give it a moment.
+  private static func listen(_ handler: @escaping HTTPServer.Handler) async throws -> HTTPServer {
+    for attempt in 1...10 {
+      do { return try await HTTPServer(port: port, handler: handler) } catch where attempt < 10 {
+        try await Task.sleep(nanoseconds: 200_000_000)
+      }
+    }
+    throw LoginError("the login port is busy")
+  }
+
+  private static func page(ok: Bool, _ title: String, _ message: String, retry: String? = nil) -> Data {
     func escape(_ text: String) -> String {
       text.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
     }
@@ -106,13 +153,16 @@ enum SubscriptionLogin {
         .status { width: 56px; height: 56px; margin: 28px auto 16px; border-radius: 50%; display: grid; place-items: center;
                   background: linear-gradient(color-mix(in srgb, var(--status) 85%, #fff), var(--status)); }
         h1 { font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
-        p { margin-top: 6px; color: var(--muted); }
+        p { margin-top: 6px; color: var(--muted); min-height: 2.9em; }
+        .button { display: block; margin-top: 18px; padding: 8px 14px; border-radius: 8px; background: var(--accent);
+                  color: #fff; font-weight: 500; text-decoration: none; }
       </style></head>
       <body><main class="card">
         <div class="brand"><img class="badge" alt="" src="data:image/png;base64,\(badge)">lembas</div>
         <div class="status"><svg width="36" height="36" viewBox="0 0 24 24">\(icon)</svg></div>
         <h1>\(escape(title))</h1>
         <p>\(escape(message))</p>
+        \(retry.map { #"<a class="button" href="\#($0.replacingOccurrences(of: "\"", with: "&quot;"))">Try again</a>"# } ?? "")
       </main></body></html>
       """.utf8)
   }
@@ -157,17 +207,22 @@ private final class ResultBox {
 
   func wait(timeout: TimeInterval) async throws {
     Task {
-      try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-      finish(LoginError("timed out waiting for the browser"))
+      try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+      finish(LoginError("timed out waiting for the browser")) // no-op if already finished
     }
-    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-      let done = lock.withLock { () -> Error?? in
-        if outcome == nil { waiter = cont }
-        return outcome
+    // Cancelling the task (Retry in the app) ends the wait, which stops the callback server.
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        let done = lock.withLock { () -> Error?? in
+          if outcome == nil { waiter = cont }
+          return outcome
+        }
+        if let done {
+          if let error = done { cont.resume(throwing: error) } else { cont.resume() }
+        }
       }
-      if let done {
-        if let error = done { cont.resume(throwing: error) } else { cont.resume() }
-      }
+    } onCancel: {
+      finish(CancellationError())
     }
   }
 }

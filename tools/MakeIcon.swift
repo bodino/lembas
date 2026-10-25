@@ -1,4 +1,5 @@
-// Writes the app icon set from src/Logo.swift. Usage: make-icon <out.iconset>
+// Writes the app icon set from src/Logo.swift, plus the small logo the pool's invite
+// page shows. Usage: make-icon <out.iconset> <logo.png>
 import AppKit
 
 @main
@@ -12,5 +13,6 @@ struct MakeIcon {
         try LembasLogo.appIconPNG(pixels: points * scale)!.write(to: out.appendingPathComponent(name))
       }
     }
+    try LembasLogo.tilePNG(pixels: 88)!.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
   }
 }

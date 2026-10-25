@@ -19,9 +19,10 @@ day, your unused capacity can help them.
   after a stretch without it (or as soon as you flip the **Away** switch). While you're
   away, the friends you picked can borrow; while you work, only those you allow "even
   while I'm working" can, up to a level you set.
-- **Your limits are exact.** Friends borrow until your 5-hour window reaches 90% and
-  never past 60% of your week (both adjustable), checked against Anthropic's own live
-  usage numbers. If they can't be read, nobody borrows.
+- **On by default, with safe limits.** Everyone in a pool can borrow from everyone
+  while they're away — until your 5-hour window reaches 70%, and never past 60% of your
+  week. Limits are checked against Anthropic's own live usage numbers; if they can't be
+  read, nobody borrows. Turn people off or adjust the limits in the app.
 - **Prompts stay home.** In the normal path only `{model, estimated USD}` leaves your
   Mac. Only borrowed requests pass through the pool.
 
@@ -30,29 +31,52 @@ The pieces:
 | Piece | Runs on | What it does |
 |---|---|---|
 | **lembas.app** | every member's Mac | Menu bar app: join with an invite code, connect your subscription, set who you lend to. |
-| **lembas-agent** | every member's Mac (inside the app, run by launchd) | Local proxy on `127.0.0.1:8788` that Claude Code talks to: direct to Anthropic, pool only on usage limits. |
+| **lembas-agent** | every member's Mac (a launchd job, run from `~/Library/Application Support/lembas`) | Local proxy on `127.0.0.1:8788` that Claude Code talks to: direct to Anthropic, pool only on usage limits. |
 | **pool** (`src/server.ts`) | one Mac in the group | Holds members' subscription access, decides who can lend right now, relays borrowed requests. |
 
 ## Joining a pool
 
-1. Download **lembas.zip** from the [latest release](../../releases/latest), unzip it,
-   and move **lembas.app** to Applications.
-2. Open it. The app isn't notarized by Apple, so the first time macOS blocks it: open
-   **System Settings › Privacy & Security** and click **Open Anyway**.
-3. Click the parcel in the menu bar, paste the invite code a friend sent you, and click
-   **Join**. Then approve the claude.ai login that opens in your browser.
+You need macOS 26 or later. Open the invite link a friend sent you — it's a page on
+their pool with two buttons:
+
+1. **Download** lembas, unzip it, and open it. The app isn't notarized by Apple, so the
+   first time macOS blocks it: open **System Settings › Privacy & Security** and click
+   **Open Anyway**. If you opened it from Downloads, lembas offers to move itself to
+   Applications first — it needs a permanent home to update itself.
+2. **Join** opens lembas with the invite filled in (or paste the link into lembas).
+   Then finish the short setup checklist: connect your subscription (approve the
+   claude.ai login in your browser; **Retry** if you closed the tab) and choose whether
+   lembas opens at login. Wrong invite? **Use a different invite** goes back, and the
+   invite stays valid until you've connected.
+
+You can also download lembas from the [latest release](../../releases/latest).
 
 That's it — no Terminal, no Tailscale, no Node. lembas installs its agent (a launchd
 job, `com.lembas.agent`) and sets only `ANTHROPIC_BASE_URL=http://127.0.0.1:8788` in
 Claude Code's settings, so Claude Code keeps its own login, connectors and `/usage`.
 The **fallback** switch in the app header turns this off (direct only, no borrowing).
 
+**Claude Code always keeps working:**
+
+- With the app closed — the agent runs on its own.
+- When the pool is unreachable (its Mac asleep, or its owner on another VPN) — requests
+  go straight to Anthropic; only borrowing pauses.
+- After **Leave Pool** (⚙ menu), after being removed by an admin, or after deleting
+  lembas.app — the agent stops using the pool, takes itself out of Claude Code's
+  settings so new sessions talk to Anthropic directly, keeps serving sessions that were
+  already open, and removes itself once they're gone.
+
+**Updates** come from the pool: when its owner publishes a new build, lembas shows
+**Install latest build…** at the bottom; one click updates and relaunches.
+
 ## Running a pool
 
 One person runs the pool on a Mac that's usually awake. Requirements: Node ≥ 22.18
-(the server has no npm dependencies) and Tailscale.
+(the server has no npm dependencies), Tailscale, and Xcode with the macOS 26 SDK or
+newer to build the app.
 
-1. Clone this repo and build the app (the pool serves it to joiners):
+1. Clone this repo and build the app (the pool serves it to joiners and offers each new
+   build to members as an update):
    ```sh
    ./build.sh
    ```
@@ -76,16 +100,20 @@ One person runs the pool on a Mac that's usually awake. Requirements: Node ≥ 2
    curl -fsSL http://127.0.0.1:8787/join.sh | sh -s -- https://your-mac.your-tailnet.ts.net pool-…
    ```
    — then choose **Connect Subscription…** in the app.
-6. Invite friends: **Invite to Pool…** in the app gives a one-time code (valid 7 days)
-   with a ready-to-send message. Nobody is added until the code is used. Admins can
-   also **Remove from Pool** on a person's page, which revokes their access at once.
+6. Invite friends: **Invite to Pool…** in the app copies a one-time link (valid 7 days)
+   that opens the invite page described above. Nobody is added until it's used. Admins
+   can also **Remove from Pool** on a person's page, which revokes their access at once.
+7. Ship an update: run `./build.sh` again. Members get it from the pool within a minute.
 
 ### What protects a public pool
 
-- Every route except `/pool/redeem`, `/join.sh` and `/lembas.zip` needs a pool token
-  (192 random bits). Invite codes are 16 characters (~79 bits) and single-use.
+- Every route except the invite page, `/pool/redeem`, `/join.sh`, `/lembas.zip`,
+  `/version.json` and `/logo.png` needs a pool token (192 random bits). Invite codes
+  are 16 characters (~79 bits) and single-use; the invite page only displays, it never
+  joins anyone.
 - 10 failed tokens or codes from one client block it for 10 minutes; 30 failed codes
-  across everyone pause redemption for 10 minutes. Unauthenticated bodies are capped.
+  across everyone pause redemption for 10 minutes. Valid tokens are never blocked.
+  Unauthenticated bodies are capped.
 - The pool listens only on your Tailscale IP and, for Funnel, on `127.0.0.1`.
 - Keep 2FA on your Tailscale account: it controls the Funnel.
 
@@ -95,10 +123,10 @@ One person runs the pool on a Mac that's usually awake. Requirements: Node ≥ 2
   use, or when you flip the switch; your next own request turns it off. The pool sees
   your activity through the usage your agent reports, so this works with the laptop
   closed.
-- **Per person** (their page in the app): *When I'm away* and *While I'm working*
-  (until your 5-hour window reaches the level you set).
+- **Per person** (their page in the app): *When I'm away* (on by default) and *While
+  I'm working* (until your 5-hour window reaches the level you set).
 - **Your limits** (*Lending limits*): while away, friends borrow until your 5-hour
-  window reaches `away5h` (default 90%). Nobody borrows past `week` (default 60%) of
+  window reaches `away5h` (default 70%). Nobody borrows past `week` (default 60%) of
   your 7-day window. Unused 5-hour capacity is lost at reset anyway; the week limit is
   the real protection.
 - **Pick order:** the lender with the most room under their limits goes first.
@@ -118,12 +146,16 @@ PUT /pool/share     {"policy":{"away5h":90,"week":60,"awayAfterMinutes":30},
 PUT /pool/presence  {"away":true}
 ```
 
-Either part of `/pool/share` may be sent alone; `lendTo` replaces the whole map.
+Either part of `/pool/share` may be sent alone. `lendTo` replaces the whole map; anyone
+omitted gets the default (may borrow while you're away), so send `{"away": false}` to
+turn someone off.
 
 ## Building from source
 
-`./build.sh` compiles the app and agent (universal arm64 + x86_64, macOS 13+), draws
-the app icon, signs ad hoc, and writes `installer/lembas.zip`. Sources:
+`./build.sh` compiles the app and agent (universal arm64 + x86_64, macOS 26+) with the
+first toolchain that has a macOS 26+ SDK (the active one, else `/Applications/Xcode.app`),
+draws the app icon, signs ad hoc, and writes `installer/lembas.zip` plus
+`installer/version.json` (the update members are offered). Sources:
 
 - `src/PoolBar.swift` — the menu bar app
 - `src/Agent.swift` — the local agent
@@ -139,6 +171,9 @@ so such members never lend).
 
 ## Notes
 
+- `LEMBAS_PROFILE=<name>` runs a second member side by side on one Mac (own config,
+  agent on port 8789, Claude Code settings in `~/.claude-<name>`) — handy for testing
+  invites. `LEMBAS_APPEARANCE=light|dark` forces an appearance.
 - The pool never rewrites request bodies; it swaps the auth header and adds the OAuth
   beta flags Anthropic requires. Requests must look like Claude Code's, so other
   clients pointed at the pool may be rejected.

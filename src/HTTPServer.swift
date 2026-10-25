@@ -18,7 +18,8 @@ enum HTTPError: Error {
   case closed, tooLarge, malformed
 }
 
-final class HTTPResponder {
+// Shared between the connection's callbacks and the handler; its state is behind `lock`.
+final class HTTPResponder: @unchecked Sendable {
   private let connection: NWConnection
   private let lock = NSLock()
   private var _closed = false

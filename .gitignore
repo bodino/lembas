@@ -7,6 +7,8 @@ state.json.tmp
 # Build output (published as GitHub release assets instead).
 build/
 installer/lembas.zip
+installer/version.json
+installer/logo.png
 
 node_modules/
 .DS_Store

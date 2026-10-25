@@ -26,7 +26,7 @@ enum LembasLogo {
       ctx.setFillColor(rgb(0xF3E9D6))
       ctx.fillPath()
       ctx.restoreGState()
-      if pixels <= 64 { drawSmallTile(ctx, in: tile) } else { drawTile(ctx, in: tile) }
+      drawSmallTile(ctx, in: tile) // the green tile at every size, matching the badge and menu bar
     }
   }
 

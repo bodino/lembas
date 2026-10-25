@@ -30,7 +30,11 @@ export type LendRule = { away: boolean; working5h: number };
 // `week`: never lend past this percentage of the 7-day window, away or not.
 // `awayAfterMinutes`: count as away after this long without own Claude Code use.
 export type LendPolicy = { away5h: number; week: number; awayAfterMinutes: number };
-export const DEFAULT_POLICY: LendPolicy = { away5h: 90, week: 60, awayAfterMinutes: 30 };
+export const DEFAULT_POLICY: LendPolicy = { away5h: 70, week: 60, awayAfterMinutes: 30 };
+
+// Pools start generous: everyone may borrow from everyone while they're away, within
+// the default limits above. Turning someone off is stored as an explicit rule.
+export const DEFAULT_RULE: LendRule = { away: true, working5h: 0 };
 
 export type Presence = { away: boolean; manual: boolean; since: number | null };
 
@@ -55,8 +59,8 @@ export class Ledger {
     this.pruneLog();
   }
 
-  lendRule(owner: string, consumer: string): LendRule | undefined {
-    return this.state.lends[owner]?.[consumer];
+  lendRule(owner: string, consumer: string): LendRule {
+    return this.state.lends[owner]?.[consumer] ?? DEFAULT_RULE;
   }
 
   lendRules(owner: string): Record<string, LendRule> {

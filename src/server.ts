@@ -8,6 +8,9 @@ import { UsageTap } from "./usageTap.ts";
 type User = {
   token: string; // what this person puts in Claude Code to talk to the pool
   claudeToken: string; // their sk-ant-oat01-... from `claude setup-token`, carries their Pro/Max subscription
+  // The invite they joined with, kept until they connect a subscription: leaving before
+  // that (going back during setup) makes the code valid again.
+  invite?: { code: string; by?: string; expiresAt: number };
 };
 
 type Config = {
@@ -25,7 +28,7 @@ type Config = {
   // When set, invite codes use it and the pool also listens on 127.0.0.1 for Funnel.
   publicUrl?: string;
   // One-time invite codes, redeemed by the menu bar app for that member's pool token.
-  invites?: Record<string, { name: string; expiresAt: number }>;
+  invites?: Record<string, { name: string; by?: string; expiresAt: number }>;
   users: Record<string, User>;
 };
 
@@ -164,6 +167,7 @@ const FIVE_HOURS_MS = 5 * 3_600_000;
 
 type Availability = {
   headroom: number; // percentage points left before the tighter limit
+  limitedBy?: "5h" | "week"; // which window that headroom is measured in
   reason: "away" | "working" | "off" | "unconnected" | "parked" | "unknown" | "full";
 };
 
@@ -173,13 +177,16 @@ async function availability(owner: string, consumer: string): Promise<Availabili
   const rule = ledger.lendRule(owner, consumer);
   const away = ledger.presence(owner).away;
   const policy = ledger.policy(owner);
-  const ceiling5h = Math.max(rule?.away && away ? policy.away5h : 0, rule?.working5h ?? 0);
+  const ceiling5h = Math.max(rule.away && away ? policy.away5h : 0, rule.working5h);
   if (ceiling5h <= 0) return { headroom: 0, reason: "off" };
   const usage = await fetchUtilization(owner);
   if (!usage) return { headroom: 0, reason: "unknown" };
-  const headroom = Math.min(ceiling5h - usage.fiveHour, policy.week - usage.sevenDay);
+  // What they allow minus what's used, in whichever window runs out first.
+  const left5h = ceiling5h - usage.fiveHour;
+  const leftWeek = policy.week - usage.sevenDay;
+  const headroom = Math.min(left5h, leftWeek);
   if (headroom <= 0) return { headroom: 0, reason: "full" };
-  return { headroom, reason: away ? "away" : "working" };
+  return { headroom, limitedBy: leftWeek < left5h ? "week" : "5h", reason: away ? "away" : "working" };
 }
 
 // Own token first; then whoever is sharing with the most headroom left.
@@ -374,14 +381,16 @@ async function status(caller: string): Promise<unknown> {
         if (consumer === name) continue;
         const rule = ledger.lendRule(name, consumer);
         lending[consumer] = {
-          away: rule?.away ?? false,
-          working5h: rule?.working5h ?? 0,
+          away: rule.away,
+          working5h: rule.working5h,
           borrowedThisWeekUsd: round(weekBy[consumer] ?? 0),
         };
       }
       const borrowedBy = ledger.borrowedByFrom(name);
       out[name] = {
         subscriptionConnected: Boolean(ledger.oauth(name)),
+        // Joined with an invite and not set up yet: going back is safe and gives it back.
+        inviteReturnable: Boolean(users[name].invite),
         utilization: usage ? { fiveHour: usage.fiveHour, sevenDay: usage.sevenDay, fiveHourResetsAt: usage.resetsAt } : null,
         policy: ledger.policy(name),
         presence: ledger.presence(name),
@@ -400,10 +409,11 @@ async function status(caller: string): Promise<unknown> {
     } else {
       // The caller's view of each other member: can I borrow from them right now, and
       // why (not). Their own per-person choices for others are not exposed.
-      const { headroom, reason } = await availability(name, caller);
+      const { headroom, reason, limitedBy } = await availability(name, caller);
       borrowingFrom[name] = {
         reason,
         availablePoints: round1(headroom),
+        limitedBy: limitedBy ?? null,
         away: ledger.presence(name).away,
         subscriptionConnected: Boolean(ledger.oauth(name)),
       };
@@ -427,7 +437,8 @@ const isPercent = (value: unknown): value is number =>
 
 // PUT /pool/share {"policy": {"away5h": 90, "week": 60, "awayAfterMinutes": 30},
 //                  "lendTo": {"max": {"away": true, "working5h": 40}}}
-// Either part may be sent alone. lendTo replaces the whole map: anyone omitted is off.
+// Either part may be sent alone. lendTo replaces the whole map; anyone omitted falls back
+// to the default (may borrow while you're away), so send {"away": false} to turn someone off.
 async function setShare(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { policy?: unknown; lendTo?: unknown };
   try {
@@ -463,13 +474,15 @@ async function setShare(req: http.IncomingMessage, res: http.ServerResponse, cal
       if (typeof rule !== "object" || rule === null || typeof rule.away !== "boolean" || !isPercent(rule.working5h)) {
         return sendError(res, 400, "invalid_request_error", `lendTo.${consumer} must be {"away": true|false, "working5h": 0–100}.`);
       }
-      if (rule.away || rule.working5h > 0) rules[consumer] = { away: rule.away, working5h: rule.working5h };
+      rules[consumer] = { away: rule.away, working5h: rule.working5h };
     }
   }
 
   if (newPolicy) ledger.setPolicy(caller, newPolicy);
   if (rules) ledger.setLendRules(caller, rules);
-  const who = Object.entries(ledger.lendRules(caller))
+  const who = Object.keys(users).filter((name) => name !== caller)
+    .map((name) => [name, ledger.lendRule(caller, name)] as const)
+    .filter(([, r]) => r.away || r.working5h > 0)
     .map(([name, r]) => `${name} (${[r.away && "away", r.working5h > 0 && `working ≤${r.working5h}%`].filter(Boolean).join(", ")})`)
     .join(", ") || "nobody";
   const pol = ledger.policy(caller);
@@ -537,6 +550,8 @@ function serveInstaller(req: http.IncomingMessage, res: http.ServerResponse, fil
     "login.mjs": "text/javascript; charset=utf-8",
     "agent.mjs": "text/javascript; charset=utf-8",
     "lembas.zip": "application/zip",
+    "version.json": "application/json", // the build lembas.zip holds; apps poll it for updates
+    "logo.png": "image/png", // for the invite page
   };
   if (!types[file]) return sendError(res, 404, "not_found_error", "Not found.");
   try {
@@ -562,6 +577,10 @@ async function setTokens(req: http.IncomingMessage, res: http.ServerResponse, ca
   let exp = typeof expiresAt === "number" ? expiresAt : Date.now() + 3_600_000;
   if (exp < 1e12) exp *= 1000; // seconds -> ms
   ledger.setOAuth(caller, { accessToken, refreshToken, expiresAt: exp });
+  if (users[caller].invite) {
+    delete users[caller].invite; // set up for real: their invite is used up
+    saveConfig();
+  }
   usageCache.delete(caller);
   console.log(`[pool] ${caller} connected their subscription (OAuth tokens stored)`);
   sendJson(res, 200, { ok: true });
@@ -647,11 +666,105 @@ async function invite(req: http.IncomingMessage, res: http.ServerResponse, calle
   // Drop expired invites, and any older invite for the same name: the newest code wins.
   config.invites = Object.fromEntries(Object.entries(config.invites ?? {}).filter(([, i]) => i.expiresAt > now && i.name !== name));
   const code = newInviteCode();
-  config.invites[code] = { name, expiresAt: now + INVITE_TTL_MS };
+  config.invites[code] = { name, by: caller, expiresAt: now + INVITE_TTL_MS };
   saveConfig();
   console.log(`[pool] ${caller} invited ${name}`);
-  const base = (config.publicUrl ?? `http://${host}:${port}`).replace(/\/$/, "");
-  sendJson(res, 200, { name, invite: `${base}/${code}`, expiresAt: now + INVITE_TTL_MS });
+  sendJson(res, 200, { name, invite: `${poolBase()}/${code}`, expiresAt: now + INVITE_TTL_MS });
+}
+
+function poolBase(): string {
+  return (config.publicUrl ?? `http://${host}:${port}`).replace(/\/$/, "");
+}
+
+// Where lembas lives; the invite page links here for people who'd rather download a release.
+const PROJECT_URL = "https://github.com/bodino/lembas";
+
+const INVITE_PATH = /^\/([a-z0-9]{4}(?:-[a-z0-9]{4}){3})$/;
+
+// GET /<invite code>: the link people receive. A read-only landing page — download
+// the app, then hand the code to it. Nothing is redeemed here; looking up wrong codes
+// counts toward the same lockout as guessing them.
+function invitePage(req: http.IncomingMessage, res: http.ServerResponse, code: string): void {
+  const client = clientId(req);
+  const invite = config.invites?.[code];
+  const valid = !isBlocked(client) && invite && invite.expiresAt > Date.now() && !users[invite.name];
+  if (!valid) recordFailure(client);
+  const pretty = (name: string) => name.charAt(0).toUpperCase() + name.slice(1);
+  const link = `${poolBase()}/${code}`;
+  // Names are limited to [a-z0-9_-] and the code to [a-z0-9-], so nothing here needs escaping.
+  const envelope = `<path d="M4 9.5 12 4l8 5.5v8.5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"/><path d="m4.5 10 7.5 5 7.5-5" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"/>`;
+  const alert = `<path d="M12 7v6M12 16.5v.5" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>`;
+  const body = valid
+    ? `<div class="hero"><div class="icon"><svg viewBox="0 0 24 24" width="22" height="22">${envelope}</svg></div>
+        <h1>${invite.by ? `${pretty(invite.by)} invited you` : "You're invited"}</h1>
+        <p>to their lembas pool</p></div>
+      <div class="card">
+        <div class="row"><span class="step">1</span>
+          <div class="text"><div>Download lembas</div><small>Unzip into Applications</small></div>
+          <a class="button" href="/lembas.zip">Download</a></div>
+        <div class="row"><span class="step">2</span>
+          <div class="text"><div>Join the pool</div><small>Opens lembas with your invite</small></div>
+          <a class="button" href="lembas://join?invite=${encodeURIComponent(link)}">Join</a></div>
+      </div>
+      <small class="note">First launch: System Settings › Privacy &amp; Security › Open Anyway.</small>
+      <small class="label">Or paste into lembas</small>
+      <div class="field"><code id="code">${link}</code>
+        <button onclick="navigator.clipboard.writeText(document.getElementById('code').textContent);this.textContent='Copied'">Copy</button></div>`
+    : `<div class="hero"><div class="icon warn"><svg viewBox="0 0 24 24" width="22" height="22">${alert}</svg></div>
+        <h1>This invite isn't valid anymore</h1><p>Ask for a new one.</p></div>`;
+  res.writeHead(valid ? 200 : 404, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+  // Mirrors the app: 320 pt panel, the 13/12/11 type scale, system accent, quaternary
+  // fills, checklist rows with small buttons, and the app's input field.
+  res.end(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join lembas</title>
+<style>
+  :root { --page: #ececec; --panel: #ffffff; --fill: rgba(0,0,0,.035); --line: rgba(0,0,0,.1);
+          --field: #ffffff; --text: #1d1d1f; --muted: rgba(0,0,0,.5); --accent: #007aff; --warn: #ff9500;
+          color-scheme: light dark; }
+  @media (prefers-color-scheme: dark) {
+    :root { --page: #161616; --panel: #242424; --fill: rgba(255,255,255,.05); --line: rgba(255,255,255,.1);
+            --field: #1e1e1e; --text: #f5f5f7; --muted: rgba(255,255,255,.55); --accent: #0a84ff; }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: var(--page);
+         color: var(--text); font: 12px/1.35 -apple-system, BlinkMacSystemFont, sans-serif;
+         -webkit-font-smoothing: antialiased; }
+  main { width: 320px; padding: 10px 14px 18px; background: var(--panel); border: 1px solid var(--line);
+         border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,.18); }
+  header { display: flex; align-items: center; gap: 10px; font: 600 13px -apple-system, sans-serif; }
+  header img { width: 28px; height: 28px; }
+  .hero { text-align: center; margin: 24px 0 20px; }
+  .icon { width: 48px; height: 48px; margin: 0 auto 12px; border-radius: 50%; background: var(--accent);
+          display: grid; place-items: center; }
+  .icon.warn { background: var(--warn); }
+  h1 { font: 600 13px -apple-system, sans-serif; }
+  .hero p { margin-top: 6px; color: var(--muted); }
+  .card { background: var(--fill); border-radius: 10px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
+  .row + .row { border-top: 1px solid var(--line); margin-left: 44px; padding-left: 0; }
+  .row + .row .step { margin-left: -32px; }
+  .step { flex: none; width: 22px; height: 22px; border-radius: 50%; border: 1.5px solid var(--line);
+          color: var(--muted); font-size: 11px; font-weight: 600; display: grid; place-items: center; }
+  .text { flex: 1; }
+  small { display: block; font-size: 11px; color: var(--muted); }
+  .button { flex: none; padding: 3px 10px; border-radius: 6px; background: var(--accent); color: #fff;
+            font-size: 12px; text-decoration: none; }
+  .note { margin: 10px 2px 0; }
+  .label { margin: 18px 2px 6px; }
+  .field { display: flex; align-items: center; gap: 8px; padding: 7px 7px 7px 12px; border-radius: 8px;
+           background: var(--field); border: 1px solid var(--line); }
+  .field code { flex: 1; min-width: 0; font: 11px ui-monospace, Menlo, monospace; overflow-wrap: anywhere; }
+  .field button { flex: none; border: 1px solid var(--line); border-radius: 6px; padding: 2px 9px;
+                  background: var(--fill); color: var(--text); font: 12px -apple-system, sans-serif; cursor: pointer; }
+  footer { margin-top: 18px; text-align: center; }
+  footer a { color: var(--accent); text-decoration: none; font-size: 11px; }
+</style></head>
+<body><main>
+  <header><img src="/logo.png" alt="">lembas</header>
+  ${body}
+  <footer><a href="${PROJECT_URL}">Also on GitHub</a></footer>
+</main></body></html>`);
 }
 
 // Unauthenticated by design: the invite code is the credential. It works once.
@@ -675,34 +788,71 @@ async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return sendError(res, 404, "not_found_error", "This invite code is not valid. Ask for a new one.");
   }
   const token = `pool-${randomBytes(24).toString("hex")}`;
-  users[invite.name] = { token, claudeToken: `PASTE-${invite.name}-sk-ant-oat01-HERE` };
+  users[invite.name] = {
+    token,
+    claudeToken: `PASTE-${invite.name}-sk-ant-oat01-HERE`,
+    invite: { code: key, by: invite.by, expiresAt: invite.expiresAt },
+  };
   delete config.invites![key];
   saveConfig();
   console.log(`[pool] ${invite.name} joined with their invite`);
   sendJson(res, 200, { name: invite.name, token });
 }
 
+// Takes a member out of the pool: their pool token stops working immediately, and
+// their subscription access (OAuth tokens), lending settings and presence are deleted.
+function forgetMember(name: string): void {
+  delete users[name];
+  if (config.admins) config.admins = config.admins.filter((admin) => admin !== name);
+  saveConfig();
+  ledger.removeMember(name);
+  usageCache.delete(name);
+}
+
 async function removeMember(res: http.ServerResponse, caller: string, name: string): Promise<void> {
   if (!isAdmin(caller)) return sendError(res, 403, "permission_error", "Only pool admins can remove people.");
   if (name === caller) return sendError(res, 400, "invalid_request_error", "You can't remove yourself.");
   if (!users[name]) return sendError(res, 404, "not_found_error", `${name} is not in the pool.`);
-  delete users[name]; // their pool token stops working immediately
-  saveConfig();
-  ledger.removeMember(name);
-  usageCache.delete(name);
+  forgetMember(name);
   console.log(`[pool] ${caller} removed ${name}`);
   sendJson(res, 200, { ok: true });
 }
 
+// POST /pool/leave — a member leaves on their own. The last admin can't, so a pool
+// always keeps someone who can invite and remove people.
+async function leavePool(res: http.ServerResponse, caller: string): Promise<void> {
+  const otherAdmins = (config.admins ?? []).filter((admin) => admin !== caller && users[admin]);
+  if (isAdmin(caller) && otherAdmins.length === 0) {
+    return sendError(res, 400, "invalid_request_error", "You're this pool's only admin, so you can't leave it.");
+  }
+  // Leaving during setup (never connected) gives the invite back, so the same link works
+  // again; once they've connected, it stays used.
+  const pending = users[caller].invite;
+  const connected = Boolean(ledger.oauth(caller));
+  forgetMember(caller);
+  if (pending && pending.expiresAt > Date.now() && !connected) {
+    (config.invites ??= {})[pending.code] = { name: caller, by: pending.by, expiresAt: pending.expiresAt };
+    saveConfig();
+    console.log(`[pool] ${caller} went back during setup; their invite works again`);
+  } else {
+    console.log(`[pool] ${caller} left the pool (their subscription access was deleted)`);
+  }
+  sendJson(res, 200, { ok: true });
+}
+
 const server = http.createServer(async (req, res) => {
-  if (req.method === "GET" && (req.url === "/join.sh" || req.url === "/lembas.zip")) {
+  if (req.method === "GET" && ["/join.sh", "/lembas.zip", "/version.json", "/logo.png"].includes(req.url ?? "")) {
     return serveInstaller(req, res, req.url!.slice(1));
   }
   if (req.method === "POST" && req.url === "/pool/redeem") return await redeem(req, res);
-  const client = clientId(req);
-  if (isBlocked(client)) return sendError(res, 429, "rate_limit_error", "Too many failed attempts. Try again in a few minutes.");
+  const inviteCode = req.method === "GET" ? req.url?.match(INVITE_PATH)?.[1] : undefined;
+  if (inviteCode) return invitePage(req, res, inviteCode);
+  // Valid tokens always get through: the block only stops guessing, and members often
+  // share an address (a home network, or this Mac reaching itself over the tailnet).
   const caller = authenticate(req);
   if (!caller) {
+    const client = clientId(req);
+    if (isBlocked(client)) return sendError(res, 429, "rate_limit_error", "Too many failed attempts. Try again in a few minutes.");
     recordFailure(client);
     return sendError(res, 401, "authentication_error", "Unknown pool token.");
   }
@@ -715,6 +865,7 @@ const server = http.createServer(async (req, res) => {
     if (req.url === "/pool/report" && req.method === "PUT") return await reportDirectUsage(req, res, caller);
     if (req.url === "/pool/limit" && req.method === "PUT") return await reportDirectLimit(req, res, caller);
     if (req.url === "/pool/invite" && req.method === "POST") return await invite(req, res, caller);
+    if (req.url === "/pool/leave" && req.method === "POST") return await leavePool(res, caller);
     const member = req.url?.match(/^\/pool\/members\/([a-z][a-z0-9_-]{0,31})$/);
     if (member && req.method === "DELETE") return await removeMember(res, caller, member[1]);
     // /v1/* are the model calls; /api/* covers Claude Code's own usage display.
