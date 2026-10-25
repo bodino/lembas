@@ -1,0 +1,12 @@
+# Secrets and live data of a running pool: never commit these.
+config.json
+state.json
+state.json.tmp
+*.log
+
+# Build output (published as GitHub release assets instead).
+build/
+installer/lembas.zip
+
+node_modules/
+.DS_Store

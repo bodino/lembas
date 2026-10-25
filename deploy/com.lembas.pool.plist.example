@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Runs the pool at login and restarts it on crash.
+     Copy to ~/Library/LaunchAgents/com.lembas.pool.plist, replace /PATH/TO/lembas
+     (and the node path if yours differs: `which node`), then:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lembas.pool.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.lembas.pool</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>src/server.ts</string>
+  </array>
+  <key>WorkingDirectory</key><string>/PATH/TO/lembas</string>
+  <key>EnvironmentVariables</key><dict><key>POOL_CONFIG</key><string>config.json</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/PATH/TO/lembas/pool.log</string>
+  <key>StandardErrorPath</key><string>/PATH/TO/lembas/pool.log</string>
+</dict>
+</plist>

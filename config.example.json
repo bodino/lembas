@@ -1,0 +1,12 @@
+{
+  "port": 8787,
+  "host": "100.x.y.z",
+  "publicUrl": "https://your-mac.your-tailnet.ts.net",
+  "admins": ["alice"],
+  "users": {
+    "alice": {
+      "token": "pool-REPLACE-WITH-OUTPUT-OF-openssl-rand-hex-24",
+      "claudeToken": "unused-once-you-connect-your-subscription-in-the-app"
+    }
+  }
+}

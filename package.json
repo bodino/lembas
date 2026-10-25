@@ -1,0 +1,17 @@
+{
+  "name": "lembas",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Friends back up each other's Claude subscriptions: borrow when you hit your limit, lend when you're away.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/server.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0"
+  },
+  "license": "MIT"
+}
