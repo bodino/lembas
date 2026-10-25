@@ -72,17 +72,20 @@ struct LendPolicy: Equatable {
 // Whether I can borrow from someone right now, and why (not).
 struct BorrowSource: Identifiable {
   var name: String
-  var reason: String // away | working | off | unconnected | parked | unknown | full
-  var availablePoints: Double // percentage points left: what they allow minus what's used
-  var limitedByWeek = false   // the week limit is tighter than the 5-hour one
+  var reason: String // away | working | off | unconnected | parked | unknown | full | weekFull
+  var availablePoints: Double
+  // Points left in each window, each in its own unit (never compared: a percent of a
+  // week isn't a percent of a 5-hour window). Shown as two bars on the person's page.
+  var left5h: Double?
+  var leftWeek: Double?
   var id: String { name }
   var displayName: String { prettyName(name) }
   var available: Bool { reason == "away" || reason == "working" }
 
   var chip: String {
     switch reason {
-    case "away", "working": return "\(Int(availablePoints))% left"
-    case "full": return "Full"
+    case "away", "working": return "\(Int(availablePoints))% left" // of their 5-hour window
+    case "full", "weekFull": return "Full"
     case "parked": return "Paused"
     case "unconnected": return "Not set up"
     case "unknown": return "—"
@@ -90,13 +93,12 @@ struct BorrowSource: Identifiable {
     }
   }
 
-  private var window: String { limitedByWeek ? "week" : "5-hour window" }
-
   var explanation: String {
     switch reason {
-    case "away": return "Away · \(Int(availablePoints))% of their \(window) left"
-    case "working": return "Working · \(Int(availablePoints))% of their \(window) left"
-    case "full": return "At their limit"
+    case "away": return "Away"
+    case "working": return "Working · lending to you"
+    case "full": return "At their 5-hour limit"
+    case "weekFull": return "At their weekly limit"
     case "parked": return "Hit their own limit"
     case "unconnected": return "Not set up yet"
     case "unknown": return "Usage unavailable"
@@ -432,7 +434,8 @@ final class Store: ObservableObject {
         borrowSources = borrowing.map { name, row in
           BorrowSource(name: name, reason: row["reason"] as? String ?? "off",
                        availablePoints: number(row["availablePoints"]),
-                       limitedByWeek: row["limitedBy"] as? String == "week")
+                       left5h: (row["left5h"] as? NSNumber)?.doubleValue,
+                       leftWeek: (row["leftWeek"] as? NSNumber)?.doubleValue)
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
       } else {
         borrowSources = []
@@ -1110,6 +1113,33 @@ struct InputBackground: View {
   }
 }
 
+// Read-only counterpart of PercentSlider (same label, track and value columns).
+struct UsageBar: View {
+  let label: String
+  let percent: Double?
+  var labelWidth: CGFloat = 34
+  var body: some View {
+    HStack(spacing: 8) {
+      Text(label)
+        .font(Typography.caption)
+        .foregroundStyle(.secondary)
+        .frame(width: labelWidth, alignment: .leading)
+      GeometryReader { geo in
+        ZStack(alignment: .leading) {
+          Capsule().fill(.quaternary)
+          Capsule().fill(accent).frame(width: geo.size.width * min(max(percent ?? 0, 0), 100) / 100)
+        }
+      }
+      .frame(height: 4)
+      Text(percent.map { "\(Int($0))%" } ?? "—")
+        .font(Typography.caption)
+        .monospacedDigit()
+        .frame(width: 34, alignment: .trailing)
+    }
+    .animation(.easeInOut(duration: 0.3), value: percent)
+  }
+}
+
 struct SwitchRow: View {
   let title: String
   @Binding var isOn: Bool
@@ -1216,6 +1246,10 @@ struct PersonDetail: View {
           .font(Typography.caption)
           .foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
+        // What's left to borrow in each window: borrowing stops at whichever runs out first.
+        if let source, source.available {
+          UsageBar(label: "5h left", percent: source.left5h, labelWidth: 56)
+        }
       }
       .padding(Spacing.card)
       .frame(maxWidth: .infinity, alignment: .leading)
@@ -1691,7 +1725,17 @@ struct MainView: View {
         WeekTile(title: "Lent", icon: "arrow.up.right", value: store.borrowedWeekTotal)
         WeekTile(title: "Borrowed", icon: "arrow.down.left", value: store.borrowedByMeWeekTotal)
       }
-      .padding(.horizontal, inset)
+      .padding(.horizontal, Spacing.edge)
+      SectionHeader(title: "Your usage")
+        .padding(.top, Spacing.section)
+      // Anthropic's own live numbers for this subscription (what lending limits use).
+      VStack(spacing: 8) {
+        UsageBar(label: "5h", percent: store.utilizationFiveHour)
+        UsageBar(label: "Week", percent: store.utilizationSevenDay)
+      }
+      .padding(Spacing.card)
+      .background(card)
+      .padding(.horizontal, Spacing.edge)
       if !store.lendingMembers.isEmpty || store.canInvite {
         SectionHeader(title: "People")
           .padding(.top, Spacing.section)

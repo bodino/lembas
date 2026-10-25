@@ -129,7 +129,10 @@ newer to build the app.
   window reaches `away5h` (default 70%). Nobody borrows past `week` (default 60%) of
   your 7-day window. Unused 5-hour capacity is lost at reset anyway; the week limit is
   the real protection.
-- **Pick order:** the lender with the most room under their limits goes first.
+- **Pick order:** the lender with the most 5-hour room goes first. The week is a gate:
+  once someone's week reaches their limit they can't lend, whatever their 5-hour room.
+  The app shows each lender's 5-hour room ("41% left"); a percent of a week and a percent
+  of a 5-hour window aren't comparable, so they're never mixed.
 - Usage is read at most once a minute (Anthropic rate-limits that endpoint), so a
   borrower can overshoot a limit by what they use within that minute.
 - Dollar amounts in the app are API-price estimates, a fairness indicator only.

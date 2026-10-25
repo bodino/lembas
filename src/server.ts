@@ -166,9 +166,13 @@ async function fetchUtilization(name: string): Promise<Utilization | null> {
 const FIVE_HOURS_MS = 5 * 3_600_000;
 
 type Availability = {
-  headroom: number; // percentage points left before the tighter limit
-  limitedBy?: "5h" | "week"; // which window that headroom is measured in
-  reason: "away" | "working" | "off" | "unconnected" | "parked" | "unknown" | "full";
+  headroom: number; // percentage points left in the 5-hour window (> 0 only if the week has room too)
+  // Points left in each window, each in its own unit: a percent of a week is worth many
+  // percents of a 5-hour window, by a ratio Anthropic doesn't publish, so the two are
+  // never compared — borrowing just needs room in both.
+  left5h?: number;
+  leftWeek?: number;
+  reason: "away" | "working" | "off" | "unconnected" | "parked" | "unknown" | "full" | "weekFull";
 };
 
 async function availability(owner: string, consumer: string): Promise<Availability> {
@@ -181,12 +185,13 @@ async function availability(owner: string, consumer: string): Promise<Availabili
   if (ceiling5h <= 0) return { headroom: 0, reason: "off" };
   const usage = await fetchUtilization(owner);
   if (!usage) return { headroom: 0, reason: "unknown" };
-  // What they allow minus what's used, in whichever window runs out first.
+  // What they allow minus what's used, per window. Room in both is required.
   const left5h = ceiling5h - usage.fiveHour;
   const leftWeek = policy.week - usage.sevenDay;
-  const headroom = Math.min(left5h, leftWeek);
-  if (headroom <= 0) return { headroom: 0, reason: "full" };
-  return { headroom, limitedBy: leftWeek < left5h ? "week" : "5h", reason: away ? "away" : "working" };
+  // The week is a gate: once it's used up they can't lend, whatever the 5-hour room.
+  if (leftWeek <= 0) return { headroom: 0, reason: "weekFull" };
+  if (left5h <= 0) return { headroom: 0, reason: "full" };
+  return { headroom: left5h, left5h, leftWeek, reason: away ? "away" : "working" };
 }
 
 // Own token first; then whoever is sharing with the most headroom left.
@@ -409,11 +414,12 @@ async function status(caller: string): Promise<unknown> {
     } else {
       // The caller's view of each other member: can I borrow from them right now, and
       // why (not). Their own per-person choices for others are not exposed.
-      const { headroom, reason, limitedBy } = await availability(name, caller);
+      const { headroom, reason, left5h, leftWeek } = await availability(name, caller);
       borrowingFrom[name] = {
         reason,
         availablePoints: round1(headroom),
-        limitedBy: limitedBy ?? null,
+        left5h: left5h === undefined ? null : round1(Math.max(0, left5h)),
+        leftWeek: leftWeek === undefined ? null : round1(Math.max(0, leftWeek)),
         away: ledger.presence(name).away,
         subscriptionConnected: Boolean(ledger.oauth(name)),
       };

@@ -1,6 +1,6 @@
 {
   "name": "lembas",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Friends back up each other's Claude subscriptions: borrow when you hit your limit, lend when you're away.",
   "type": "module",
