@@ -55,8 +55,14 @@ let session: URLSession = {
   return URLSession(configuration: config)
 }()
 
+private let logClock: ISO8601DateFormatter = {
+  let f = ISO8601DateFormatter()
+  f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+  return f
+}()
+
 func log(_ message: String) {
-  FileHandle.standardError.write(Data("[agent] \(message)\n".utf8))
+  FileHandle.standardError.write(Data("\(logClock.string(from: Date())) [agent] \(message)\n".utf8))
 }
 
 actor DirectLock {
@@ -218,7 +224,7 @@ final class Agent {
       }
       await sendFixed(out, upstream, body) // pool down/no donors: preserve Anthropic's own error
     } catch {
-      log("\(error.localizedDescription)")
+      log("direct request to Anthropic failed (\(req.method) \(req.path)): \(error.localizedDescription)")
       if !out.closed {
         await out.sendJSON(status: 502, ["type": "error", "error": ["type": "api_error", "message": "lembas agent could not reach Anthropic."]])
       }

@@ -1103,7 +1103,14 @@ const server = http.createServer(async (req, res) => {
     if (req.url?.startsWith("/v1/") || req.url?.startsWith("/api/")) return await proxy(req, res, caller);
     sendError(res, 404, "not_found_error", "Not found.");
   } catch (err) {
-    if ((err as Error).name === "AbortError") return; // client went away mid-stream
+    const e = err as Error & { code?: string };
+    if (e.name === "AbortError") return; // client went away mid-stream
+    if (e.code === "ECONNRESET" || e.message === "aborted") {
+      // The client dropped the request while we were reading it (Claude Code
+      // cancelled); nothing of ours went wrong.
+      console.log(`[pool] a client dropped its request mid-upload`);
+      return;
+    }
     console.error(err);
     if (!res.headersSent) sendError(res, 502, "api_error", "Pool server could not reach Anthropic.");
     else res.end();
