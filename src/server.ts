@@ -51,7 +51,8 @@ const ledger = new Ledger(config.statePath ?? "state.json");
 // pauses borrowing rather than falling back to the relay the pool can read.
 const MPC_HELPER = config.mpc?.helper ?? new URL("../build/lembas-mpc", import.meta.url).pathname;
 // A borrower's share of the handshake plus a body up to the helper's 64 MB limit.
-const MPC_MAX_FROM_BORROWER = 96 << 20;
+// Over a whole session; the helper bounds each request on its own.
+const MPC_MAX_FROM_BORROWER = 8 * 1024 * 1024 * 1024;
 const UPSTREAM_URL = new URL(UPSTREAM);
 function mpcAvailable(): boolean {
   try {
@@ -474,28 +475,26 @@ async function status(caller: string): Promise<unknown> {
   return out;
 }
 
-// ---------- private borrowing: the spliced token record, over a WebSocket ----------
+// ---------- private borrowing: a session of spliced token records, over a WebSocket ----------
 //
-// The agent connects here when its "Private borrowing" switch is on. One connection
-// is one attempt on one donor: the pool names the donor in a text frame, then bridges
-// binary frames to `lembas-mpc pool --stdio`, which relays the agent's TLS session to
-// Anthropic and inserts the one record carrying the donor's token; it can read nothing
-// else (docs/mpc-tls.md). Because the pool cannot
-// see Anthropic's answer, the agent ends with a text frame saying what happened:
-// usage to meter, or a usage limit to park the donor. That is a trust the pool
-// extends to the borrower; today's relay reads it off the response instead.
+// The agent connects here when its "Private borrowing" switch is on and keeps the
+// connection for as long as it has requests: one session, many TLS connections to
+// Anthropic, one spliced token record per request. The pool bridges binary frames to
+// `lembas-mpc pool --stdio`, which relays the agent's TLS bytes and writes the token
+// records, and can read nothing else (docs/mpc-tls.md). The helper asks for a token
+// per request over fd 3, and a lender is picked here each time. Because the pool
+// cannot see Anthropic's answers, the agent reports each request's outcome in a text
+// frame, naming the request number the helper gave it: usage to meter, or a usage
+// limit to park that lender. That is a trust the pool extends to the borrower.
 
-async function borrowPrivately(ws: WebSocketConnection, caller: string, url: URL): Promise<void> {
+let nextLease = 1;
+
+async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: URL): Promise<void> {
   const fail = (code: string, message: string) => {
     ws.send(JSON.stringify({ type: "error", code, message }));
     ws.close(1000);
   };
   if (!mpcAvailable()) return fail("unsupported", "This pool has no MPC helper, so it can't lend privately.");
-  const exclude = new Set((url.searchParams.get("exclude") ?? "").split(",").filter(Boolean));
-  const order = (await tokenOrder(caller)).filter((name) => name !== caller && !exclude.has(name));
-  if (order.length === 0) return fail("no_capacity", "Nobody in the pool has shared capacity to spare right now.");
-  const owner = order[0];
-  const bearer = await anthropicToken(owner);
 
   const child = spawn(
     MPC_HELPER,
@@ -504,43 +503,86 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, url: URL
       "--server", `${UPSTREAM_URL.hostname}:${UPSTREAM_URL.port || 443}`,
       "--server-name", config.mpc?.serverName ?? UPSTREAM_URL.hostname,
       "--roots", config.mpc?.roots ?? "mozilla",
+      "--control-fd", "3",
     ],
-    // The token reaches the helper through its environment and nowhere else.
-    { env: { LEMBAS_TOKEN: bearer, RUST_LOG: process.env.RUST_LOG ?? "warn" }, stdio: ["pipe", "pipe", "pipe"] },
+    // Tokens reach the helper over fd 3, one per request, and nowhere else.
+    { env: { RUST_LOG: process.env.RUST_LOG ?? "warn" }, stdio: ["pipe", "pipe", "pipe", "pipe"] },
   );
+  const control = child.stdio[3] as import("node:stream").Duplex;
   const started = Date.now();
-  let reported = false;
-  let exited = false;
+  const leases = new Map<number, { owner: string; at: number }>();
   let fromBorrower = 0;
+  let requests = 0;
   const finish = () => {
     if (!ws.closed) ws.close(1000);
   };
+  const controlSend = (message: object) => {
+    if (control.writable) control.write(JSON.stringify(message) + "\n");
+  };
   child.on("error", (err) => fail("helper", `The pool's MPC helper could not start: ${err.message}`));
   child.stdin.on("error", () => {}); // EPIPE once the helper has exited
+  control.on("error", () => {});
   child.stderr.on("data", (chunk: Buffer) => {
-    for (const line of chunk.toString().split("\n")) if (line.trim()) console.log(`[mpc ${owner}→${caller}] ${line.trim()}`);
+    for (const line of chunk.toString().split("\n")) if (line.trim()) console.log(`[mpc ${caller}] ${line.trim()}`);
   });
-  // The bridge, with backpressure both ways: the garbled circuit is a few MB.
+
+  // A lender for each request, as the helper asks.
+  const leaseToken = async (id: number) => {
+    try {
+      const order = (await tokenOrder(caller)).filter((name) => name !== caller);
+      if (order.length === 0) return controlSend({ type: "refuse", id, reason: "no_capacity" });
+      const owner = order[0];
+      const token = await anthropicToken(owner);
+      const req = nextLease++;
+      leases.set(req, { owner, at: Date.now() });
+      requests++;
+      controlSend({ type: "token", id, token, req });
+    } catch (err) {
+      controlSend({ type: "refuse", id, reason: `lender lookup failed: ${(err as Error).message}` });
+    }
+  };
+  let controlBuffer = "";
+  control.on("data", (chunk: Buffer) => {
+    controlBuffer += chunk.toString();
+    let nl: number;
+    while ((nl = controlBuffer.indexOf("\n")) >= 0) {
+      const line = controlBuffer.slice(0, nl).trim();
+      controlBuffer = controlBuffer.slice(nl + 1);
+      if (!line) continue;
+      let message: { type?: unknown; id?: unknown; req?: unknown };
+      try {
+        message = JSON.parse(line);
+      } catch {
+        console.log(`[pool] ${caller}'s helper sent a malformed control line`);
+        continue;
+      }
+      if (message.type === "need_token" && typeof message.id === "number") void leaseToken(message.id);
+      else if (message.type === "spliced" && typeof message.req === "number") {
+        const lease = leases.get(message.req);
+        if (lease) console.log(`[pool] ${caller} borrows ${lease.owner}'s token privately (request ${message.req})`);
+      }
+    }
+  });
+
+  // The bridge, with backpressure both ways.
   child.stdout.on("data", (chunk: Buffer) => {
     if (!ws.send(chunk)) child.stdout.pause();
   });
   ws.on("drain", () => child.stdout.resume());
   ws.on("message", (data: Buffer, isText: boolean) => {
     if (!isText) {
-      // No backpressure this way: the borrower sends little (its share of the
-      // handshake, the body), and pausing the socket could hold back its close.
-      // The helper enforces the body budget; this only keeps Node's buffer honest.
+      // The helper bounds each request; this only keeps Node's buffer honest over a
+      // long session.
       fromBorrower += data.length;
       if (fromBorrower > MPC_MAX_FROM_BORROWER) return ws.close(1009, "too much data");
       if (!child.stdin.destroyed && child.stdin.writable) child.stdin.write(data);
       return;
     }
-    reported = true;
-    recordPrivateResult(owner, caller, data.toString(), Date.now() - started);
-    if (exited) finish();
+    recordPrivateResult(caller, leases, data.toString());
   });
   ws.on("close", () => {
     child.stdin.end();
+    control.end();
     // The helper leaves on its own once its stdin ends; make sure of it.
     setTimeout(() => {
       if (child.exitCode === null) child.kill();
@@ -551,26 +593,30 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, url: URL
         child.kill("SIGKILL");
       }
     }, 10_000).unref();
+    console.log(`[pool] ${caller}'s private session ended after ${requests} requests (${Math.round((Date.now() - started) / 1000)} s)`);
   });
   child.on("exit", (code) => {
-    exited = true;
     child.stdout.resume();
     if (code !== 0 && !ws.closed) ws.send(JSON.stringify({ type: "error", code: "helper", message: `The pool's MPC helper failed (exit ${code}).` }));
-    // The agent's report follows the helper's exit by a moment; don't wait forever for it.
-    if (reported || code !== 0) finish();
-    else setTimeout(finish, 10_000).unref();
+    finish();
   });
-  ws.send(JSON.stringify({ type: "donor", owner }));
+  ws.send(JSON.stringify({ type: "session" }));
 }
 
-// What the borrower says Anthropic answered. Bounds match the direct-usage reports.
-function recordPrivateResult(owner: string, caller: string, text: string, elapsedMs: number): void {
-  let report: { type?: unknown; status?: unknown; model?: unknown; usd?: unknown; forMs?: unknown; message?: unknown };
+// What the borrower says Anthropic answered to one request. Bounds match the
+// direct-usage reports.
+function recordPrivateResult(caller: string, leases: Map<number, { owner: string; at: number }>, text: string): void {
+  let report: { type?: unknown; req?: unknown; status?: unknown; model?: unknown; usd?: unknown; forMs?: unknown; message?: unknown };
   try {
     report = JSON.parse(text);
   } catch {
-    return console.log(`[pool] ${caller} sent a malformed report for ${owner}'s token`);
+    return console.log(`[pool] ${caller} sent a malformed report`);
   }
+  const lease = typeof report.req === "number" ? leases.get(report.req) : undefined;
+  if (!lease) return console.log(`[pool] ${caller} reported on an unknown request`);
+  leases.delete(report.req as number);
+  const owner = lease.owner;
+  const elapsedMs = Date.now() - lease.at;
   const model = typeof report.model === "string" ? report.model.slice(0, 64) : undefined;
   switch (report.type) {
     case "result": {
@@ -592,7 +638,7 @@ function recordPrivateResult(owner: string, caller: string, text: string, elapse
       console.log(`[pool] ${owner}'s token is dead (${caller} got a 401, privately); parked for 24 h`);
       return;
     case "failed":
-      console.log(`[pool] ${caller}'s private borrow on ${owner}'s token failed: ${String(report.message ?? "").slice(0, 200)}`);
+      console.log(`[pool] ${caller}'s private request on ${owner}'s token failed: ${String(report.message ?? "").slice(0, 200)}`);
       return;
     default:
       console.log(`[pool] ${caller} sent an unknown report type for ${owner}'s token`);

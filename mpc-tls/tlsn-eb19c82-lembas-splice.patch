@@ -1,8 +1,8 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index ed080ae..488e30e 100644
+index ed080ae..51e9410 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -3475,6 +3475,42 @@ version = "0.1.0"
+@@ -3475,6 +3475,43 @@ version = "0.1.0"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
  
@@ -33,6 +33,7 @@ index ed080ae..488e30e 100644
 + "serde",
 + "serde_json",
 + "serio",
++ "thiserror 1.0.69",
 + "tls-server-fixture",
 + "tlsn-mux",
 + "tokio",
@@ -59,10 +60,10 @@ index cedabcf..fa06516 100644
  # in `noir-rs`, which transitively depends on the `noir-lang/noir` monorepo via
 diff --git a/crates/lembas-mpc/Cargo.toml b/crates/lembas-mpc/Cargo.toml
 new file mode 100644
-index 0000000..76f2917
+index 0000000..d4c8e2b
 --- /dev/null
 +++ b/crates/lembas-mpc/Cargo.toml
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,57 @@
 +[package]
 +name = "lembas-mpc"
 +version = "0.0.0"
@@ -115,41 +116,47 @@ index 0000000..76f2917
 +serde = { workspace = true, features = ["derive"] }
 +serde_json = { workspace = true }
 +serio = { workspace = true }
++thiserror = { workspace = true }
 +tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "net", "fs"] }
 +tokio-util = { workspace = true, features = ["compat"] }
 +tracing = { workspace = true }
 +tracing-subscriber = { workspace = true, features = ["env-filter"] }
 diff --git a/crates/lembas-mpc/src/bin/lembas-mpc.rs b/crates/lembas-mpc/src/bin/lembas-mpc.rs
 new file mode 100644
-index 0000000..2e44dd0
+index 0000000..52b0ef3
 --- /dev/null
 +++ b/crates/lembas-mpc/src/bin/lembas-mpc.rs
-@@ -0,0 +1,601 @@
+@@ -0,0 +1,764 @@
 +//! `lembas-mpc`: the pool and borrower helpers over TCP, or over stdin/stdout
 +//! for a parent process that bridges the link (the lembas pool and agent).
 +//!
 +//! ```text
 +//! lembas-mpc fixture  --listen 127.0.0.1:7443
 +//! lembas-mpc pool     --listen 127.0.0.1:7700 --server 127.0.0.1:7443 \
-+//!                     --server-name test-server.io --roots fixture --token-env LEMBAS_TOKEN
++//!                     --server-name test-server.io --token-env LEMBAS_TOKEN
 +//! lembas-mpc borrower --pool 127.0.0.1:7700 --template req.http --body req.json
-+//! lembas-mpc pool     --stdio ...            # one borrower, link on stdin/stdout
-+//! lembas-mpc borrower --stdio --output resp.http --template ... --body ...
++//! lembas-mpc pool     --stdio ...            # one session, link on stdin/stdout
++//! lembas-mpc proxy    --stdio --listen 127.0.0.1:0 --port-file port
++//! lembas-mpc chat     --pool 127.0.0.1:7700
 +//! ```
 +//!
-+//! The borrower's template is the request header with `{token}` where the
-+//! pool's bearer token goes and `{body_len}` for the body length. The response
-+//! is written to stdout (or `--output`) as it arrives.
-+//!
-+//! The protocol is the spliced record (`lembas_mpc::splice`): the borrower
-+//! runs the TLS session itself and the pool inserts the one record that
-+//! carries the token.
++//! A session (`session`) carries many requests over many connections with one
++//! two-party setup. `proxy` is how the lembas agent uses it: the link to the
++//! pool on stdin/stdout, and a local HTTP/1.1 port where every request the
++//! agent sends becomes a borrowed request. The `pool --stdio` helper takes a
++//! token per request from its parent over fd 3 (JSON lines) when that is
++//! open, or lends the one from the environment.
 +
 +use std::{
++    collections::HashMap,
 +    io::Write as _,
++    os::fd::{FromRawFd as _, OwnedFd},
 +    path::PathBuf,
 +    pin::Pin,
-+    sync::{Arc, Mutex},
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicU64, Ordering},
++    },
 +    task::{Context as TaskContext, Poll},
 +    time::Instant,
 +};
@@ -157,22 +164,26 @@ index 0000000..2e44dd0
 +use anyhow::{Context as _, Result, bail};
 +use clap::{Parser, Subcommand, ValueEnum};
 +use lembas_mpc::{
-+    TOKEN_LEN, dechunk, fixture_roots, link, mozilla_roots,
-+    splice::{BorrowerReport, run_borrower, run_pool},
++    TOKEN_LEN, dechunk, fixture_roots, link,
++    local::serve_local,
++    mozilla_roots,
++    session::{Connector, Lease, OnSpliced, Session, TokenSource, fixed_token, run_pool},
 +};
 +use rustls::RootCertStore;
++use serde::Deserialize;
 +use tokio::{
-+    io::{AsyncBufReadExt, AsyncWrite, BufReader},
++    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
 +    net::{TcpListener, TcpStream},
++    sync::oneshot,
 +};
 +use tokio_util::compat::TokioAsyncReadCompatExt;
-+use tracing::{error, info};
++use tracing::{error, info, warn};
 +
 +/// Request header for the Messages API with a subscription token, as the
 +/// lembas pool sends it.
-+const MESSAGES_TEMPLATE: &str = "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n\
++const MESSAGES_TEMPLATE: &str = "POST /v1/messages HTTP/1.1\r\nHost: {host}\r\n\
 +    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
-+    Connection: close\r\nContent-Type: application/json\r\nanthropic-version: 2023-06-01\r\n\
++    Content-Type: application/json\r\nanthropic-version: 2023-06-01\r\n\
 +    anthropic-beta: claude-code-20250219,oauth-2025-04-20\r\n\
 +    user-agent: claude-cli/2.1.0 (external, cli)\r\naccept-encoding: identity\r\n\r\n";
 +
@@ -226,6 +237,11 @@ index 0000000..2e44dd0
 +        /// Environment variable holding the bearer token.
 +        #[arg(long, default_value = "LEMBAS_TOKEN")]
 +        token_env: String,
++        /// With --stdio: a descriptor the parent set up (JSON lines both
++        /// ways) on which it lends a token per request; without it the token
++        /// from the environment is lent to every request.
++        #[arg(long, requires = "stdio")]
++        control_fd: Option<i32>,
 +        /// Serve one borrower, then exit.
 +        #[arg(long)]
 +        once: bool,
@@ -239,7 +255,7 @@ index 0000000..2e44dd0
 +        /// The pool's address.
 +        #[arg(long, default_value = "127.0.0.1:7700")]
 +        pool: String,
-+        /// Request header template with `{token}` and `{body_len}`.
++        /// Request header template with `{token}`, `{body_len}` and `{host}`.
 +        #[arg(long)]
 +        template: PathBuf,
 +        /// Request body file.
@@ -262,12 +278,35 @@ index 0000000..2e44dd0
 +        #[arg(long, conflicts_with = "pool")]
 +        stdio: bool,
 +    },
++    /// Run a session for a parent process: the link to the pool on
++    /// stdin/stdout, a local HTTP/1.1 port where each request becomes a
++    /// borrowed request.
++    Proxy {
++        /// Local address to serve HTTP on; port 0 picks a free one.
++        #[arg(long, default_value = "127.0.0.1:0")]
++        listen: String,
++        /// Where to write the port actually bound, for the parent.
++        #[arg(long)]
++        port_file: Option<PathBuf>,
++        /// Name to verify the server's certificate for.
++        #[arg(long, default_value = "api.anthropic.com")]
++        server_name: String,
++        #[arg(long, value_enum, default_value_t = Roots::Mozilla)]
++        roots: Roots,
++        /// Length of the credential the pool lends.
++        #[arg(long, default_value_t = TOKEN_LEN)]
++        token_len: usize,
++        /// The link arrives on stdin/stdout (the only mode).
++        #[arg(long)]
++        stdio: bool,
++    },
 +    /// Run tlsn's HTTPS echo server, for local tests.
 +    Fixture {
 +        #[arg(long, default_value = "127.0.0.1:7443")]
 +        listen: String,
 +    },
-+    /// Chat with the model; every turn is one borrowed request through the pool.
++    /// Chat with the model; the conversation is one session, every turn one
++    /// borrowed request.
 +    Chat {
 +        /// The pool's address.
 +        #[arg(long, default_value = "127.0.0.1:7700")]
@@ -327,29 +366,31 @@ index 0000000..2e44dd0
 +            server_name,
 +            roots: _,
 +            token_env,
++            control_fd,
 +            once,
 +            stdio,
 +        } => {
-+            let token = std::env::var(&token_env)
-+                .with_context(|| format!("set {token_env} to the bearer token"))?;
-+            if token.is_empty() || token.contains(['\r', '\n']) {
-+                bail!("{token_env} does not look like a token");
-+            }
++            let connector = tcp_connector(server.clone());
 +            if stdio {
++                let (tokens, on_spliced) = match control_fd {
++                    Some(fd) => {
++                        let control = Control::open(fd)?;
++                        (control.tokens(), Some(control.on_spliced()))
++                    }
++                    None => (env_token(&token_env)?, None),
++                };
 +                let io = stdio_link();
-+                return lend(io.compat(), &server, &server_name, &token).await;
++                return lend(io.compat(), connector, &server_name, tokens, on_spliced).await;
 +            }
++            let tokens = env_token(&token_env)?;
 +            let listener = TcpListener::bind(&listen).await?;
 +            info!("pool: listening on {listen}, lending to {server} as {server_name}");
 +            loop {
 +                let (stream, peer) = listener.accept().await?;
 +                info!("pool: borrower connected from {peer}");
 +                stream.set_nodelay(true)?;
-+                let (server, server_name, token) =
-+                    (server.clone(), server_name.clone(), token.clone());
-+                let task = async move {
-+                    lend(stream.compat(), &server, &server_name, &token).await
-+                };
++                let (connector, server_name, tokens) = (connector.clone(), server_name.clone(), tokens.clone());
++                let task = async move { lend(stream.compat(), connector, &server_name, tokens, None).await };
 +                if once {
 +                    task.await?;
 +                    return Ok(());
@@ -373,6 +414,39 @@ index 0000000..2e44dd0
 +            max_tokens,
 +            token_len,
 +        } => chat(&pool, &model, max_tokens, token_len).await,
++        Cmd::Proxy {
++            listen,
++            port_file,
++            server_name,
++            roots,
++            token_len,
++            stdio: _,
++        } => {
++            let listener = TcpListener::bind(&listen).await?;
++            let port = listener.local_addr()?.port();
++            if let Some(path) = port_file {
++                std::fs::write(&path, format!("{port}\n")).with_context(|| format!("writing {}", path.display()))?;
++            }
++            let io = stdio_link();
++            let link = link(io.compat())?;
++            let driver = tokio::spawn(link.driver);
++            let session = Arc::new(
++                Session::start(link.mpc, link.up, link.down, &roots.store()?, &server_name, token_len).await?,
++            );
++            info!("proxy: session ready, serving on 127.0.0.1:{port}");
++            tokio::select! {
++                r = serve_local(session.clone(), listener) => r?,
++                r = driver => {
++                    // The parent closed the link: nothing more to do.
++                    match r {
++                        Ok(Ok(())) => info!("proxy: link closed"),
++                        Ok(Err(e)) => warn!("proxy: link failed: {e:#}"),
++                        Err(e) => warn!("proxy: link driver: {e}"),
++                    }
++                }
++            }
++            Ok(())
++        }
 +        Cmd::Borrower {
 +            pool,
 +            template,
@@ -392,7 +466,8 @@ index 0000000..2e44dd0
 +                    .lines()
 +                    .find_map(|l| {
 +                        let (k, v) = l.split_once(':')?;
-+                        k.trim().eq_ignore_ascii_case("host").then(|| v.trim().to_string())
++                        let v = v.trim();
++                        (k.trim().eq_ignore_ascii_case("host") && v != "{host}").then(|| v.to_string())
 +                    })
 +                    .context("template has no Host header; pass --server-name")?,
 +            };
@@ -403,20 +478,21 @@ index 0000000..2e44dd0
 +
 +            let started = Instant::now();
 +            let roots = roots.store()?;
-+            let report = if stdio {
++            let response = if stdio {
 +                let io = stdio_link();
-+                borrow(io.compat(), &template, body, roots, &server_name, token_len, out).await?
++                borrow_once(io.compat(), &template, body, &roots, &server_name, token_len, out).await?
 +            } else {
 +                let stream = TcpStream::connect(&pool)
 +                    .await
 +                    .with_context(|| format!("connecting to the pool at {pool}"))?;
 +                stream.set_nodelay(true)?;
-+                borrow(stream.compat(), &template, body, roots, &server_name, token_len, out).await?
++                borrow_once(stream.compat(), &template, body, &roots, &server_name, token_len, out).await?
 +            };
 +            info!(
 +                total = ?started.elapsed(),
-+                first_byte = ?report.first_byte,
-+                response_bytes = report.response.len(),
++                first_byte = ?response.first_byte,
++                status = ?response.status,
++                response_bytes = response.bytes,
 +                "borrower: done"
 +            );
 +            Ok(())
@@ -429,100 +505,207 @@ index 0000000..2e44dd0
 +/// a frame that happens to contain no newline until something flushes; the
 +/// mux's close frames are exactly that small, and the peer waits for them.
 +fn stdio_link() -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
-+    use std::os::fd::FromRawFd as _;
 +    // SAFETY: fds 0 and 1 stay open for the life of the process, and once the
 +    // link is on them nothing else in this process uses them (logs go to
-+    // stderr, the response to --output).
++    // stderr, the response to --output or the local port).
 +    let stdin = tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(0) });
 +    let stdout = tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(1) });
 +    tokio::io::join(stdin, stdout)
 +}
 +
-+/// Lends the token to the one borrower whose link is `io`.
-+async fn lend<Io>(io: Io, server: &str, server_name: &str, token: &str) -> Result<()>
++fn tcp_connector(server: String) -> Connector<TcpStream> {
++    Arc::new(move || {
++        let server = server.clone();
++        Box::pin(async move {
++            let stream = TcpStream::connect(&server)
++                .await
++                .with_context(|| format!("connecting to {server}"))?;
++            stream.set_nodelay(true)?;
++            Ok(stream)
++        })
++    })
++}
++
++fn env_token(token_env: &str) -> Result<TokenSource> {
++    let token = std::env::var(token_env).with_context(|| format!("set {token_env} to the bearer token"))?;
++    if token.is_empty() || token.contains(['\r', '\n']) {
++        bail!("{token_env} does not look like a token");
++    }
++    Ok(fixed_token(token))
++}
++
++// ---------------------------------------------------------------------------
++// Per-request tokens from the parent, over fd 3
++
++/// What the parent answers to `{"type":"need_token","id":N}`.
++#[derive(Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++enum ControlReply {
++    Token { id: u64, token: String, req: u64 },
++    Refuse { id: u64, reason: String },
++}
++
++/// JSON lines both ways on a descriptor the parent set up (a socketpair when
++/// Node spawns the helper with a fourth `pipe`).
++struct Control {
++    writer: tokio::sync::Mutex<tokio::fs::File>,
++    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<Lease>>>>>,
++    next: AtomicU64,
++}
++
++impl Control {
++    fn open(fd: i32) -> Result<Arc<Self>> {
++        // SAFETY: the parent named this descriptor for us and nothing else in
++        // this process uses it. (Guessing a number instead would be unsafe:
++        // without a parent, the runtime's own descriptors sit there.)
++        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
++        let dup = fd.try_clone().context("the control descriptor is not open")?;
++        let reader = tokio::fs::File::from_std(std::fs::File::from(fd));
++        let writer = tokio::fs::File::from_std(std::fs::File::from(dup));
++        let control = Arc::new(Self {
++            writer: tokio::sync::Mutex::new(writer),
++            pending: Arc::new(Mutex::new(HashMap::new())),
++            next: AtomicU64::new(1),
++        });
++        let pending = control.pending.clone();
++        tokio::spawn(async move {
++            let mut lines = BufReader::new(reader).lines();
++            while let Ok(Some(line)) = lines.next_line().await {
++                match serde_json::from_str::<ControlReply>(&line) {
++                    Ok(ControlReply::Token { id, token, req }) => {
++                        if let Some(tx) = pending.lock().unwrap().remove(&id) {
++                            let _ = tx.send(Some(Lease { token, req }));
++                        }
++                    }
++                    Ok(ControlReply::Refuse { id, reason }) => {
++                        warn!("pool: parent refused request {id}: {reason}");
++                        if let Some(tx) = pending.lock().unwrap().remove(&id) {
++                            let _ = tx.send(None);
++                        }
++                    }
++                    Err(e) => warn!("pool: bad control line: {e}"),
++                }
++            }
++            // The parent is gone; nobody waiting gets a token.
++            pending.lock().unwrap().clear();
++        });
++        Ok(control)
++    }
++
++    fn tokens(self: &Arc<Self>) -> TokenSource {
++        let control = self.clone();
++        Arc::new(move || {
++            let control = control.clone();
++            Box::pin(async move {
++                let id = control.next.fetch_add(1, Ordering::Relaxed);
++                let (tx, rx) = oneshot::channel();
++                control.pending.lock().unwrap().insert(id, tx);
++                control
++                    .send(&serde_json::json!({ "type": "need_token", "id": id }).to_string())
++                    .await?;
++                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
++                    Ok(Ok(lease)) => Ok(lease),
++                    Ok(Err(_)) => bail!("parent went away"),
++                    Err(_) => {
++                        control.pending.lock().unwrap().remove(&id);
++                        bail!("parent did not answer in 30 s")
++                    }
++                }
++            })
++        })
++    }
++
++    fn on_spliced(self: &Arc<Self>) -> OnSpliced {
++        let control = self.clone();
++        Arc::new(move |req| {
++            let control = control.clone();
++            tokio::spawn(async move {
++                let _ = control
++                    .send(&serde_json::json!({ "type": "spliced", "req": req }).to_string())
++                    .await;
++            });
++        })
++    }
++
++    async fn send(&self, line: &str) -> Result<()> {
++        let mut w = self.writer.lock().await;
++        w.write_all(line.as_bytes()).await?;
++        w.write_all(b"\n").await?;
++        w.flush().await?;
++        Ok(())
++    }
++}
++
++// ---------------------------------------------------------------------------
++
++/// Lends to the one borrower whose link is `io`, for a whole session.
++async fn lend<Io>(
++    io: Io,
++    connector: Connector<TcpStream>,
++    server_name: &str,
++    tokens: TokenSource,
++    on_spliced: Option<OnSpliced>,
++) -> Result<()>
 +where
 +    Io: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
 +{
 +    let started = Instant::now();
 +    let link = link(io)?;
 +    let driver = tokio::spawn(link.driver);
-+
-+    let upstream = TcpStream::connect(server)
-+        .await
-+        .with_context(|| format!("connecting to {server}"))?;
-+    upstream.set_nodelay(true)?;
-+
-+    let report = run_pool(
-+        link.mpc,
-+        link.up,
-+        link.down,
-+        upstream,
-+        server_name,
-+        token,
-+        None,
-+    )
-+    .await;
-+
++    let stats = run_pool(link.mpc, link.up, link.down, connector, server_name, tokens, on_spliced, None).await;
 +    info!("pool: closing the link");
 +    drop(link.session);
 +    let _ = link.close.send(());
 +    // The close handshake is a courtesy; a peer that is gone must not hold us.
 +    let _ = tokio::time::timeout(CLOSE_TIMEOUT, driver).await;
-+    info!("pool: link closed");
-+    let report = report?;
-+    info!(
-+        total = ?started.elapsed(),
-+        preprocess = ?report.preprocess,
-+        handshake = ?report.handshake,
-+        splice = ?report.splice,
-+        "pool: borrowed request done"
-+    );
++    let stats = stats?;
++    info!(total = ?started.elapsed(), ?stats, "pool: session done");
 +    Ok(())
 +}
 +
-+/// Borrows once over the link `io`.
++/// One request over a session of its own.
 +#[allow(clippy::too_many_arguments)]
-+async fn borrow<Io>(
++async fn borrow_once<Io>(
 +    io: Io,
 +    template: &str,
 +    body: Vec<u8>,
-+    roots: RootCertStore,
++    roots: &RootCertStore,
 +    server_name: &str,
 +    token_len: usize,
-+    out: Box<dyn AsyncWrite + Unpin + Send>,
-+) -> Result<BorrowerReport>
++    mut out: Box<dyn AsyncWrite + Unpin + Send>,
++) -> Result<lembas_mpc::session::Response>
 +where
 +    Io: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
 +{
 +    let link = link(io)?;
 +    let driver = tokio::spawn(link.driver);
-+    let report = run_borrower(
-+        link.mpc,
-+        link.up,
-+        link.down,
-+        template,
-+        body,
-+        roots,
-+        server_name,
-+        token_len,
-+        out,
-+    )
-+    .await;
++    let session = Session::start(link.mpc, link.up, link.down, roots, server_name, token_len).await?;
++    let response = session.request(template, body, &mut out, |_| {}).await;
++    session.close().await;
 +    info!("borrower: closing the link");
 +    drop(link.session);
 +    let _ = link.close.send(());
 +    let _ = tokio::time::timeout(CLOSE_TIMEOUT, driver).await;
-+    info!("borrower: link closed");
-+    report
++    response
 +}
 +
-+/// The interactive chat: reads a line, sends the whole conversation as one
-+/// borrowed request, streams the answer, repeats.
++/// The interactive chat: one session; each line is one borrowed request with
++/// the whole conversation, streamed back.
 +async fn chat(pool: &str, model: &str, max_tokens: u32, token_len: usize) -> Result<()> {
 +    let mut history: Vec<serde_json::Value> = Vec::new();
 +    let mut lines = BufReader::new(tokio::io::stdin()).lines();
 +
-+    eprintln!("Each message is one borrowed request through the pool at {pool}.");
++    let stream = TcpStream::connect(pool)
++        .await
++        .with_context(|| format!("connecting to the pool at {pool}"))?;
++    stream.set_nodelay(true)?;
++    let link = link(stream.compat())?;
++    let driver = tokio::spawn(link.driver);
++    let t = Instant::now();
++    let session =
++        Session::start(link.mpc, link.up, link.down, &mozilla_roots(), "api.anthropic.com", token_len).await?;
++
++    eprintln!("One session with the pool at {pool} (ready in {:.0?}); each message is one borrowed request.", t.elapsed());
 +    eprintln!("The pool lends the token but cannot read what you type or what comes back.");
 +    eprintln!("Empty line or Ctrl-D to quit.");
 +    eprintln!();
@@ -549,59 +732,34 @@ index 0000000..2e44dd0
 +
 +        print!("claude> ");
 +        std::io::stdout().flush()?;
-+        let sink = SseSink::new();
++        let mut sink = SseSink::new();
 +        let text = sink.text.clone();
 +        let started = Instant::now();
-+
-+        let stream = TcpStream::connect(pool)
-+            .await
-+            .with_context(|| format!("connecting to the pool at {pool}"))?;
-+        stream.set_nodelay(true)?;
-+        let link = link(stream.compat())?;
-+        let driver = tokio::spawn(link.driver);
-+        let report = run_borrower(
-+            link.mpc,
-+            link.up,
-+            link.down,
-+            MESSAGES_TEMPLATE,
-+            serde_json::to_vec(&body)?,
-+            mozilla_roots(),
-+            "api.anthropic.com",
-+            token_len,
-+            Box::new(sink),
-+        )
-+        .await;
-+        drop(link.session);
-+        let _ = link.close.send(());
-+        let _ = driver.await;
-+
++        let result = session
++            .request(MESSAGES_TEMPLATE, serde_json::to_vec(&body)?, &mut sink, |_| {})
++            .await;
 +        println!();
-+        match report {
-+            Ok(report) => {
-+                let status = report
-+                    .response
-+                    .split(|&b| b == b'\n')
-+                    .next()
-+                    .map(|l| String::from_utf8_lossy(l).trim().to_string())
-+                    .unwrap_or_default();
-+                if !status.contains(" 200 ") {
-+                    let body_pos = report
-+                        .response
++        match result {
++            Ok(response) => {
++                if response.status != Some(200) {
++                    let raw = sink.raw.lock().unwrap();
++                    let body_pos = raw
 +                        .windows(4)
 +                        .position(|w| w == b"\r\n\r\n")
 +                        .map(|p| p + 4)
-+                        .unwrap_or(report.response.len());
-+                    let body = dechunk(&report.response[body_pos..]);
-+                    eprintln!("{status}: {}", String::from_utf8_lossy(&body));
++                        .unwrap_or(raw.len());
++                    eprintln!("{:?}: {}", response.status, String::from_utf8_lossy(&dechunk(&raw[body_pos..])));
 +                    history.pop();
 +                } else {
 +                    let answer = std::mem::take(&mut *text.lock().unwrap());
 +                    history.push(serde_json::json!({"role": "assistant", "content": answer}));
 +                }
 +                eprintln!(
-+                    "[borrowed request: {:.1?} total, first byte after {:.1?}]",
++                    "[borrowed request {}: {:.1?} total, first byte after {:.1?}, connection {}]",
++                    response.req,
 +                    started.elapsed(),
-+                    report.first_byte
++                    response.first_byte,
++                    if response.reused { "reused" } else { "new" }
 +                );
 +            }
 +            Err(e) => {
@@ -612,6 +770,10 @@ index 0000000..2e44dd0
 +        println!();
 +    }
 +
++    session.close().await;
++    drop(link.session);
++    let _ = link.close.send(());
++    let _ = tokio::time::timeout(CLOSE_TIMEOUT, driver).await;
 +    // Leave at once: tokio's stdin reader is a blocking thread that could
 +    // otherwise keep the runtime from shutting down.
 +    let _ = std::io::stdout().flush();
@@ -628,6 +790,7 @@ index 0000000..2e44dd0
 +    body: Vec<u8>,
 +    line_start: usize,
 +    text: Arc<Mutex<String>>,
++    raw: Arc<Mutex<Vec<u8>>>,
 +}
 +
 +impl SseSink {
@@ -639,10 +802,12 @@ index 0000000..2e44dd0
 +            body: Vec::new(),
 +            line_start: 0,
 +            text: Arc::new(Mutex::new(String::new())),
++            raw: Arc::new(Mutex::new(Vec::new())),
 +        }
 +    }
 +
 +    fn feed(&mut self, data: &[u8]) {
++        self.raw.lock().unwrap().extend_from_slice(data);
 +        self.buf.extend_from_slice(data);
 +        if !self.headers_done {
 +            let Some(p) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") else {
@@ -728,10 +893,10 @@ index 0000000..2e44dd0
 +}
 diff --git a/crates/lembas-mpc/src/lib.rs b/crates/lembas-mpc/src/lib.rs
 new file mode 100644
-index 0000000..1b1757a
+index 0000000..232f343
 --- /dev/null
 +++ b/crates/lembas-mpc/src/lib.rs
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,542 @@
 +//! Borrowed requests with a spliced token record.
 +//!
 +//! The **borrower** runs an ordinary TLS session to the API server through a
@@ -759,7 +924,9 @@ index 0000000..1b1757a
 +use serde::{Deserialize, Serialize};
 +use webpki::anchor_from_trusted_cert;
 +
++pub mod local;
 +pub mod record;
++pub mod session;
 +pub mod splice;
 +
 +/// Largest token record the pool may send: the request line, Host,
@@ -771,6 +938,11 @@ index 0000000..1b1757a
 +
 +/// Marker in a borrower's template that becomes the token span.
 +pub const TOKEN_MARKER: &str = "{token}";
++/// Marker in a borrower's template that becomes the server name.
++pub const HOST_MARKER: &str = "{host}";
++/// Largest trailer (the borrower's own headers after the Authorization line,
++/// blank line included) a request may carry. The pool checks and counts it.
++pub const MAX_TRAILER_LEN: usize = 8 << 10;
 +/// Marker in a borrower's template that becomes the body length.
 +pub const BODY_LEN_MARKER: &str = "{body_len}";
 +
@@ -797,7 +969,7 @@ index 0000000..1b1757a
 +pub const MAX_PENDING_BYTES: usize = 4 << 20;
 +/// Changes whenever `Hello` or what follows it changes; the wire codec is not
 +/// self-describing, so this is what turns an old peer into a clean error.
-+pub const PROTOCOL_VERSION: u32 = 4;
++pub const PROTOCOL_VERSION: u32 = 5;
 +
 +/// The pool's opening message.
 +#[derive(Debug, Clone, Serialize, Deserialize)]
@@ -929,6 +1101,57 @@ index 0000000..1b1757a
 +    Ok(())
 +}
 +
++/// Checks the borrower's remaining headers against the pool's record, and
++/// returns the body length the record announces: together they are the
++/// request length the pool lets through before the next token record.
++///
++/// The trailer must be whole header lines ending in the blank line, with no
++/// header that would change the framing (`Transfer-Encoding`) or repeat one
++/// the pool's record carries (`Host`, `Content-Length`, `Authorization`).
++pub fn check_trailer(header: &RequestHeader, trailer: &[u8]) -> Result<usize> {
++    ensure!(
++        trailer.len() <= MAX_TRAILER_LEN,
++        "trailer is {} bytes; at most {MAX_TRAILER_LEN}",
++        trailer.len()
++    );
++    ensure!(
++        trailer == b"\r\n" || trailer.ends_with(b"\r\n\r\n"),
++        "trailer must be header lines ending with the blank line"
++    );
++    let text = std::str::from_utf8(&trailer[..trailer.len() - 2]).context("trailer is not UTF-8")?;
++    let text = text.strip_suffix("\r\n").unwrap_or(text);
++    ensure!(!text.contains("\r\n\r\n"), "trailer contains a blank line");
++    let head = std::str::from_utf8(&header.template).context("header is not UTF-8")?;
++    let mut names: std::collections::HashSet<String> = head
++        .split("\r\n")
++        .skip(1)
++        .filter_map(|l| l.split_once(':').map(|(n, _)| n.trim().to_ascii_lowercase()))
++        .collect();
++    let mut body_len = None;
++    for line in head.split("\r\n").skip(1) {
++        if let Some((n, v)) = line.split_once(':')
++            && n.trim().eq_ignore_ascii_case("content-length")
++        {
++            body_len = v.trim().parse::<usize>().ok();
++        }
++    }
++    let body_len = body_len.context("header has no Content-Length")?;
++    if !text.is_empty() {
++        for line in text.split("\r\n") {
++            let (name, value) = line.split_once(':').context("malformed trailer line")?;
++            let name = name.trim().to_ascii_lowercase();
++            ensure!(!name.is_empty() && !name.contains(' '), "malformed header name");
++            ensure!(!value.contains(['\r', '\n']), "header value with a line break");
++            ensure!(
++                !matches!(name.as_str(), "transfer-encoding" | "host" | "content-length" | "authorization"),
++                "trailer may not carry {name}"
++            );
++            ensure!(names.insert(name.clone()), "header {name} appears twice");
++        }
++    }
++    Ok(body_len)
++}
++
 +/// Splits a full header template (ending in a blank line) at the line that
 +/// carries the token: the first part becomes the pool's record, the rest
 +/// (remaining headers plus the blank line) is sent by the borrower alone,
@@ -992,10 +1215,6 @@ index 0000000..1b1757a
 +        token: start..start + span_len,
 +    })
 +}
-+
-+/// Test hook: a misbehaving pool's change to the header after the token is
-+/// in place.
-+pub type Tamper = Option<Box<dyn FnOnce(&mut Vec<u8>) + Send>>;
 +
 +/// Roots trusting tlsn's test server.
 +pub fn fixture_roots() -> Result<rustls::RootCertStore> {
@@ -1162,6 +1381,13 @@ index 0000000..1b1757a
 +        let real = fill_template(&hidden, TOKEN_LEN, 5).unwrap();
 +        assert_eq!(real.token.len(), 112);
 +        check_template(&real, TOKEN_LEN, "api.example").unwrap();
++        // The trailer: counted, and not allowed to change the framing.
++        assert_eq!(check_trailer(&real, &trailer).unwrap(), 5);
++        assert_eq!(check_trailer(&real, b"\r\n").unwrap(), 5);
++        assert!(check_trailer(&real, b"Transfer-Encoding: chunked\r\n\r\n").is_err());
++        assert!(check_trailer(&real, b"Host: other\r\n\r\n").is_err());
++        assert!(check_trailer(&real, b"X-A: 1\r\nx-a: 2\r\n\r\n").is_err());
++        assert!(check_trailer(&real, b"X-A: 1\r\n").is_err());
 +        assert!(check_template(&real, TOKEN_LEN, "other.example").is_err());
 +        // A shorter credential in the same span would leave room to smuggle a
 +        // header, which is why it is refused.
@@ -1213,14 +1439,560 @@ index 0000000..1b1757a
 +        assert_eq!(dechunk(short), short.to_vec());
 +    }
 +}
+diff --git a/crates/lembas-mpc/src/local.rs b/crates/lembas-mpc/src/local.rs
+new file mode 100644
+index 0000000..dcdf517
+--- /dev/null
++++ b/crates/lembas-mpc/src/local.rs
+@@ -0,0 +1,539 @@
++//! The borrower's local face: HTTP/1.1 response framing, and a local proxy
++//! that turns plain HTTP requests from a parent process (the lembas agent)
++//! into borrowed requests on a session.
++
++use std::sync::{
++    Arc,
++    atomic::{AtomicU64, Ordering},
++};
++
++use anyhow::{Context as _, Result, bail, ensure};
++use tokio::{
++    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
++    net::{TcpListener, TcpStream},
++};
++use tracing::{debug, info, warn};
++
++use crate::{MAX_BODY_LEN, session::{Refused, Session}};
++
++/// Largest request head the local proxy accepts.
++const MAX_HEAD: usize = 64 << 10;
++
++/// Headers the proxy never forwards into the template: the pool's record
++/// supplies the first three, the rest are hop-by-hop or would change the
++/// framing the pool counts on.
++const DROPPED: &[&str] = &[
++    "host",
++    "content-length",
++    "authorization",
++    "x-api-key",
++    "connection",
++    "transfer-encoding",
++    "accept-encoding",
++    "expect",
++    "keep-alive",
++    "proxy-connection",
++    "upgrade",
++];
++
++// ---------------------------------------------------------------------------
++// Response framing
++
++#[derive(Debug)]
++enum Body {
++    Length(usize),
++    ChunkSize(Vec<u8>),
++    ChunkData(usize),
++    ChunkEnd(usize),
++    Trailer(Vec<u8>),
++    UntilClose,
++    Done,
++}
++
++/// Follows an HTTP/1.1 response byte by byte to know where it ends, so a
++/// connection can be reused.
++#[derive(Debug, Default)]
++pub struct ResponseFramer {
++    head: Vec<u8>,
++    status: Option<u16>,
++    keep_alive: bool,
++    body: Option<Body>,
++}
++
++impl ResponseFramer {
++    /// Consumes bytes of the response; returns how many belonged to it.
++    pub fn feed(&mut self, mut bytes: &[u8]) -> Result<usize> {
++        let total = bytes.len();
++        while !bytes.is_empty() {
++            let Some(body) = self.body.as_mut() else {
++                // Still in the head.
++                let take = bytes.len().min(MAX_HEAD - self.head.len());
++                ensure!(take > 0, "response head longer than {MAX_HEAD} bytes");
++                self.head.extend_from_slice(&bytes[..take]);
++                if let Some(end) = self.head.windows(4).position(|w| w == b"\r\n\r\n") {
++                    let extra = self.head.len() - (end + 4);
++                    self.head.truncate(end + 4);
++                    self.parse_head()?;
++                    // Replay what came after the head.
++                    bytes = &bytes[take - extra..];
++                } else {
++                    bytes = &bytes[take..];
++                }
++                continue;
++            };
++            match body {
++                Body::Done => break,
++                Body::UntilClose => {
++                    bytes = &[];
++                }
++                Body::Length(remaining) => {
++                    let n = bytes.len().min(*remaining);
++                    *remaining -= n;
++                    bytes = &bytes[n..];
++                    if *remaining == 0 {
++                        self.body = Some(Body::Done);
++                    }
++                }
++                Body::ChunkSize(line) => {
++                    let (consumed, complete) = take_line(line, bytes);
++                    bytes = &bytes[consumed..];
++                    if complete {
++                        let text = std::str::from_utf8(line).context("chunk size")?;
++                        let size = text.split(';').next().unwrap_or("").trim();
++                        if size.is_empty() {
++                            // A stray CRLF between chunks; keep looking.
++                            line.clear();
++                            continue;
++                        }
++                        let size = usize::from_str_radix(size, 16).context("chunk size")?;
++                        self.body = Some(if size == 0 {
++                            Body::Trailer(Vec::new())
++                        } else {
++                            Body::ChunkData(size)
++                        });
++                    }
++                }
++                Body::ChunkData(remaining) => {
++                    let n = bytes.len().min(*remaining);
++                    *remaining -= n;
++                    bytes = &bytes[n..];
++                    if *remaining == 0 {
++                        self.body = Some(Body::ChunkEnd(2));
++                    }
++                }
++                Body::ChunkEnd(remaining) => {
++                    let n = bytes.len().min(*remaining);
++                    *remaining -= n;
++                    bytes = &bytes[n..];
++                    if *remaining == 0 {
++                        self.body = Some(Body::ChunkSize(Vec::new()));
++                    }
++                }
++                Body::Trailer(line) => {
++                    let (consumed, complete) = take_line(line, bytes);
++                    bytes = &bytes[consumed..];
++                    if complete {
++                        if line.is_empty() {
++                            self.body = Some(Body::Done);
++                        } else {
++                            line.clear();
++                        }
++                    }
++                }
++            }
++        }
++        Ok(total - bytes.len())
++    }
++
++    fn parse_head(&mut self) -> Result<()> {
++        let text = std::str::from_utf8(&self.head).context("response head is not UTF-8")?;
++        let mut lines = text.split("\r\n");
++        let status_line = lines.next().unwrap_or("");
++        let status: u16 = status_line
++            .split(' ')
++            .nth(1)
++            .and_then(|s| s.parse().ok())
++            .context("malformed status line")?;
++        self.status = Some(status);
++        let mut length = None;
++        let mut chunked = false;
++        let mut close = false;
++        for line in lines {
++            let Some((name, value)) = line.split_once(':') else {
++                continue;
++            };
++            let name = name.trim().to_ascii_lowercase();
++            let value = value.trim();
++            match name.as_str() {
++                "content-length" => length = Some(value.parse::<usize>().context("Content-Length")?),
++                "transfer-encoding" => chunked = value.to_ascii_lowercase().contains("chunked"),
++                "connection" => close = value.to_ascii_lowercase().contains("close"),
++                _ => {}
++            }
++        }
++        self.keep_alive = !close;
++        self.body = Some(if (100..200).contains(&status) || status == 204 || status == 304 {
++            Body::Done
++        } else if chunked {
++            Body::ChunkSize(Vec::new())
++        } else if let Some(n) = length {
++            if n == 0 { Body::Done } else { Body::Length(n) }
++        } else {
++            self.keep_alive = false;
++            Body::UntilClose
++        });
++        Ok(())
++    }
++
++    /// True once the whole response has been fed.
++    pub fn complete(&self) -> bool {
++        matches!(self.body, Some(Body::Done))
++    }
++
++    /// True if the server closing now ends the response properly.
++    pub fn complete_at_close(&self) -> bool {
++        matches!(self.body, Some(Body::Done) | Some(Body::UntilClose))
++    }
++
++    /// Whether the connection may carry another request afterwards.
++    pub fn keep_alive(&self) -> bool {
++        self.keep_alive && self.complete()
++    }
++
++    pub fn status(&self) -> Option<u16> {
++        self.status
++    }
++}
++
++/// Appends bytes to `line` up to and including a CRLF; returns how many were
++/// consumed and whether the line is complete (`line` then holds it without
++/// the CRLF).
++fn take_line(line: &mut Vec<u8>, bytes: &[u8]) -> (usize, bool) {
++    for (i, &b) in bytes.iter().enumerate() {
++        line.push(b);
++        if line.ends_with(b"\r\n") {
++            line.truncate(line.len() - 2);
++            return (i + 1, true);
++        }
++        if line.len() > 1024 {
++            // A chunk-size or trailer line this long is not HTTP; let the
++            // caller's parse fail on it.
++            return (i + 1, true);
++        }
++    }
++    (bytes.len(), false)
++}
++
++// ---------------------------------------------------------------------------
++// The local proxy
++
++/// Serves plain HTTP/1.1 clients on `listener`, each request becoming one
++/// borrowed request on `session`. One request per client connection: the
++/// response is relayed as the server sent it, with one header added
++/// (`x-lembas-request`, the pool's number for the request, so the client can
++/// report its outcome to the pool), and the connection is closed after it, so
++/// a client reading to the end of the stream needs no framing of its own.
++pub async fn serve_local(session: Arc<Session>, listener: TcpListener) -> Result<()> {
++    info!("proxy: listening on {}", listener.local_addr()?);
++    loop {
++        let (stream, peer) = listener.accept().await?;
++        stream.set_nodelay(true)?;
++        let session = session.clone();
++        tokio::spawn(async move {
++            if let Err(e) = serve_client(session, stream).await {
++                debug!("proxy: client {peer}: {e:#}");
++            }
++        });
++    }
++}
++
++async fn serve_client(session: Arc<Session>, stream: TcpStream) -> Result<()> {
++    let (rd, mut wr) = stream.into_split();
++    let mut rd = BufReader::new(rd);
++    let result = async {
++        // The head.
++        let mut head = Vec::new();
++        loop {
++            let n = rd.read_until(b'\n', &mut head).await?;
++            if n == 0 {
++                return Ok(());
++            }
++            ensure!(head.len() <= MAX_HEAD, "request head longer than {MAX_HEAD} bytes");
++            if head.ends_with(b"\r\n\r\n") {
++                break;
++            }
++        }
++        let (template, body_len) = match parse_request(&head) {
++            Ok(x) => x,
++            Err(e) => {
++                respond_error(&mut wr, 400, "bad_request", &format!("{e:#}")).await?;
++                return Ok(());
++            }
++        };
++        let mut body = vec![0u8; body_len];
++        rd.read_exact(&mut body).await.context("reading the request body")?;
++
++        let req = Arc::new(AtomicU64::new(0));
++        let mut out = HeaderInsert::new(&mut wr, req.clone());
++        let on_req = {
++            let req = req.clone();
++            move |n: u64| req.store(n, Ordering::Relaxed)
++        };
++        match session.request(&template, body, &mut out, on_req).await {
++            Ok(response) => {
++                debug!(
++                    req = response.req,
++                    status = ?response.status,
++                    bytes = response.bytes,
++                    reused = response.reused,
++                    "proxy: request done"
++                );
++            }
++            Err(e) => {
++                if out.started() {
++                    // The client has part of a response; nothing to add.
++                    warn!("proxy: request failed mid-response: {e:#}");
++                    return Err(e);
++                }
++                let (status, kind) = match e.downcast_ref::<Refused>() {
++                    Some(_) => (503, "refused"),
++                    None => (502, "failed"),
++                };
++                warn!("proxy: request failed: {e:#}");
++                respond_error(&mut wr, status, kind, &format!("{e:#}")).await?;
++            }
++        }
++        Ok::<(), anyhow::Error>(())
++    }
++    .await;
++    let _ = wr.shutdown().await;
++    result
++}
++
++/// Turns a request head into a template for the session: the pool's part
++/// (request line, Host, Content-Length, Authorization) first, then the
++/// client's other headers.
++fn parse_request(head: &[u8]) -> Result<(String, usize)> {
++    let text = std::str::from_utf8(head).context("request head is not UTF-8")?;
++    let mut lines = text.trim_end_matches("\r\n").split("\r\n");
++    let request_line = lines.next().unwrap_or("");
++    let mut parts = request_line.split(' ');
++    let method = parts.next().unwrap_or("");
++    let path = parts.next().unwrap_or("");
++    let version = parts.next().unwrap_or("");
++    ensure!(
++        !method.is_empty()
++            && method.bytes().all(|b| b.is_ascii_alphabetic())
++            && path.starts_with('/')
++            && version.starts_with("HTTP/1.")
++            && parts.next().is_none(),
++        "malformed request line"
++    );
++    let mut body_len = None;
++    let mut rest = String::new();
++    for line in lines {
++        let (name, value) = line.split_once(':').context("malformed header line")?;
++        let lname = name.trim().to_ascii_lowercase();
++        let value = value.trim();
++        ensure!(!value.contains(['\r', '\n']), "header value with a line break");
++        if lname == "content-length" {
++            body_len = Some(value.parse::<usize>().context("Content-Length")?);
++        }
++        if lname == "transfer-encoding" {
++            bail!("chunked requests are not supported; send Content-Length");
++        }
++        if DROPPED.contains(&lname.as_str()) {
++            continue;
++        }
++        rest.push_str(name.trim());
++        rest.push_str(": ");
++        rest.push_str(value);
++        rest.push_str("\r\n");
++    }
++    let body_len = body_len.context("Content-Length required")?;
++    ensure!(body_len <= MAX_BODY_LEN, "body of {body_len} bytes is over the limit");
++    rest.push_str("accept-encoding: identity\r\n");
++    let template = format!(
++        "{method} {path} HTTP/1.1\r\nHost: {{host}}\r\nContent-Length: {{body_len}}\r\nAuthorization: Bearer {{token}}\r\n{rest}\r\n"
++    );
++    Ok((template, body_len))
++}
++
++async fn respond_error<W: AsyncWrite + Unpin>(wr: &mut W, status: u16, kind: &str, message: &str) -> Result<()> {
++    let reason = match status {
++        400 => "Bad Request",
++        503 => "Service Unavailable",
++        _ => "Bad Gateway",
++    };
++    let body = serde_json::json!({
++        "type": "error",
++        "error": { "type": format!("lembas_{kind}"), "message": message },
++    })
++    .to_string();
++    let head = format!(
++        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-lembas-error: {kind}\r\n\r\n",
++        body.len()
++    );
++    wr.write_all(head.as_bytes()).await?;
++    wr.write_all(body.as_bytes()).await?;
++    wr.flush().await?;
++    Ok(())
++}
++
++/// Passes a response through, adding `x-lembas-request` to its head.
++struct HeaderInsert<'a, W> {
++    inner: &'a mut W,
++    req: Arc<AtomicU64>,
++    head: Vec<u8>,
++    in_head: bool,
++    started: bool,
++}
++
++impl<'a, W: AsyncWrite + Unpin> HeaderInsert<'a, W> {
++    fn new(inner: &'a mut W, req: Arc<AtomicU64>) -> Self {
++        Self {
++            inner,
++            req,
++            head: Vec::new(),
++            in_head: true,
++            started: false,
++        }
++    }
++
++    fn started(&self) -> bool {
++        self.started
++    }
++}
++
++impl<W: AsyncWrite + Unpin> AsyncWrite for HeaderInsert<'_, W> {
++    fn poll_write(
++        mut self: std::pin::Pin<&mut Self>,
++        cx: &mut std::task::Context<'_>,
++        data: &[u8],
++    ) -> std::task::Poll<std::io::Result<usize>> {
++        self.started = true;
++        if self.in_head {
++            self.head.extend_from_slice(data);
++            if let Some(end) = self.head.windows(4).position(|w| w == b"\r\n\r\n") {
++                let line = format!("x-lembas-request: {}\r\n", self.req.load(Ordering::Relaxed));
++                self.head.splice(end + 2..end + 2, line.into_bytes());
++                self.in_head = false;
++                // Hand the whole head (and whatever followed) to the inner
++                // writer in one go.
++                let pending = std::mem::take(&mut self.head);
++                let this = &mut *self;
++                let mut written = 0;
++                while written < pending.len() {
++                    match std::pin::Pin::new(&mut *this.inner).poll_write(cx, &pending[written..]) {
++                        std::task::Poll::Ready(Ok(n)) => written += n,
++                        std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
++                        std::task::Poll::Pending => {
++                            // Keep the rest for the next poll.
++                            this.head = pending[written..].to_vec();
++                            this.in_head = false;
++                            return std::task::Poll::Ready(Ok(data.len()));
++                        }
++                    }
++                }
++            } else if self.head.len() > MAX_HEAD {
++                return std::task::Poll::Ready(Err(std::io::Error::other("response head too long")));
++            }
++            return std::task::Poll::Ready(Ok(data.len()));
++        }
++        // Drain anything a Pending left behind, then the new data.
++        if !self.head.is_empty() {
++            let pending = std::mem::take(&mut self.head);
++            let this = &mut *self;
++            match std::pin::Pin::new(&mut *this.inner).poll_write(cx, &pending) {
++                std::task::Poll::Ready(Ok(n)) if n == pending.len() => {}
++                std::task::Poll::Ready(Ok(n)) => {
++                    this.head = pending[n..].to_vec();
++                    this.head.extend_from_slice(data);
++                    return std::task::Poll::Ready(Ok(data.len()));
++                }
++                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
++                std::task::Poll::Pending => {
++                    this.head = pending;
++                    return std::task::Poll::Pending;
++                }
++            }
++        }
++        std::pin::Pin::new(&mut *self.inner).poll_write(cx, data)
++    }
++
++    fn poll_flush(
++        mut self: std::pin::Pin<&mut Self>,
++        cx: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<std::io::Result<()>> {
++        if !self.in_head && !self.head.is_empty() {
++            let pending = std::mem::take(&mut self.head);
++            let this = &mut *self;
++            match std::pin::Pin::new(&mut *this.inner).poll_write(cx, &pending) {
++                std::task::Poll::Ready(Ok(n)) if n == pending.len() => {}
++                std::task::Poll::Ready(Ok(n)) => {
++                    this.head = pending[n..].to_vec();
++                    cx.waker().wake_by_ref();
++                    return std::task::Poll::Pending;
++                }
++                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
++                std::task::Poll::Pending => {
++                    this.head = pending;
++                    return std::task::Poll::Pending;
++                }
++            }
++        }
++        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
++    }
++
++    fn poll_shutdown(
++        mut self: std::pin::Pin<&mut Self>,
++        cx: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<std::io::Result<()>> {
++        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn framer_follows_content_length_and_chunks() {
++        let mut f = ResponseFramer::default();
++        let resp = b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhelloEXTRA";
++        assert_eq!(f.feed(&resp[..10]).unwrap(), 10);
++        assert!(!f.complete());
++        assert_eq!(f.feed(&resp[10..]).unwrap(), resp.len() - 10 - 5);
++        assert!(f.complete() && f.keep_alive());
++        assert_eq!(f.status(), Some(200));
++
++        let mut f = ResponseFramer::default();
++        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
++        for b in resp.iter() {
++            assert_eq!(f.feed(std::slice::from_ref(b)).unwrap(), 1);
++        }
++        assert!(f.complete());
++        assert!(!f.keep_alive());
++
++        let mut f = ResponseFramer::default();
++        f.feed(b"HTTP/1.1 200 OK\r\n\r\nstream").unwrap();
++        assert!(!f.complete() && f.complete_at_close() && !f.keep_alive());
++
++        let mut f = ResponseFramer::default();
++        f.feed(b"HTTP/1.1 204 No Content\r\n\r\n").unwrap();
++        assert!(f.complete() && f.keep_alive());
++    }
++
++    #[test]
++    fn request_head_becomes_a_template() {
++        let head = b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\nAuthorization: Bearer nope\r\nanthropic-version: 2023-06-01\r\nConnection: keep-alive\r\n\r\n";
++        let (template, len) = parse_request(head).unwrap();
++        assert_eq!(len, 12);
++        assert_eq!(
++            template,
++            "POST /v1/messages HTTP/1.1\r\nHost: {host}\r\nContent-Length: {body_len}\r\nAuthorization: Bearer {token}\r\nanthropic-version: 2023-06-01\r\naccept-encoding: identity\r\n\r\n"
++        );
++        assert!(parse_request(b"GET / HTTP/1.1\r\n\r\n").is_err());
++        assert!(parse_request(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").is_err());
++    }
++}
 diff --git a/crates/lembas-mpc/src/main.rs b/crates/lembas-mpc/src/main.rs
 new file mode 100644
-index 0000000..f4cdd99
+index 0000000..0ab4e30
 --- /dev/null
 +++ b/crates/lembas-mpc/src/main.rs
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,349 @@
 +//! In-process demo: pool, borrower and tlsn's echo server in one process,
-+//! with checks that the token never reaches the borrower.
++//! many requests over one session, with checks that the token never reaches
++//! the borrower.
 +
 +use std::{
 +    pin::Pin,
@@ -1235,9 +2007,8 @@ index 0000000..f4cdd99
 +use anyhow::{Context as _, Result, bail, ensure};
 +use clap::Parser;
 +use lembas_mpc::{
-+    TOKEN_LEN, Tamper, dechunk, fixture_roots, link,
-+    record::{APPLICATION_DATA, LocalRecordLayer},
-+    splice::{run_borrower, run_pool},
++    TOKEN_LEN, dechunk, fixture_roots, link,
++    session::{Connector, Session, Tamper, fixed_token, run_pool},
 +};
 +use rand::RngExt;
 +use tls_server_fixture::SERVER_DOMAIN;
@@ -1247,15 +2018,31 @@ index 0000000..f4cdd99
 +/// The pool's secret. The borrower must never learn it.
 +const TOKEN: &str = "sk-ant-api03-THIS-IS-THE-POOLS-SECRET-TOKEN-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-A";
 +
-+const TEMPLATE: &str = "POST /echo HTTP/1.1\r\nHost: test-server.io\r\n\
++const TEMPLATE: &str = "POST /echo HTTP/1.1\r\nHost: {host}\r\n\
 +    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
-+    Connection: close\r\nContent-Type: application/json\r\n\r\n";
++    Content-Type: application/json\r\n\r\n";
++
++/// The same, asking the server to close afterwards: forces a new connection
++/// for the next request.
++const TEMPLATE_CLOSE: &str = "POST /echo HTTP/1.1\r\nHost: {host}\r\n\
++    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
++    Content-Type: application/json\r\nConnection: close\r\n\r\n";
 +
 +#[derive(Parser, Debug)]
 +struct Args {
-+    /// Size of the request body in bytes. The test server echoes it.
++    /// Requests to make over the one session.
++    #[arg(long, default_value_t = 6)]
++    requests: usize,
++    /// How many at a time.
++    #[arg(long, default_value_t = 3)]
++    concurrency: usize,
++    /// Size of each request body in bytes. The test server echoes it.
 +    #[arg(long, default_value_t = 32 * 1024)]
 +    body: usize,
++    /// Refuse to lend for the first N requests (nobody has capacity), then
++    /// lend; the borrower must report each refusal and the session go on.
++    #[arg(long, default_value_t = 0)]
++    refuse_first: usize,
 +    /// Misbehave as the pool: change a header byte outside the token span.
 +    /// The server must reject the record, since the tag binds the pool to
 +    /// the borrower's text.
@@ -1276,12 +2063,6 @@ index 0000000..f4cdd99
 +
 +    let args = Args::parse();
 +
-+    // The server.
-+    let (server_client_sock, server_sock) = tokio::io::duplex(1 << 20);
-+    let server = tokio::spawn(tls_server_fixture::bind_test_server_hyper(
-+        server_sock.compat(),
-+    ));
-+
 +    // The pool↔borrower link, with byte counters on the pool's end.
 +    let (pool_sock, borrower_sock) = tokio::io::duplex(1 << 23);
 +    let counters = LinkCounters::default();
@@ -1292,49 +2073,111 @@ index 0000000..f4cdd99
 +    let pool_driver = tokio::spawn(pool_link.driver);
 +    let borrower_driver = tokio::spawn(borrower_link.driver);
 +
-+    let body: Vec<u8> = {
-+        let mut rng = rand::rng();
-+        let mut b = Vec::with_capacity(args.body);
-+        while b.len() < args.body {
-+            b.extend_from_slice(format!("{{\"n\":{}}},", rng.random::<u32>()).as_bytes());
-+        }
-+        b.truncate(args.body);
-+        b
-+    };
++    // Every `Open` gets its own echo server on an in-memory pipe.
++    let connector: Connector<DuplexStream> = Arc::new(|| {
++        Box::pin(async {
++            let (client, server) = tokio::io::duplex(1 << 20);
++            tokio::spawn(async move {
++                if let Err(e) = tls_server_fixture::bind_test_server_hyper(server.compat()).await {
++                    tracing::debug!("test server: {e}");
++                }
++            });
++            Ok(client)
++        })
++    });
 +
-+    let token = TOKEN.to_string();
 +    let tamper: Tamper = args
 +        .evil_rewrite
-+        .then(|| Box::new(|h: &mut Vec<u8>| h[0] = b'G') as Box<dyn FnOnce(&mut Vec<u8>) + Send>);
++        .then(|| Arc::new(|h: &mut Vec<u8>| h[0] = b'G') as Arc<dyn Fn(&mut Vec<u8>) + Send + Sync>);
++    // The evil pool claims to lend for the name the borrower expects while
++    // connecting it to the test server; only the certificate check can tell.
 +    let expected_server = if args.evil_server {
 +        "api.anthropic.com"
 +    } else {
 +        SERVER_DOMAIN
 +    };
++    let announced_server = expected_server;
 +
 +    let started = Instant::now();
-+    let outcome = tokio::try_join!(
-+        run_pool(
-+            pool_link.mpc,
-+            pool_link.up,
-+            pool_link.down,
-+            server_client_sock,
-+            SERVER_DOMAIN,
-+            &token,
-+            tamper,
-+        ),
-+        run_borrower(
-+            borrower_link.mpc,
-+            borrower_link.up,
-+            borrower_link.down,
-+            TEMPLATE,
-+            body.clone(),
-+            fixture_roots()?,
-+            expected_server,
-+            TOKEN_LEN,
-+            Box::new(tokio::io::sink()),
-+        ),
++    let pool = run_pool(
++        pool_link.mpc,
++        pool_link.up,
++        pool_link.down,
++        connector,
++        announced_server,
++        refusing_first(args.refuse_first, fixed_token(TOKEN.to_string())),
++        None,
++        tamper,
 +    );
++    let borrower = async {
++        let session = Arc::new(
++            Session::start(
++                borrower_link.mpc,
++                borrower_link.up,
++                borrower_link.down,
++                &fixture_roots()?,
++                expected_server,
++                TOKEN_LEN,
++            )
++            .await?,
++        );
++        let ready = started.elapsed();
++
++        let mut rng = rand::rng();
++        let mut tasks = tokio::task::JoinSet::new();
++        let mut outcomes = Vec::new();
++        let per_request = Arc::new(std::sync::Mutex::new(Vec::new()));
++        for i in 0..args.requests {
++            // Keep `concurrency` in flight.
++            while tasks.len() >= args.concurrency.max(1) {
++                outcomes.push(tasks.join_next().await.unwrap()?);
++            }
++            let body: Vec<u8> = {
++                let mut b = Vec::with_capacity(args.body);
++                while b.len() < args.body {
++                    b.extend_from_slice(format!("{{\"n\":{}}},", rng.random::<u32>()).as_bytes());
++                }
++                b.truncate(args.body);
++                b
++            };
++            // Every third request asks the server to close: the next one
++            // must open a new connection and re-handshake.
++            let template = if i % 3 == 2 { TEMPLATE_CLOSE } else { TEMPLATE };
++            let session = session.clone();
++            let per_request = per_request.clone();
++            tasks.spawn(async move {
++                let t = Instant::now();
++                let mut response = Vec::new();
++                let r = match session.request(template, body.clone(), &mut response, |_| {}).await {
++                    Ok(r) => r,
++                    Err(e) if e.downcast_ref::<lembas_mpc::session::Refused>().is_some() => {
++                        REFUSED.fetch_add(1, Ordering::Relaxed);
++                        // Try again: the pool lends from the (N+1)th request on.
++                        session.request(template, body.clone(), &mut response, |_| {}).await?
++                    }
++                    Err(e) => return Err(e),
++                };
++                per_request.lock().unwrap().push(t.elapsed());
++                let text = String::from_utf8_lossy(&response);
++                ensure!(
++                    text.starts_with("HTTP/1.1 200 OK"),
++                    "unexpected response: {}",
++                    &text[..text.len().min(200)]
++                );
++                let body_pos = text.find("\r\n\r\n").context("no header terminator")? + 4;
++                ensure!(dechunk(&response[body_pos..]) == body, "server did not echo the body");
++                Ok::<_, anyhow::Error>(r)
++            });
++        }
++        while let Some(outcome) = tasks.join_next().await {
++            outcomes.push(outcome?);
++        }
++        session.close().await;
++        let per_request = std::mem::take(&mut *per_request.lock().unwrap());
++        let responses = outcomes.into_iter().collect::<Result<Vec<_>>>()?;
++        Ok::<_, anyhow::Error>((responses, ready, per_request))
++    };
++    let outcome = tokio::try_join!(pool, borrower);
 +    let total = started.elapsed();
 +
 +    if args.evil_rewrite || args.evil_server {
@@ -1342,12 +2185,7 @@ index 0000000..f4cdd99
 +            Ok(_) => bail!("the borrower accepted a misbehaving pool"),
 +            Err(err) => err,
 +        };
-+        let expected = if args.evil_rewrite {
-+            // The server fails the record's tag and sends a fatal alert.
-+            "alert"
-+        } else {
-+            "certificate"
-+        };
++        let expected = if args.evil_rewrite { "alert" } else { "certificate" };
 +        ensure!(
 +            format!("{err:#}").to_ascii_lowercase().contains(expected),
 +            "unexpected failure: {err:#}"
@@ -1356,7 +2194,7 @@ index 0000000..f4cdd99
 +        println!("misbehaving pool rejected as expected: {err:#}");
 +        return Ok(());
 +    }
-+    let (pool_report, borrower_report) = outcome?;
++    let (stats, (responses, ready, per_request)) = outcome?;
 +
 +    drop(pool_link.session);
 +    drop(borrower_link.session);
@@ -1364,99 +2202,53 @@ index 0000000..f4cdd99
 +    let _ = borrower_link.close.send(());
 +    pool_driver.await??;
 +    borrower_driver.await??;
-+    match server.await? {
-+        Ok(()) => {}
-+        Err(e) => println!("test server ended with an error: {e}"),
-+    }
 +
-+    // Checks.
-+    let response = String::from_utf8_lossy(&borrower_report.response);
-+    ensure!(
-+        response.starts_with("HTTP/1.1 200 OK"),
-+        "unexpected response: {}",
-+        &response[..response.len().min(200)]
-+    );
-+    let body_pos = response
-+        .find("\r\n\r\n")
-+        .context("response has no header terminator")?
-+        + 4;
-+    let echoed = dechunk(&borrower_report.response[body_pos..]);
-+    ensure!(
-+        echoed == body,
-+        "server did not echo the body: got {} bytes, sent {} (response {} bytes)",
-+        echoed.len(),
-+        body.len(),
-+        borrower_report.response.len()
-+    );
++    ensure!(responses.len() == args.requests);
++    ensure!(stats.requests as usize == args.requests, "pool counted {} requests", stats.requests);
++    let reused = responses.iter().filter(|r| r.reused).count();
++    let refused = REFUSED.load(Ordering::Relaxed);
++    ensure!(refused == args.refuse_first, "{refused} refusals seen, expected {}", args.refuse_first);
++    ensure!(stats.refused as usize == args.refuse_first, "pool counted {} refusals", stats.refused);
 +
-+    // What went over the link to the borrower must contain neither the token
-+    // nor the token record's ciphertext (mux framing could split a match, so
-+    // look for 16-byte windows of the record rather than the whole record).
++    // What went over the link to the borrower must not contain the token.
 +    let sent = SENT_TO_BORROWER.lock().unwrap();
 +    ensure!(
 +        !contains(&sent, TOKEN.as_bytes()),
 +        "the token went to the borrower in the clear"
 +    );
-+    let record = &pool_report.record;
-+    ensure!(record.len() > 5 + 8 + 16, "token record too short");
-+    let ciphertext = &record[5 + 8..record.len() - 16];
-+    for window in ciphertext.chunks(16).filter(|w| w.len() == 16) {
-+        ensure!(
-+            !contains(&sent, window),
-+            "part of the token record's ciphertext went to the borrower"
-+        );
-+    }
 +    drop(sent);
 +
-+    // Diagnostic only possible because both parties run in this process: the
-+    // token record the pool sent must be what the borrower's keys produce
-+    // from the borrower's template with the token in place.
-+    {
-+        let mut reference = LocalRecordLayer::new(&borrower_report.keys, borrower_report.splice_seq, 0);
-+        let mut expected_headers = borrower_report.header.template.clone();
-+        let span = &mut expected_headers[borrower_report.header.token.clone()];
-+        span.fill(b' ');
-+        span[..TOKEN.len()].copy_from_slice(TOKEN.as_bytes());
-+        ensure!(expected_headers == pool_report.headers);
-+        let expected = reference
-+            .encrypt(APPLICATION_DATA, &expected_headers)
-+            .context("reference encryption")?;
-+        ensure!(
-+            expected == pool_report.record,
-+            "the token record differs from what the traffic keys produce"
-+        );
-+    }
-+
++    let mut sorted = per_request.clone();
++    sorted.sort();
 +    println!();
-+    println!("borrowed request OK");
-+    println!("  protocol:              spliced record (borrower owns the session; zero-knowledge keystream)");
-+    println!("  body:                  {} bytes, echoed back", body.len());
++    println!("borrowed requests OK");
++    println!("  protocol:              session of spliced records (zero-knowledge keystream)");
 +    println!(
-+        "  token record:          {} bytes plaintext, seq {}; span hidden from the borrower, rest bound to its text",
-+        pool_report.headers.len(),
-+        borrower_report.splice_seq
++        "  requests:              {} of {} bytes, {} at a time, all echoed back",
++        args.requests, args.body, args.concurrency
++    );
++    println!(
++        "  connections:           {} opened by the pool, {} requests reused one{}",
++        stats.connections,
++        reused,
++        if refused > 0 { format!(", {refused} refusals handled") } else { String::new() }
 +    );
 +    println!("  server identity:       verified by the borrower");
 +    println!();
 +    println!("timing (both parties on this machine)");
-+    println!("  preprocessing:         {:>8.0?}  (overlapped with the handshake)", pool_report.preprocess);
-+    println!("  handshake:             {:>8.0?}", pool_report.handshake);
-+    println!("  token record:          {:>8.0?}", pool_report.splice);
++    println!("  session ready (OT setup, once): {:>6.0?}", ready);
 +    println!(
-+        "  body sent → first response byte: {:>5.0?}",
-+        borrower_report.first_byte
++        "  per request:           median {:>6.0?}, max {:>6.0?} (handshake included when a connection was opened)",
++        sorted[sorted.len() / 2],
++        sorted[sorted.len() - 1]
 +    );
 +    println!("  total:                 {:>8.0?}", total);
 +    println!();
 +    println!("pool↔borrower link");
-+    println!(
-+        "  pool → borrower:       {:>8} KB",
-+        counters.sent.load(Ordering::Relaxed) / 1024
-+    );
-+    println!(
-+        "  borrower → pool:       {:>8} KB",
-+        counters.received.load(Ordering::Relaxed) / 1024
-+    );
++    let up = counters.received.load(Ordering::Relaxed);
++    let down = counters.sent.load(Ordering::Relaxed);
++    println!("  borrower → pool:       {:>8} KB ({} KB of it request bodies)", up / 1024, args.requests * args.body / 1024);
++    println!("  pool → borrower:       {:>8} KB (responses included)", down / 1024);
 +
 +    Ok(())
 +}
@@ -1526,16 +2318,33 @@ index 0000000..f4cdd99
 +
 +/// Everything the pool sent to the borrower, for the token check.
 +static SENT_TO_BORROWER: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
++/// Refusals the borrower saw.
++static REFUSED: AtomicUsize = AtomicUsize::new(0);
++
++/// A token source that says no to the first `n` requests.
++fn refusing_first(n: usize, inner: lembas_mpc::session::TokenSource) -> lembas_mpc::session::TokenSource {
++    let count = Arc::new(AtomicUsize::new(0));
++    Arc::new(move || {
++        let inner = inner.clone();
++        let count = count.clone();
++        Box::pin(async move {
++            if count.fetch_add(1, Ordering::Relaxed) < n {
++                return Ok(None);
++            }
++            inner().await
++        })
++    })
++}
 +
 +fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 +    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 +}
 diff --git a/crates/lembas-mpc/src/record.rs b/crates/lembas-mpc/src/record.rs
 new file mode 100644
-index 0000000..d816b77
+index 0000000..35bd527
 --- /dev/null
 +++ b/crates/lembas-mpc/src/record.rs
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,224 @@
 +//! TLS 1.2 AES-128-GCM records with keys this side holds: what the borrower
 +//! runs after taking the keys out of rustls, continuing from the sequence
 +//! numbers rustls reached (plus one on the client side, for the pool's
@@ -1640,6 +2449,17 @@ index 0000000..d816b77
 +            iv: keys.client_write_iv,
 +            seq,
 +        }
++    }
++
++    /// The next sequence number this writer will use.
++    pub fn seq(&self) -> u64 {
++        self.seq
++    }
++
++    /// Skips to a sequence number: the pool's token record took the one
++    /// before it.
++    pub fn set_seq(&mut self, seq: u64) {
++        self.seq = seq;
 +    }
 +
 +    /// Encrypts one record and returns it encoded, ready for the wire. The
@@ -1749,49 +2569,1364 @@ index 0000000..d816b77
 +        assert_eq!(reader.decrypt(&record).unwrap(), (ALERT, CLOSE_NOTIFY.to_vec()));
 +    }
 +}
-diff --git a/crates/lembas-mpc/src/splice.rs b/crates/lembas-mpc/src/splice.rs
+diff --git a/crates/lembas-mpc/src/session.rs b/crates/lembas-mpc/src/session.rs
 new file mode 100644
-index 0000000..7d31aa6
+index 0000000..23b9330
 --- /dev/null
-+++ b/crates/lembas-mpc/src/splice.rs
-@@ -0,0 +1,1148 @@
-+//! The spliced token record: the borrower owns the TLS session, the pool
-+//! inserts one record.
++++ b/crates/lembas-mpc/src/session.rs
+@@ -0,0 +1,1324 @@
++//! Sessions: one two-party setup, many TLS connections, many requests.
 +//!
-+//! The borrower runs an ordinary TLS 1.2 client (rustls) over a byte relay
-+//! through the pool, verifies the server's certificate itself and holds the
-+//! traffic keys alone from the start. The pool opens the TCP connection, so it
-+//! decides which server the token goes to, and it writes exactly one record:
-+//! the request line, `Host`, `Content-Length` and the `Authorization` line.
-+//! For that record it needs keystream and a tag.
++//! A session is one link between a borrower and a pool, kept for as long as
++//! the borrower has requests to make. Inside it the borrower opens TLS
++//! connections to the server on demand (one per request in flight, reused
++//! with HTTP keep-alive), and every request is one spliced token record on
++//! one of them. The zero-knowledge prover and verifier, with their OT setup,
++//! are built once per session; a connection's key is just another witness.
 +//!
-+//! - Keystream: AES on the borrower's client key, proven in zero knowledge
-+//!   (mpz's QuickSilver VM). The borrower is the prover, so its key stays
-+//!   private against a malicious pool; the pool is the verifier and receives
-+//!   the keystream with a soundness guarantee against a borrower that would
-+//!   try to pass off a keystream of its choosing (say zeros, which would put
-+//!   the token on the pool's uplink in the clear). Nothing is garbled: the
-+//!   pool has no private input, so a proof is all it needs.
-+//! - Tag: the borrower knows `H` and `E_K(J0)` and computes the GHASH terms
-+//!   for every block it knows; the token span's blocks go through one
-+//!   multiplicative-to-additive conversion each, with the pool's ciphertext
-+//!   block as its input. The pool learns only the finished tag.
++//! Frames carry a connection id. Everything the borrower sends goes on `up`,
++//! everything the pool sends on `down`, the two-party computation on `mpc`.
 +//!
-+//! The pool refuses to splice unless the first application-data record on the
-+//! connection is its own, so the token cannot become the body or a header
-+//! continuation of a request the borrower wrote. Then the borrower continues
-+//! with its own records, sequence number +1, and the pool relays bytes it can
-+//! neither read nor forge.
++//! What the pool enforces per connection, so that the token record always
++//! begins a fresh HTTP request:
 +//!
-+//! The link carries three channels, opened in the same order by both sides:
-+//! `mpc` for the two-party computation, `up` for everything the borrower
-+//! sends (its header, then [`Frame`]s), `down` for everything the pool sends
-+//! (its [`Hello`], then [`Frame`]s).
++//! - before the first splice only handshake records pass (no application
++//!   data, so the token record cannot continue something the borrower wrote);
++//! - after a splice the borrower may send exactly the announced request
++//!   length (its remaining headers plus `Content-Length` of body), counted
++//!   from the relayed records' plaintext lengths, and no application data
++//!   outside that window: fewer bytes would make the next token record part
++//!   of this body, more would make it the body of a pipelined request;
++//! - a later splice must announce the sequence number the pool expects from
++//!   the records it counted, and no borrower record may reuse a token
++//!   record's explicit nonce.
 +
 +use std::{
-+    sync::Arc,
++    collections::{HashMap, HashSet},
++    future::Future,
++    pin::Pin,
++    sync::{
++        Arc,
++        atomic::{AtomicU32, Ordering},
++    },
 +    time::{Duration, Instant},
 +};
++
++use anyhow::{Context as _, Result, bail, ensure};
++use mpz_common::Context;
++use serde::{Deserialize, Serialize};
++use serio::{SinkExt, stream::IoStreamExt};
++use tokio::{
++    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
++    sync::{Mutex, Notify, Semaphore, mpsc, oneshot},
++    task::JoinSet,
++};
++use tracing::{debug, info, warn};
++
++use crate::{
++    Hello, MAX_BODY_LEN, PROTOCOL_VERSION, RequestHeader, SETUP_TIMEOUT, TOKEN_LEN,
++    check_template, check_trailer, fill_template,
++    record::{
++        ALERT, APPLICATION_DATA, CHANGE_CIPHER_SPEC, CLOSE_NOTIFY, HANDSHAKE, LocalRecordLayer,
++        LocalRecordReader, LocalRecordWriter, MAX_RECORD_PLAINTEXT,
++    },
++    splice::{Deframer, Proving, Verifying, extract_keys, span_blocks, tls_config},
++    split_template,
++};
++
++/// Most handshake bytes the pool relays from the borrower on one connection
++/// before its first splice.
++pub const MAX_HANDSHAKE_BYTES: usize = 64 << 10;
++/// Largest frame either side accepts.
++pub const MAX_FRAME_BYTES: usize = 256 << 10;
++/// Connections a session may have open at once.
++pub const MAX_CONNECTIONS: usize = 16;
++/// A session with no frame from the peer for this long is over.
++pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
++/// How long the borrower waits for a response to finish once it has begun
++/// sending, from the last byte received (a model's thinking pause fits).
++pub const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
++/// Frame size the borrower batches its records into.
++const FRAME_TARGET: usize = 64 << 10;
++/// Frames buffered per connection between tasks.
++const CONN_QUEUE: usize = 64;
++/// Requests after which the two-party setup is rebuilt. mpz's VMs keep every
++/// wire they ever allocated (about 3 MB per request on each side), so a long
++/// session trades one more OT setup for bounded memory.
++pub const RENEW_AFTER: usize = 32;
++
++/// Everything the borrower sends.
++#[derive(Serialize, Deserialize)]
++pub enum Up {
++    /// Open a connection to the server under this id.
++    Open { conn: u32 },
++    /// TLS bytes for the server.
++    Bytes { conn: u32, bytes: Vec<u8> },
++    /// Splice a token record: `header` is the pool's part (through the
++    /// Authorization line), `trailer` the borrower's remaining headers and
++    /// the blank line, which the pool only checks and counts.
++    Request {
++        conn: u32,
++        header: RequestHeader,
++        trailer: Vec<u8>,
++        seq: u64,
++        nonce: [u8; 12],
++    },
++    /// The borrower's share of the pending token record's tag.
++    TagShare { conn: u32, share: [u8; 16] },
++    /// Done with this connection.
++    Close { conn: u32 },
++    /// The borrower starts a fresh two-party setup (both sides warm up again
++    /// on `mpc` before the next request).
++    Renew,
++    /// Done with the session.
++    Done,
++}
++
++/// Everything the pool sends, after its [`Hello`].
++#[derive(Serialize, Deserialize)]
++pub enum Down {
++    Opened { conn: u32 },
++    OpenFailed { conn: u32, reason: String },
++    /// TLS bytes from the server.
++    Bytes { conn: u32, bytes: Vec<u8> },
++    /// A lender is found for the request; the proof starts now. `req`
++    /// numbers the request within the session.
++    Accepted { conn: u32, req: u64 },
++    /// The token record is on its way to the server.
++    Spliced { conn: u32, req: u64 },
++    /// No token for this request (nobody lending right now, say). The
++    /// connection stays usable.
++    Refused { conn: u32, reason: String },
++    /// The server closed this connection.
++    ServerClosed { conn: u32 },
++}
++
++impl std::fmt::Display for Up {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Up::Open { conn } => write!(f, "Open({conn})"),
++            Up::Bytes { conn, bytes } => write!(f, "Bytes({conn}, {})", bytes.len()),
++            Up::Request { conn, seq, .. } => write!(f, "Request({conn}, seq {seq})"),
++            Up::TagShare { conn, .. } => write!(f, "TagShare({conn})"),
++            Up::Close { conn } => write!(f, "Close({conn})"),
++            Up::Renew => f.write_str("Renew"),
++            Up::Done => f.write_str("Done"),
++        }
++    }
++}
++
++impl std::fmt::Display for Down {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Down::Opened { conn } => write!(f, "Opened({conn})"),
++            Down::OpenFailed { conn, reason } => write!(f, "OpenFailed({conn}, {reason})"),
++            Down::Bytes { conn, bytes } => write!(f, "Bytes({conn}, {})", bytes.len()),
++            Down::Accepted { conn, req } => write!(f, "Accepted({conn}, req {req})"),
++            Down::Spliced { conn, req } => write!(f, "Spliced({conn}, req {req})"),
++            Down::Refused { conn, reason } => write!(f, "Refused({conn}, {reason})"),
++            Down::ServerClosed { conn } => write!(f, "ServerClosed({conn})"),
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Pool
++
++/// A token for one request, and the number the pool gives that request.
++pub struct Lease {
++    pub token: String,
++    pub req: u64,
++}
++
++/// Where the pool gets a token for each request: a fixed one, or a parent
++/// process that picks a lender per request.
++pub type TokenSource =
++    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Option<Lease>>> + Send>> + Send + Sync>;
++
++/// A token source lending the same credential to every request.
++pub fn fixed_token(token: String) -> TokenSource {
++    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
++    Arc::new(move || {
++        let token = token.clone();
++        let req = counter.fetch_add(1, Ordering::Relaxed) + 1;
++        Box::pin(async move { Ok(Some(Lease { token, req })) })
++    })
++}
++
++/// Opens a connection to the server.
++pub type Connector<S> =
++    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<S>> + Send>> + Send + Sync>;
++
++/// Test hook: a misbehaving pool's change to a request's headers after the
++/// token is in place.
++pub type Tamper = Option<Arc<dyn Fn(&mut Vec<u8>) + Send + Sync>>;
++
++/// Told to the parent after each splice (which request went on which lease).
++pub type OnSpliced = Arc<dyn Fn(u64) + Send + Sync>;
++
++/// What the pool counted.
++#[derive(Debug, Default)]
++pub struct PoolStats {
++    pub connections: u64,
++    pub requests: u64,
++    pub refused: u64,
++}
++
++/// Where a pool-side connection is in its life.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Phase {
++    /// Before the first splice: handshake records only.
++    Handshake,
++    /// Between requests: nothing but alerts may pass.
++    Idle,
++    /// A token record is being computed.
++    Splicing,
++    /// The borrower is sending the rest of a request.
++    Sending,
++}
++
++/// The per-connection state the pool keeps, and the checks on it. Pure, so
++/// it can be tested without a network.
++struct Gate {
++    phase: Phase,
++    handshake_bytes: usize,
++    spliced_once: bool,
++    last_splice_seq: u64,
++    records_since_splice: u64,
++    splice_nonces: HashSet<[u8; 8]>,
++    /// Bytes of the current request the borrower has yet to send.
++    remaining: usize,
++}
++
++impl Gate {
++    fn new() -> Self {
++        Self {
++            phase: Phase::Handshake,
++            handshake_bytes: 0,
++            spliced_once: false,
++            last_splice_seq: 0,
++            records_since_splice: 0,
++            splice_nonces: HashSet::new(),
++            remaining: 0,
++        }
++    }
++
++    /// Admits one record from the borrower, or refuses it.
++    fn accept_record(&mut self, record: &[u8]) -> Result<()> {
++        let typ = record[0];
++        let payload = &record[5..];
++        match self.phase {
++            Phase::Handshake => {
++                self.handshake_bytes += record.len();
++                ensure!(
++                    self.handshake_bytes <= MAX_HANDSHAKE_BYTES,
++                    "more than {MAX_HANDSHAKE_BYTES} bytes of handshake"
++                );
++                ensure!(
++                    typ != APPLICATION_DATA,
++                    "borrower sent application data before the token record"
++                );
++                Ok(())
++            }
++            Phase::Idle | Phase::Splicing => {
++                ensure!(
++                    typ == ALERT,
++                    "borrower sent a record of type {typ} outside a request"
++                );
++                Ok(())
++            }
++            Phase::Sending => match typ {
++                APPLICATION_DATA => {
++                    ensure!(payload.len() >= 24, "application-data record too short");
++                    let nonce: [u8; 8] = payload[..8].try_into().unwrap();
++                    ensure!(
++                        !self.splice_nonces.contains(&nonce),
++                        "borrower record reuses a token record's nonce"
++                    );
++                    let plaintext = payload.len() - 24;
++                    ensure!(
++                        plaintext <= self.remaining,
++                        "borrower sent {} bytes more than the request it announced",
++                        plaintext - self.remaining
++                    );
++                    self.remaining -= plaintext;
++                    self.records_since_splice += 1;
++                    if self.remaining == 0 {
++                        self.phase = Phase::Idle;
++                    }
++                    Ok(())
++                }
++                ALERT => Ok(()),
++                HANDSHAKE | CHANGE_CIPHER_SPEC => bail!("borrower sent a handshake record after the splice"),
++                other => bail!("record of unknown type {other}"),
++            },
++        }
++    }
++
++    /// Admits a splice request, or refuses it.
++    fn accept_splice(&mut self, seq: u64, nonce: &[u8; 12]) -> Result<()> {
++        match self.phase {
++            Phase::Handshake | Phase::Idle => {}
++            Phase::Splicing => bail!("borrower asked for a token record while one is pending"),
++            Phase::Sending => bail!(
++                "borrower asked for a token record with {} bytes of the previous request unsent",
++                self.remaining
++            ),
++        }
++        if self.spliced_once {
++            let expected = self.last_splice_seq + 1 + self.records_since_splice;
++            ensure!(
++                seq == expected,
++                "token record sequence number {seq} does not follow the {} records sent (expected {expected})",
++                self.records_since_splice
++            );
++        }
++        let explicit: [u8; 8] = nonce[4..].try_into().unwrap();
++        ensure!(!self.splice_nonces.contains(&explicit), "token record nonce reused");
++        self.phase = Phase::Splicing;
++        Ok(())
++    }
++
++    /// The token record is written; the borrower may send `request_len` bytes.
++    fn spliced(&mut self, seq: u64, nonce: &[u8; 12], request_len: usize) {
++        self.spliced_once = true;
++        self.last_splice_seq = seq;
++        self.records_since_splice = 0;
++        self.splice_nonces.insert(nonce[4..].try_into().unwrap());
++        self.remaining = request_len;
++        self.phase = if request_len == 0 { Phase::Idle } else { Phase::Sending };
++    }
++
++    /// The token record could not be made; back to where we were.
++    fn splice_failed(&mut self) {
++        self.phase = if self.spliced_once { Phase::Idle } else { Phase::Handshake };
++    }
++}
++
++struct PoolConn {
++    gate: Gate,
++    deframer: Deframer,
++    to_server: mpsc::Sender<Vec<u8>>,
++    reader: tokio::task::AbortHandle,
++    pending_tag: Option<oneshot::Sender<[u8; 16]>>,
++}
++
++enum Event {
++    Connected {
++        conn: u32,
++        to_server: mpsc::Sender<Vec<u8>>,
++        reader: tokio::task::AbortHandle,
++    },
++    ConnectFailed {
++        conn: u32,
++        err: String,
++    },
++    Spliced {
++        conn: u32,
++        req: u64,
++        seq: u64,
++        nonce: [u8; 12],
++        request_len: usize,
++    },
++    SpliceFailed {
++        conn: u32,
++        err: anyhow::Error,
++    },
++    ServerGone {
++        conn: u32,
++    },
++    Fatal(anyhow::Error),
++}
++
++/// Work for the proof task.
++enum Job {
++    Splice {
++        conn: u32,
++        headers: Vec<u8>,
++        span_idx: Vec<usize>,
++        seq: u64,
++        nonce: [u8; 12],
++        req: u64,
++        request_len: usize,
++        tag_rx: oneshot::Receiver<[u8; 16]>,
++        to_server: mpsc::Sender<Vec<u8>>,
++    },
++    Renew,
++}
++
++/// Runs the pool's side of a session.
++///
++/// `connect` opens a connection to the API server for each `Open`;
++/// `server_name` is the `Host` the borrower must use; `tokens` supplies a
++/// token per request; `on_spliced` is told the request number of each record
++/// written; `tamper` is a test hook for a misbehaving pool.
++#[allow(clippy::too_many_arguments)]
++pub async fn run_pool<S>(
++    mpc: Context,
++    mut up: Context,
++    mut down: Context,
++    connect: Connector<S>,
++    server_name: &str,
++    tokens: TokenSource,
++    on_spliced: Option<OnSpliced>,
++    tamper: Tamper,
++) -> Result<PoolStats>
++where
++    S: AsyncRead + AsyncWrite + Send + 'static,
++{
++    down.io_mut()
++        .send(Hello {
++            version: PROTOCOL_VERSION,
++            token_len: TOKEN_LEN,
++            server_name: server_name.to_string(),
++        })
++        .await
++        .context("prelude: greeting the borrower")?;
++
++    // The OT setup, paid once per session.
++    let t = Instant::now();
++    let mut mpc = mpc;
++    let mut verifying = Verifying::new();
++    tokio::time::timeout(SETUP_TIMEOUT, verifying.warm_up(&mut mpc))
++        .await
++        .context("warm-up timed out")??;
++    info!(took = ?t.elapsed(), "pool: session ready");
++
++    // Everything the pool sends goes through one task.
++    let (down_tx, mut down_rx) = mpsc::channel::<Down>(CONN_QUEUE);
++    let mut tasks = JoinSet::new();
++    let (events_tx, mut events) = mpsc::channel::<Event>(CONN_QUEUE);
++
++    // The proofs run on one task, in the order the requests arrived: the
++    // borrower proves in that same order, under one lock, so the two sides'
++    // transcripts on `mpc` line up.
++    let (jobs_tx, mut jobs) = mpsc::channel::<Job>(CONN_QUEUE);
++    {
++        let events_tx = events_tx.clone();
++        tasks.spawn(async move {
++            while let Some(job) = jobs.recv().await {
++                match job {
++                    Job::Renew => {
++                        let t = Instant::now();
++                        verifying = Verifying::new();
++                        if let Err(e) = tokio::time::timeout(SETUP_TIMEOUT, verifying.warm_up(&mut mpc))
++                            .await
++                            .context("renewal timed out")
++                            .and_then(|r| r)
++                        {
++                            let _ = events_tx.send(Event::Fatal(e)).await;
++                            return Ok(());
++                        }
++                        info!(took = ?t.elapsed(), "pool: setup renewed");
++                    }
++                    Job::Splice { conn, headers, span_idx, seq, nonce, req, request_len, tag_rx, to_server } => {
++                        let outcome = async {
++                            let (ciphertext, mine) = verifying
++                                .ciphertext_and_tag_share(&mut mpc, &headers, &span_idx, seq, &nonce)
++                                .await?;
++                            let theirs = tokio::time::timeout(SETUP_TIMEOUT, tag_rx)
++                                .await
++                                .context("waiting for the borrower's tag share")?
++                                .context("borrower never sent its tag share")?;
++                            let record = Verifying::finish_record(&nonce, &ciphertext, mine, theirs);
++                            to_server
++                                .send(record)
++                                .await
++                                .map_err(|_| anyhow::anyhow!("server connection closed"))?;
++                            Ok::<_, anyhow::Error>(())
++                        }
++                        .await;
++                        let event = match outcome {
++                            Ok(()) => Event::Spliced { conn, req, seq, nonce, request_len },
++                            Err(err) => Event::SpliceFailed { conn, err },
++                        };
++                        if events_tx.send(event).await.is_err() {
++                            return Ok(());
++                        }
++                    }
++                }
++            }
++            Ok(())
++        });
++    }
++    tasks.spawn(async move {
++        while let Some(frame) = down_rx.recv().await {
++            if let Err(e) = down.io_mut().send(frame).await {
++                debug!("pool: borrower left: {e}");
++                break;
++            }
++        }
++        Ok::<_, anyhow::Error>(())
++    });
++
++    let mut conns: HashMap<u32, PoolConn> = HashMap::new();
++    let mut connecting: HashSet<u32> = HashSet::new();
++    let mut stats = PoolStats::default();
++    let server_name = server_name.to_string();
++
++    loop {
++        tokio::select! {
++            frame = tokio::time::timeout(SESSION_IDLE_TIMEOUT, up.io_mut().expect_next::<Up>()) => {
++                let frame = match frame.context("no frame from the borrower for 2 h")? {
++                    Ok(frame) => frame,
++                    // The borrower closing its end is also how a session ends.
++                    Err(e) => {
++                        debug!("pool: borrower left: {e}");
++                        break;
++                    }
++                };
++                match frame {
++                    Up::Open { conn } => {
++                        ensure!(
++                            !conns.contains_key(&conn) && connecting.insert(conn),
++                            "connection {conn} already open"
++                        );
++                        ensure!(
++                            conns.len() + connecting.len() <= MAX_CONNECTIONS,
++                            "more than {MAX_CONNECTIONS} connections"
++                        );
++                        stats.connections += 1;
++                        let connect = connect.clone();
++                        let events_tx = events_tx.clone();
++                        let down_tx = down_tx.clone();
++                        tasks.spawn(async move {
++                            match tokio::time::timeout(SETUP_TIMEOUT, connect()).await {
++                                Ok(Ok(server)) => {
++                                    let (rd, wr) = tokio::io::split(server);
++                                    let (to_server, from_borrower) = mpsc::channel::<Vec<u8>>(CONN_QUEUE);
++                                    let reader = tokio::spawn(read_server(conn, rd, down_tx, events_tx.clone()));
++                                    tokio::spawn(write_server(wr, from_borrower));
++                                    let _ = events_tx
++                                        .send(Event::Connected { conn, to_server, reader: reader.abort_handle() })
++                                        .await;
++                                }
++                                Ok(Err(e)) => {
++                                    let _ = events_tx.send(Event::ConnectFailed { conn, err: format!("{e:#}") }).await;
++                                }
++                                Err(_) => {
++                                    let _ = events_tx
++                                        .send(Event::ConnectFailed { conn, err: "connect timed out".into() })
++                                        .await;
++                                }
++                            }
++                            Ok(())
++                        });
++                    }
++                    Up::Bytes { conn, bytes } => {
++                        ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
++                        let Some(c) = conns.get_mut(&conn) else {
++                            ensure!(!connecting.contains(&conn), "bytes for a connection that is not open yet");
++                            debug!("pool: bytes for closed connection {conn}, dropped");
++                            continue;
++                        };
++                        c.deframer.push(&bytes);
++                        while let Some(record) = c.deframer.next_record()? {
++                            c.gate.accept_record(&record)?;
++                            if c.to_server.send(record).await.is_err() {
++                                debug!("pool: connection {conn}'s server side is gone");
++                            }
++                        }
++                    }
++                    Up::Request { conn, header, trailer, seq, nonce } => {
++                        let Some(c) = conns.get_mut(&conn) else {
++                            // The server closed it a moment ago; the borrower
++                            // will hear so and try another connection.
++                            debug!("pool: token record requested on closed connection {conn}");
++                            let _ = down_tx.send(Down::ServerClosed { conn }).await;
++                            continue;
++                        };
++                        ensure!(c.deframer.is_empty(), "partial record pending at the splice");
++                        check_template(&header, TOKEN_LEN, &server_name).context("borrower's header rejected")?;
++                        let body_len = check_trailer(&header, &trailer).context("borrower's trailer rejected")?;
++                        c.gate.accept_splice(seq, &nonce)?;
++
++                        let lease = match tokens().await {
++                            Ok(Some(lease)) => lease,
++                            Ok(None) => {
++                                stats.refused += 1;
++                                c.gate.splice_failed();
++                                let _ = down_tx.send(Down::Refused { conn, reason: "no token available".into() }).await;
++                                continue;
++                            }
++                            Err(e) => {
++                                stats.refused += 1;
++                                c.gate.splice_failed();
++                                let _ = down_tx.send(Down::Refused { conn, reason: format!("{e:#}") }).await;
++                                continue;
++                            }
++                        };
++                        ensure!(lease.token.len() == TOKEN_LEN, "lease is not a {TOKEN_LEN}-byte credential");
++                        ensure!(
++                            !lease.token.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
++                            "credential contains whitespace or control characters"
++                        );
++                        let mut headers = header.template.clone();
++                        let span = &mut headers[header.token.clone()];
++                        span.fill(b' ');
++                        span[..lease.token.len()].copy_from_slice(lease.token.as_bytes());
++                        if let Some(tamper) = &tamper {
++                            tamper(&mut headers);
++                        }
++                        let span_idx = span_blocks(&header);
++                        let (tag_tx, tag_rx) = oneshot::channel();
++                        c.pending_tag = Some(tag_tx);
++                        // The borrower proves only once it knows there is a lender.
++                        let _ = down_tx.send(Down::Accepted { conn, req: lease.req }).await;
++                        jobs_tx
++                            .send(Job::Splice {
++                                conn,
++                                headers,
++                                span_idx,
++                                seq,
++                                nonce,
++                                req: lease.req,
++                                request_len: trailer.len() + body_len,
++                                tag_rx,
++                                to_server: c.to_server.clone(),
++                            })
++                            .await
++                            .map_err(|_| anyhow::anyhow!("proof worker is gone"))?;
++                    }
++                    Up::TagShare { conn, share } => {
++                        let Some(c) = conns.get_mut(&conn) else {
++                            bail!("tag share for a connection that is not open");
++                        };
++                        let tx = c.pending_tag.take().context("tag share without a pending token record")?;
++                        let _ = tx.send(share);
++                    }
++                    Up::Close { conn } => {
++                        if let Some(c) = conns.remove(&conn) {
++                            c.reader.abort();
++                            debug!("pool: connection {conn} closed by the borrower");
++                        }
++                    }
++                    Up::Renew => {
++                        jobs_tx
++                            .send(Job::Renew)
++                            .await
++                            .map_err(|_| anyhow::anyhow!("proof worker is gone"))?;
++                    }
++                    Up::Done => break,
++                }
++            }
++            Some(event) = events.recv() => match event {
++                Event::Connected { conn, to_server, reader } => {
++                    connecting.remove(&conn);
++                    conns.insert(conn, PoolConn {
++                        gate: Gate::new(),
++                        deframer: Deframer::default(),
++                        to_server,
++                        reader,
++                        pending_tag: None,
++                    });
++                    let _ = down_tx.send(Down::Opened { conn }).await;
++                }
++                Event::ConnectFailed { conn, err } => {
++                    connecting.remove(&conn);
++                    warn!("pool: connecting for {conn}: {err}");
++                    let _ = down_tx.send(Down::OpenFailed { conn, reason: err }).await;
++                }
++                Event::Spliced { conn, req, seq, nonce, request_len } => {
++                    if let Some(c) = conns.get_mut(&conn) {
++                        c.gate.spliced(seq, &nonce, request_len);
++                        stats.requests += 1;
++                        if let Some(cb) = &on_spliced {
++                            cb(req);
++                        }
++                        debug!(conn, req, seq, "pool: token record written");
++                        let _ = down_tx.send(Down::Spliced { conn, req }).await;
++                    }
++                }
++                Event::SpliceFailed { conn, err } => {
++                    // A failed proof is the borrower cheating or a bug; either
++                    // way this session is over.
++                    return Err(err.context(format!("token record for connection {conn}")));
++                }
++                Event::Fatal(err) => return Err(err),
++                Event::ServerGone { conn } => {
++                    if let Some(c) = conns.remove(&conn) {
++                        c.reader.abort();
++                        let _ = down_tx.send(Down::ServerClosed { conn }).await;
++                    }
++                }
++            },
++        }
++    }
++    for (_, c) in conns.drain() {
++        c.reader.abort();
++    }
++    tasks.abort_all();
++    info!(?stats, "pool: session done");
++    Ok(stats)
++}
++
++/// Forwards the server's bytes to the borrower until the server closes.
++async fn read_server<R: AsyncRead + Unpin>(
++    conn: u32,
++    mut rd: R,
++    down_tx: mpsc::Sender<Down>,
++    events_tx: mpsc::Sender<Event>,
++) {
++    let mut buf = vec![0u8; 64 << 10];
++    loop {
++        match rd.read(&mut buf).await {
++            Ok(0) | Err(_) => break,
++            Ok(n) => {
++                if down_tx
++                    .send(Down::Bytes {
++                        conn,
++                        bytes: buf[..n].to_vec(),
++                    })
++                    .await
++                    .is_err()
++                {
++                    return;
++                }
++            }
++        }
++    }
++    let _ = events_tx.send(Event::ServerGone { conn }).await;
++}
++
++/// Writes the borrower's records to the server in order.
++async fn write_server<W: AsyncWrite + Unpin>(mut wr: W, mut from_borrower: mpsc::Receiver<Vec<u8>>) {
++    while let Some(bytes) = from_borrower.recv().await {
++        if wr.write_all(&bytes).await.is_err() {
++            return;
++        }
++    }
++    let _ = wr.shutdown().await;
++}
++
++// ---------------------------------------------------------------------------
++// Borrower
++
++/// What one request came back with.
++#[derive(Debug)]
++pub struct Response {
++    /// The pool's number for the request.
++    pub req: u64,
++    /// HTTP status, once the head arrived.
++    pub status: Option<u16>,
++    /// Response bytes, head included.
++    pub bytes: usize,
++    /// Time from sending the body to the first response byte.
++    pub first_byte: Duration,
++    /// Whether the connection was reused from an earlier request.
++    pub reused: bool,
++}
++
++/// The pool declined to lend for this request; the connection is still fine.
++#[derive(Debug, thiserror::Error)]
++#[error("pool refused: {0}")]
++pub struct Refused(pub String);
++
++/// A reused connection turned out to be closed before the request went out;
++/// nothing was sent, so another connection can take the request.
++#[derive(Debug, thiserror::Error)]
++#[error("connection was closed by the server while idle")]
++struct Stale;
++
++/// A borrower's session with a pool.
++pub struct Session {
++    inner: Arc<Inner>,
++}
++
++struct Inner {
++    up: mpsc::Sender<Up>,
++    mpc: Mutex<(Proving, Context)>,
++    routes: std::sync::Mutex<HashMap<u32, mpsc::Sender<Down>>>,
++    idle: std::sync::Mutex<Vec<Conn>>,
++    idle_notify: Notify,
++    slots: Arc<Semaphore>,
++    next_conn: AtomicU32,
++    config: Arc<rustls::ClientConfig>,
++    server_name: String,
++    token_len: usize,
++}
++
++/// One TLS connection to the server, as the borrower holds it.
++struct Conn {
++    id: u32,
++    rx: mpsc::Receiver<Down>,
++    writer: LocalRecordWriter,
++    reader: LocalRecordReader,
++    key: [u8; 16],
++    iv: [u8; 4],
++    deframer: Deframer,
++    _slot: tokio::sync::OwnedSemaphorePermit,
++}
++
++impl Session {
++    /// Opens a session: reads the pool's `Hello`, pays the OT setup. The
++    /// `down` reader and `up` writer run as tasks until the session is
++    /// dropped.
++    pub async fn start(
++        mpc: Context,
++        mut up: Context,
++        mut down: Context,
++        roots: &rustls::RootCertStore,
++        server_name: &str,
++        token_len: usize,
++    ) -> Result<Self> {
++        let hello: Hello = tokio::time::timeout(SETUP_TIMEOUT, down.io_mut().expect_next())
++            .await
++            .context("waiting for the pool's hello")??;
++        info!(?hello, "borrower: pool says hello");
++        ensure!(
++            hello.version == PROTOCOL_VERSION,
++            "pool speaks protocol version {}, this borrower {PROTOCOL_VERSION}",
++            hello.version
++        );
++        ensure!(
++            hello.token_len == token_len,
++            "pool announced a {}-byte token, expected {token_len}",
++            hello.token_len
++        );
++        ensure!(
++            hello.server_name == server_name,
++            "pool lends for {}, this borrower wants {server_name}",
++            hello.server_name
++        );
++
++        let t = Instant::now();
++        let mut mpc = mpc;
++        let mut proving = Proving::new();
++        tokio::time::timeout(SETUP_TIMEOUT, proving.warm_up(&mut mpc))
++            .await
++            .context("warm-up timed out")??;
++        info!(took = ?t.elapsed(), "borrower: session ready");
++
++        let (up_tx, mut up_rx) = mpsc::channel::<Up>(CONN_QUEUE);
++        tokio::spawn(async move {
++            while let Some(frame) = up_rx.recv().await {
++                if let Err(e) = up.io_mut().send(frame).await {
++                    debug!("borrower: pool left: {e}");
++                    break;
++                }
++            }
++        });
++
++        let inner = Arc::new(Inner {
++            up: up_tx,
++            mpc: Mutex::new((proving, mpc)),
++            routes: std::sync::Mutex::new(HashMap::new()),
++            idle: std::sync::Mutex::new(Vec::new()),
++            idle_notify: Notify::new(),
++            slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
++            next_conn: AtomicU32::new(1),
++            config: tls_config(roots)?,
++            server_name: server_name.to_string(),
++            token_len,
++        });
++
++        let routes = Arc::clone(&inner);
++        tokio::spawn(async move {
++            loop {
++                let frame = match down.io_mut().expect_next::<Down>().await {
++                    Ok(frame) => frame,
++                    Err(e) => {
++                        debug!("borrower: pool left: {e}");
++                        routes.routes.lock().unwrap().clear();
++                        break;
++                    }
++                };
++                let conn = match &frame {
++                    Down::Opened { conn }
++                    | Down::OpenFailed { conn, .. }
++                    | Down::Bytes { conn, .. }
++                    | Down::Accepted { conn, .. }
++                    | Down::Spliced { conn, .. }
++                    | Down::Refused { conn, .. }
++                    | Down::ServerClosed { conn } => *conn,
++                };
++                let route = routes.routes.lock().unwrap().get(&conn).cloned();
++                match route {
++                    Some(tx) => {
++                        if tx.send(frame).await.is_err() {
++                            routes.routes.lock().unwrap().remove(&conn);
++                        }
++                    }
++                    None => debug!("borrower: frame for unknown connection {conn}"),
++                }
++            }
++        });
++
++        Ok(Self { inner })
++    }
++
++    /// Ends the session. Connections still open are closed by the pool when
++    /// the link goes.
++    pub async fn close(&self) {
++        let _ = self.inner.up.send(Up::Done).await;
++    }
++
++    /// Makes one request. `template` is the full header with
++    /// [`TOKEN_MARKER`](crate::TOKEN_MARKER) and [`BODY_LEN_MARKER`](crate::BODY_LEN_MARKER)
++    /// and a blank line at the end. The response is copied to `out` as it
++    /// arrives; `on_req` is told the pool's request number before the first
++    /// response byte.
++    pub async fn request<W: AsyncWrite + Unpin + Send>(
++        &self,
++        template: &str,
++        body: Vec<u8>,
++        out: &mut W,
++        on_req: impl FnOnce(u64) + Send + 'static,
++    ) -> Result<Response> {
++        let on_req: Box<dyn FnOnce(u64) + Send> = Box::new(on_req);
++        let inner = &self.inner;
++        let template = template.replace(crate::HOST_MARKER, &inner.server_name);
++        let (hidden, trailer) = split_template(&template)?;
++        let header = fill_template(&hidden, inner.token_len, body.len())?;
++        ensure!(body.len() <= MAX_BODY_LEN, "body of {} bytes is over the limit", body.len());
++        check_template(&header, inner.token_len, &inner.server_name)?;
++        check_trailer(&header, &trailer)?;
++        let span_idx = span_blocks(&header);
++
++        let (mut conn, mut reused) = inner.take_connection().await?;
++        let mut body = body;
++        let mut on_req = Some(on_req);
++        let result = loop {
++            let result = self
++                .request_on(&mut conn, &header, &trailer, &span_idx, &body, out, on_req.take().unwrap())
++                .await;
++            match result {
++                // The server dropped an idle connection under us; once more on a fresh one.
++                Err(e) if reused && e.downcast_ref::<Stale>().is_some() => {
++                    debug!("borrower: connection {} was stale, retrying on a new one", conn.id);
++                    inner.drop_connection(conn).await;
++                    let (c, _) = inner.take_connection().await?;
++                    conn = c;
++                    reused = false;
++                    body = std::mem::take(&mut body);
++                    on_req = Some(Box::new(|_| {}) as Box<dyn FnOnce(u64) + Send>);
++                }
++                other => break other,
++            }
++        };
++        match result {
++            Ok((response, keep)) => {
++                if keep {
++                    inner.idle.lock().unwrap().push(conn);
++                    inner.idle_notify.notify_one();
++                } else {
++                    inner.drop_connection(conn).await;
++                }
++                Ok(Response { reused, ..response })
++            }
++            Err(e) => {
++                // A refusal leaves the connection usable; anything else does not.
++                if e.downcast_ref::<Refused>().is_some() {
++                    inner.idle.lock().unwrap().push(conn);
++                    inner.idle_notify.notify_one();
++                } else {
++                    inner.drop_connection(conn).await;
++                }
++                Err(e)
++            }
++        }
++    }
++
++    /// The request proper, on a connection that is past its handshake.
++    /// Returns the response and whether the connection can serve again.
++    #[allow(clippy::too_many_arguments)]
++    async fn request_on<W: AsyncWrite + Unpin + Send>(
++        &self,
++        conn: &mut Conn,
++        header: &RequestHeader,
++        trailer: &[u8],
++        span_idx: &[usize],
++        body: &[u8],
++        out: &mut W,
++        on_req: Box<dyn FnOnce(u64) + Send>,
++    ) -> Result<(Response, bool)> {
++        let inner = &self.inner;
++        let seq = conn.writer.seq();
++        let mut nonce = [0u8; 12];
++        nonce[..4].copy_from_slice(&conn.iv);
++        nonce[4..].copy_from_slice(&seq.to_be_bytes());
++
++        // Request frame, proof and tag share go out under one lock, so the
++        // pool sees proofs in the order of the requests they belong to.
++        {
++            let mut guard = inner.mpc.lock().await;
++            let (proving, ctx) = &mut *guard;
++            if proving.requests >= RENEW_AFTER {
++                inner
++                    .up
++                    .send(Up::Renew)
++                    .await
++                    .map_err(|_| anyhow::anyhow!("session closed"))?;
++                let t = Instant::now();
++                *proving = Proving::new();
++                tokio::time::timeout(SETUP_TIMEOUT, proving.warm_up(ctx))
++                    .await
++                    .context("renewal timed out")??;
++                info!(took = ?t.elapsed(), "borrower: setup renewed");
++            }
++            inner
++                .up
++                .send(Up::Request {
++                    conn: conn.id,
++                    header: header.clone(),
++                    trailer: trailer.to_vec(),
++                    seq,
++                    nonce,
++                })
++                .await
++                .map_err(|_| anyhow::anyhow!("session closed"))?;
++            // Is there a lender? Only then is there a proof to make.
++            loop {
++                match tokio::time::timeout(SETUP_TIMEOUT, conn.rx.recv())
++                    .await
++                    .context("waiting for the pool to find a lender")?
++                    .context("session closed")?
++                {
++                    Down::Accepted { .. } => break,
++                    Down::Refused { reason, .. } => return Err(Refused(reason).into()),
++                    Down::ServerClosed { .. } => return Err(Stale.into()),
++                    Down::Bytes { bytes, .. } => {
++                        conn.deframer.push(&bytes);
++                        if let Some(record) = conn.deframer.next_record()? {
++                            let (typ, plaintext) = conn.reader.decrypt(&record)?;
++                            if typ == ALERT && plaintext == CLOSE_NOTIFY {
++                                return Err(Stale.into());
++                            }
++                            bail!("server sent a record of type {typ} before the request: {plaintext:?}");
++                        }
++                    }
++                    other => bail!("unexpected {other} while waiting for a lender"),
++                }
++            }
++            let share = tokio::time::timeout(
++                SETUP_TIMEOUT,
++                proving.tag_share(ctx, &conn.key, &header.template, span_idx, seq, &nonce),
++            )
++            .await
++            .context("keystream proof timed out")??;
++            inner
++                .up
++                .send(Up::TagShare {
++                    conn: conn.id,
++                    share,
++                })
++                .await
++                .map_err(|_| anyhow::anyhow!("session closed"))?;
++        }
++
++        // The pool's record goes first; ours follow at the next sequence number.
++        let req = loop {
++            match tokio::time::timeout(SETUP_TIMEOUT, conn.rx.recv())
++                .await
++                .context("waiting for the pool to write the token record")?
++                .context("session closed")?
++            {
++                Down::Spliced { req, .. } => break req,
++                Down::Refused { reason, .. } => return Err(Refused(reason).into()),
++                Down::Bytes { bytes, .. } => {
++                    // The server has nothing to say before the request, unless
++                    // it is rejecting it.
++                    conn.deframer.push(&bytes);
++                    if let Some(record) = conn.deframer.next_record()? {
++                        let (typ, plaintext) = conn.reader.decrypt(&record)?;
++                        bail!("server sent a record of type {typ} before the request: {plaintext:?}");
++                    }
++                }
++                Down::ServerClosed { .. } => bail!("server closed the connection before the request"),
++                other => bail!("unexpected {other} while waiting for the token record"),
++            }
++        };
++        on_req(req);
++        conn.writer.set_seq(seq + 1);
++
++        let payload = [trailer, body].concat();
++        let mut frame = Vec::with_capacity(FRAME_TARGET + MAX_RECORD_PLAINTEXT + 64);
++        for chunk in payload.chunks(MAX_RECORD_PLAINTEXT) {
++            frame.extend_from_slice(&conn.writer.encrypt(APPLICATION_DATA, chunk)?);
++            if frame.len() >= FRAME_TARGET {
++                inner
++                    .up
++                    .send(Up::Bytes {
++                        conn: conn.id,
++                        bytes: std::mem::take(&mut frame),
++                    })
++                    .await
++                    .map_err(|_| anyhow::anyhow!("session closed"))?;
++            }
++        }
++        if !frame.is_empty() {
++            inner
++                .up
++                .send(Up::Bytes {
++                    conn: conn.id,
++                    bytes: frame,
++                })
++                .await
++                .map_err(|_| anyhow::anyhow!("session closed"))?;
++        }
++        let sent_at = Instant::now();
++
++        // The response, until its framing says it is complete.
++        let mut framer = crate::local::ResponseFramer::default();
++        let mut first_byte = None;
++        let mut total = 0usize;
++        let mut server_closed = false;
++        loop {
++            let frame = tokio::time::timeout(RESPONSE_IDLE_TIMEOUT, conn.rx.recv())
++                .await
++                .context("no response bytes for 10 min")?
++                .context("session closed")?;
++            match frame {
++                Down::Bytes { bytes, .. } => {
++                    ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
++                    conn.deframer.push(&bytes);
++                    while let Some(record) = conn.deframer.next_record()? {
++                        let (typ, plaintext) = conn.reader.decrypt(&record)?;
++                        match typ {
++                            APPLICATION_DATA => {
++                                first_byte.get_or_insert_with(|| sent_at.elapsed());
++                                let used = framer.feed(&plaintext)?;
++                                ensure!(
++                                    used == plaintext.len(),
++                                    "server sent {} bytes beyond the response",
++                                    plaintext.len() - used
++                                );
++                                total += plaintext.len();
++                                out.write_all(&plaintext).await?;
++                                out.flush().await?;
++                            }
++                            ALERT => {
++                                ensure!(plaintext == CLOSE_NOTIFY, "unexpected alert from the server: {plaintext:?}");
++                                debug!("borrower: server sent close_notify");
++                                server_closed = true;
++                            }
++                            typ => bail!("unexpected record type {typ}"),
++                        }
++                    }
++                }
++                Down::ServerClosed { .. } => server_closed = true,
++                other => bail!("unexpected {other} during the response"),
++            }
++            if framer.complete() {
++                break;
++            }
++            if server_closed {
++                if framer.complete_at_close() {
++                    break;
++                }
++                bail!("server closed the connection with the response incomplete");
++            }
++        }
++        let keep = framer.keep_alive() && !server_closed;
++        Ok((
++            Response {
++                req,
++                status: framer.status(),
++                bytes: total,
++                first_byte: first_byte.unwrap_or_default(),
++                reused: false,
++            },
++            keep,
++        ))
++    }
++}
++
++impl Inner {
++    /// An idle connection, or a new one once a slot is free.
++    async fn take_connection(self: &Arc<Self>) -> Result<(Conn, bool)> {
++        loop {
++            if let Some(conn) = self.idle.lock().unwrap().pop() {
++                // It may have been closed by the server while idle.
++                return Ok((conn, true));
++            }
++            match Arc::clone(&self.slots).try_acquire_owned() {
++                Ok(slot) => return Ok((self.open_connection(slot).await?, false)),
++                Err(_) => self.idle_notify.notified().await,
++            }
++        }
++    }
++
++    async fn drop_connection(&self, conn: Conn) {
++        self.routes.lock().unwrap().remove(&conn.id);
++        let _ = self.up.send(Up::Close { conn: conn.id }).await;
++        // The slot frees when `conn` drops; wake a waiter.
++        drop(conn);
++        self.idle_notify.notify_one();
++    }
++
++    /// Opens a connection through the pool and runs the TLS handshake.
++    async fn open_connection(&self, slot: tokio::sync::OwnedSemaphorePermit) -> Result<Conn> {
++        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
++        let (tx, mut rx) = mpsc::channel::<Down>(CONN_QUEUE);
++        self.routes.lock().unwrap().insert(id, tx);
++        let result = async {
++            self.up
++                .send(Up::Open { conn: id })
++                .await
++                .map_err(|_| anyhow::anyhow!("session closed"))?;
++            match tokio::time::timeout(SETUP_TIMEOUT, rx.recv())
++                .await
++                .context("waiting for the pool to connect")?
++                .context("session closed")?
++            {
++                Down::Opened { .. } => {}
++                Down::OpenFailed { reason, .. } => bail!("pool could not connect: {reason}"),
++                other => bail!("unexpected {other} while opening a connection"),
++            }
++
++            let name = rustls::pki_types::ServerName::try_from(self.server_name.clone())?;
++            let mut tls = rustls::ClientConnection::new(self.config.clone(), name)?;
++            let mut deframer = Deframer::default();
++            loop {
++                let mut bytes = Vec::new();
++                while tls.wants_write() {
++                    tls.write_tls(&mut bytes)?;
++                }
++                if !bytes.is_empty() {
++                    self.up
++                        .send(Up::Bytes { conn: id, bytes })
++                        .await
++                        .map_err(|_| anyhow::anyhow!("session closed"))?;
++                }
++                if !tls.is_handshaking() {
++                    break;
++                }
++                match tokio::time::timeout(SETUP_TIMEOUT, rx.recv())
++                    .await
++                    .context("no bytes from the server")?
++                    .context("session closed")?
++                {
++                    Down::Bytes { bytes, .. } => {
++                        let mut rest = &bytes[..];
++                        while !rest.is_empty() {
++                            ensure!(tls.read_tls(&mut rest)? > 0, "TLS client refused the server's bytes");
++                            tls.process_new_packets().context("TLS handshake with the server")?;
++                        }
++                    }
++                    Down::ServerClosed { .. } => bail!("server closed the connection during the handshake"),
++                    other => bail!("unexpected {other} during the handshake"),
++                }
++            }
++            // rustls keeps nothing after the handshake in TLS 1.2, so nothing
++            // is left in its buffer to carry over.
++            let hs = extract_keys(tls)?;
++            let key = hs.keys.client_write_key;
++            let iv = hs.keys.client_write_iv;
++            let (writer, reader) = LocalRecordLayer::new(&hs.keys, hs.write_seq, hs.read_seq).split();
++            debug!(id, write_seq = hs.write_seq, read_seq = hs.read_seq, "borrower: connection ready");
++            // Anything the server sent after its Finished belongs to the record layer.
++            let _ = &mut deframer;
++            Ok::<_, anyhow::Error>((writer, reader, key, iv))
++        }
++        .await;
++        match result {
++            Ok((writer, reader, key, iv)) => Ok(Conn {
++                id,
++                rx,
++                writer,
++                reader,
++                key,
++                iv,
++                deframer: Deframer::default(),
++                _slot: slot,
++            }),
++            Err(e) => {
++                self.routes.lock().unwrap().remove(&id);
++                let _ = self.up.send(Up::Close { conn: id }).await;
++                Err(e)
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn app_record(nonce: u64, plaintext_len: usize) -> Vec<u8> {
++        let len = 8 + plaintext_len + 16;
++        let mut r = vec![APPLICATION_DATA, 3, 3, (len >> 8) as u8, len as u8];
++        r.extend_from_slice(&nonce.to_be_bytes());
++        r.extend(std::iter::repeat_n(0u8, plaintext_len + 16));
++        r
++    }
++
++    fn nonce_for(seq: u64) -> [u8; 12] {
++        let mut n = [9u8; 12];
++        n[4..].copy_from_slice(&seq.to_be_bytes());
++        n
++    }
++
++    #[test]
++    fn gate_requires_a_fresh_request_per_splice() {
++        let mut g = Gate::new();
++        // Handshake: no application data.
++        g.accept_record(&[HANDSHAKE, 3, 3, 0, 1, 0]).unwrap();
++        assert!(g.accept_record(&app_record(1, 10)).is_err());
++        // First splice at seq 1, a 100-byte request follows.
++        g.accept_splice(1, &nonce_for(1)).unwrap();
++        g.spliced(1, &nonce_for(1), 100);
++        assert_eq!(g.phase, Phase::Sending);
++        // Reusing the token record's nonce is refused.
++        assert!(g.accept_record(&app_record(1, 40)).is_err());
++        let mut g = Gate::new();
++        g.accept_splice(1, &nonce_for(1)).unwrap();
++        g.spliced(1, &nonce_for(1), 100);
++        g.accept_record(&app_record(2, 40)).unwrap();
++        // A splice mid-request is refused.
++        assert!(g.accept_splice(4, &nonce_for(4)).is_err());
++        assert_eq!(g.phase, Phase::Sending);
++        g.accept_record(&app_record(3, 60)).unwrap();
++        assert_eq!(g.phase, Phase::Idle);
++        // One byte too many, or any application data while idle, is refused.
++        assert!(g.accept_record(&app_record(4, 1)).is_err());
++        // The next splice must take the next sequence number: 1 + 1 + 2 records.
++        assert!(g.accept_splice(5, &nonce_for(5)).is_err());
++        let mut g2 = Gate::new();
++        g2.accept_splice(1, &nonce_for(1)).unwrap();
++        g2.spliced(1, &nonce_for(1), 100);
++        g2.accept_record(&app_record(2, 40)).unwrap();
++        g2.accept_record(&app_record(3, 60)).unwrap();
++        g2.accept_splice(4, &nonce_for(4)).unwrap();
++        assert_eq!(g2.phase, Phase::Splicing);
++        // While splicing, no application data; alerts pass.
++        assert!(g2.accept_record(&app_record(5, 1)).is_err());
++        g2.accept_record(&[ALERT, 3, 3, 0, 1, 0]).unwrap();
++        // A refused lease returns to idle, and the same seq is fine again.
++        g2.splice_failed();
++        assert_eq!(g2.phase, Phase::Idle);
++        g2.accept_splice(4, &nonce_for(4)).unwrap();
++    }
++}
+diff --git a/crates/lembas-mpc/src/splice.rs b/crates/lembas-mpc/src/splice.rs
+new file mode 100644
+index 0000000..9f38d05
+--- /dev/null
++++ b/crates/lembas-mpc/src/splice.rs
+@@ -0,0 +1,665 @@
++//! The spliced token record: the primitives.
++//!
++//! The borrower owns the TLS session (an ordinary rustls client whose keys it
++//! takes out after the handshake); the pool inserts one record per request,
++//! the one carrying the token. For that record it needs:
++//!
++//! - **Keystream**: AES on the borrower's client key, proven in zero knowledge
++//!   (mpz's QuickSilver VM over ferret correlated OT). The borrower is the
++//!   prover, so its key stays private against a malicious pool; the pool is the
++//!   verifier and receives the keystream with a soundness guarantee against a
++//!   borrower that would pass off a keystream of its choosing (say zeros, which
++//!   would put the token on the pool's uplink in the clear). Nothing is
++//!   garbled: the pool has no private input, so a proof is all it needs.
++//! - **The tag**: the borrower knows `H` and `E_K(J0)` and computes the GHASH
++//!   terms for every block it knows; the token span's blocks go through one
++//!   multiplicative-to-additive share conversion each, with the pool's
++//!   ciphertext block as its input. The pool learns only the finished tag.
++//!
++//! The protocol that uses these, with many connections and many requests per
++//! session, is in [`crate::session`].
++
++use std::sync::Arc;
 +
 +use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 +use anyhow::{Context as _, Result, bail, ensure};
@@ -1804,7 +3939,6 @@ index 0000000..7d31aa6
 +use mpz_ole::{Receiver as OleReceiver, Sender as OleSender};
 +use mpz_ot::{
 +    chou_orlandi as co, ferret, kos,
-+    rcot::shared::{SharedRCOTReceiver, SharedRCOTSender},
 +    rot::{
 +        any::{AnyReceiver, AnySender},
 +        randomize::{RandomizeRCOTReceiver, RandomizeRCOTSender},
@@ -1814,65 +3948,21 @@ index 0000000..7d31aa6
 +    MultiplicativeToAdditive, ShareConversionReceiver, ShareConversionSender,
 +};
 +use mpz_vm_core::{
-+    Call, Execute, Vm,
++    Call, Vm,
 +    memory::{Array, binary::U8},
 +    prelude::*,
 +};
 +use mpz_zk::{Prover, Verifier};
 +use rustls::crypto::{CryptoProvider, ring};
-+use serde::{Deserialize, Serialize};
-+use serio::{SinkExt, stream::IoStreamExt};
-+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-+use tracing::{debug, info};
++use tracing::debug;
 +
 +use crate::{
-+    Hello, MAX_PENDING_BYTES, MAX_SENT_BYTES, PROTOCOL_VERSION, RELAY_IDLE_TIMEOUT,
-+    RELAY_MAX_DURATION, RequestHeader, SETUP_TIMEOUT, TOKEN_LEN, Tamper, check_template,
-+    fill_template,
-+    record::{ALERT, APPLICATION_DATA, CLOSE_NOTIFY, LocalRecordLayer, MAX_RECORD_PLAINTEXT, TrafficKeys, tls12_aad},
-+    split_template,
++    RequestHeader,
++    record::{APPLICATION_DATA, TrafficKeys, tls12_aad},
 +};
 +
-+/// Most handshake bytes the pool relays from the borrower before the splice.
-+pub const MAX_HANDSHAKE_BYTES: usize = 64 << 10;
-+/// Largest frame either side accepts on the relay channels.
-+pub const MAX_FRAME_BYTES: usize = 256 << 10;
-+/// Frame size the borrower batches its records into.
-+const FRAME_TARGET: usize = 64 << 10;
 +/// Largest TLS record payload on the wire (plaintext plus AEAD expansion).
 +const MAX_RECORD_WIRE: usize = (1 << 14) + 2048;
-+
-+/// Everything that crosses the relay channels after the opening messages.
-+#[derive(Debug, Serialize, Deserialize)]
-+pub enum Frame {
-+    /// TLS bytes to relay: borrower → server on `up`, server → borrower on
-+    /// `down`.
-+    Bytes(Vec<u8>),
-+    /// The borrower's handshake is done; the pool's record takes this
-+    /// sequence number and nonce.
-+    Splice { seq: u64, nonce: [u8; 12] },
-+    /// The borrower's share of the token record's tag.
-+    TagShare([u8; 16]),
-+    /// The pool wrote the token record; the borrower may continue.
-+    Spliced,
-+    /// The server closed its side.
-+    ServerClosed,
-+    /// The borrower is finished with the connection.
-+    Done,
-+}
-+
-+impl std::fmt::Display for Frame {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-+        match self {
-+            Frame::Bytes(b) => write!(f, "Bytes({})", b.len()),
-+            Frame::Splice { seq, .. } => write!(f, "Splice(seq {seq})"),
-+            Frame::TagShare(_) => f.write_str("TagShare"),
-+            Frame::Spliced => f.write_str("Spliced"),
-+            Frame::ServerClosed => f.write_str("ServerClosed"),
-+            Frame::Done => f.write_str("Done"),
-+        }
-+    }
-+}
 +
 +// ---------------------------------------------------------------------------
 +// TLS record framing
@@ -1915,11 +4005,11 @@ index 0000000..7d31aa6
 +    }
 +}
 +
-+/// Encodes a TLS 1.2 AES-GCM record from its parts.
-+fn encode_record(nonce: &[u8; 12], ciphertext: &[u8], tag: [u8; 16]) -> Vec<u8> {
++/// Encodes a TLS 1.2 AES-GCM application-data record from its parts.
++pub(crate) fn encode_record(nonce: &[u8; 12], ciphertext: &[u8], tag: [u8; 16]) -> Vec<u8> {
 +    let len = 8 + ciphertext.len() + 16;
 +    let mut record = Vec::with_capacity(5 + len);
-+    record.extend_from_slice(&[0x17, 0x03, 0x03]);
++    record.extend_from_slice(&[APPLICATION_DATA, 0x03, 0x03]);
 +    record.extend_from_slice(&(len as u16).to_be_bytes());
 +    record.extend_from_slice(&nonce[4..]);
 +    record.extend_from_slice(ciphertext);
@@ -1978,7 +4068,7 @@ index 0000000..7d31aa6
 +/// Which GHASH block indices hold the token span. Ciphertext block `k` is
 +/// data block `1 + k`, after the single AAD block; the span is block aligned
 +/// (`check_template`), so these blocks hold nothing but the span.
-+fn span_blocks(header: &RequestHeader) -> Vec<usize> {
++pub(crate) fn span_blocks(header: &RequestHeader) -> Vec<usize> {
 +    (header.token.start / 16..header.token.end.div_ceil(16))
 +        .map(|k| 1 + k)
 +        .collect()
@@ -2002,100 +4092,290 @@ index 0000000..7d31aa6
 +// ---------------------------------------------------------------------------
 +// MPC plumbing
 +
-+/// KOS correlated OT, for the share conversion.
-+type CotSender = SharedRCOTSender<kos::Sender<co::Receiver>, Block>;
-+type CotReceiver = SharedRCOTReceiver<kos::Receiver<co::Sender>, bool, Block>;
-+
-+/// Correlated OT for the proof: ferret (LPN-based extension) over KOS, as
-+/// tlsn does it. KOS alone costs the receiver, here the borrower, 16 bytes per
-+/// correlation; ferret amortizes that to a fraction of a bit.
-+type ProofCotSender = SharedRCOTSender<ferret::Sender<kos::Sender<co::Receiver>>, Block>;
-+type ProofCotReceiver =
-+    SharedRCOTReceiver<ferret::Receiver<kos::Receiver<co::Sender>>, bool, Block>;
++/// Correlated OT: ferret (LPN-based extension) over KOS, as tlsn does it.
++/// KOS alone costs the receiver, here the borrower, 16 bytes per correlation
++/// and can only extend once; ferret amortizes to a fraction of a bit and
++/// extends as often as a session needs.
++type CotSender = ferret::Sender<kos::Sender<co::Receiver>>;
++type CotReceiver = ferret::Receiver<kos::Receiver<co::Sender>>;
 +/// The pool verifies the keystream proof; its correlated-OT sender carries
 +/// the VOLE correlations the proof runs on.
-+type PoolVm = Verifier<ProofCotSender>;
++type PoolVm = Verifier<CotSender>;
 +/// The borrower proves the keystream.
-+type BorrowerVm = Prover<ProofCotReceiver>;
-+
-+fn ferret_config() -> ferret::FerretConfig {
-+    ferret::FerretConfig::builder()
-+        .lpn_type(ferret::LpnType::Regular)
-+        .build()
-+        .expect("ferret config is valid")
-+}
-+
-+/// The pool's share converter: OLE sender on its correlated-OT sender.
++type BorrowerVm = Prover<CotReceiver>;
++/// The pool's share converter: OLE sender on a correlated-OT sender of its own.
 +type PoolConverter =
 +    ShareConversionSender<OleSender<AnySender<RandomizeRCOTSender<CotSender>>, Gf2_128>, Gf2_128>;
-+/// The borrower's share converter: OLE receiver on its correlated-OT receiver.
++/// The borrower's share converter: OLE receiver on a correlated-OT receiver
++/// of its own.
 +type BorrowerConverter = ShareConversionReceiver<
 +    OleReceiver<AnyReceiver<RandomizeRCOTReceiver<CotReceiver>>, Gf2_128>,
 +    Gf2_128,
 +>;
 +
-+/// One KOS sender (with its delta) and one KOS receiver for a party.
-+fn cot_pair() -> (Delta, CotSender, CotReceiver) {
-+    let mut rng = rand::rng();
-+    let delta = Delta::random(&mut rng);
-+    let cot_send = SharedRCOTSender::new(kos::Sender::new(
-+        kos::SenderConfig::default(),
-+        delta.into_inner(),
-+        co::Receiver::default(),
-+    ));
-+    let cot_recv = SharedRCOTReceiver::new(kos::Receiver::new(
-+        kos::ReceiverConfig::default(),
-+        co::Sender::default(),
-+    ));
-+    (delta, cot_send, cot_recv)
++/// The pool's side of the two-party computation, for a whole session.
++pub type Verifying = Party<PoolVm, PoolConverter>;
++/// The borrower's side of the two-party computation, for a whole session.
++pub type Proving = Party<BorrowerVm, BorrowerConverter>;
++
++/// Which ferret parameters an instance extends with.
++#[derive(Clone, Copy)]
++enum Batch {
++    /// mpz's default choice: the smallest set that covers the request,
++    /// 256k correlations per extension. Right for the share conversion,
++    /// which needs under a thousand per request.
++    Small,
++    /// A million correlations per extension, 16 MB of memory. One request's
++    /// proof needs about 75k, so this is one extension (~300 KB, pool to
++    /// borrower) per dozen requests instead of per three; the price is a
++    /// bootstrap of 39k instead of 13k base correlations (about 0.4 MB more,
++    /// borrower to pool, once per session).
++    Proof,
 +}
 +
-+/// The pool's VM: the zero-knowledge verifier. It has no private input and
-+/// learns the keystream, which the borrower knows anyway.
-+///
-+/// The share converter gets a correlated-OT instance of its own rather than a
-+/// clone of the VM's: a shared instance's `flush` is a barrier across every
-+/// handle with allocations, and the two are flushed at different times. The
-+/// extra base OT costs about a millisecond.
-+fn pool_vm() -> (PoolVm, PoolConverter) {
-+    let mut rng = rand::rng();
-+    let delta = Delta::random(&mut rng);
++fn ferret_config(batch: Batch) -> ferret::FerretConfig {
++    let mut builder = ferret::FerretConfig::builder();
++    builder.lpn_type(ferret::LpnType::Regular);
++    if let Batch::Proof = batch {
++        // The first extension runs on the bootstrap correlations, which only
++        // cover the smallest parameters; from then on, a million at a time.
++        builder.param_selector(|_, available, _| {
++            if available < 80_000 {
++                // mpz's smallest regular parameters.
++                mpz_core::lpn::LpnParameters {
++                    n: 256_000,
++                    k: 13_249,
++                    t: 2_000,
++                }
++            } else {
++                mpz_core::lpn::LpnParameters {
++                    n: 1_024_000,
++                    k: 38_737,
++                    t: 2_000,
++                }
++            }
++        });
++    }
++    builder.build().expect("ferret config is valid")
++}
++
++fn cot_sender(rng: &mut rand::rngs::ThreadRng, batch: Batch) -> (Delta, CotSender) {
++    let delta = Delta::random(rng);
 +    let kos = kos::Sender::new(
 +        kos::SenderConfig::default(),
 +        delta.into_inner(),
 +        co::Receiver::default(),
 +    );
-+    let cot_send = SharedRCOTSender::new(ferret::Sender::new(
-+        ferret_config(),
-+        Block::random(&mut rng),
-+        kos,
-+    ));
-+    let vm = Verifier::new(Default::default(), delta, cot_send);
-+    let (_, ole_cot, _) = cot_pair();
-+    let converter = ShareConversionSender::new(OleSender::new(
-+        Block::random(&mut rand::rng()),
-+        AnySender::new(RandomizeRCOTSender::new(ole_cot)),
-+    ));
-+    (vm, converter)
++    (delta, ferret::Sender::new(ferret_config(batch), Block::random(rng), kos))
 +}
 +
-+/// The borrower's VM: the zero-knowledge prover. Its key is a witness,
-+/// private against a malicious pool. The roles are fixed in code: the key
-+/// holder proves, and no message from the peer can change that.
-+fn borrower_vm() -> (BorrowerVm, BorrowerConverter) {
-+    let mut rng = rand::rng();
++fn cot_receiver(rng: &mut rand::rngs::ThreadRng, batch: Batch) -> CotReceiver {
 +    let kos = kos::Receiver::new(kos::ReceiverConfig::default(), co::Sender::default());
-+    let cot_recv = SharedRCOTReceiver::new(ferret::Receiver::new(
-+        ferret_config(),
-+        Block::random(&mut rng),
-+        kos,
-+    ));
-+    let vm = Prover::new(Default::default(), cot_recv);
-+    let (_, _, ole_cot) = cot_pair();
-+    let converter = ShareConversionReceiver::new(OleReceiver::new(AnyReceiver::new(
-+        RandomizeRCOTReceiver::new(ole_cot),
-+    )));
-+    (vm, converter)
++    ferret::Receiver::new(ferret_config(batch), Block::random(rng), kos)
++}
++
++/// One party's zero-knowledge VM and share converter.
++///
++/// Each has a correlated-OT instance of its own. mpz's shared instance would
++/// let them draw on one, but its `flush` is a barrier that every live handle
++/// must reach, and the converter only flushes its handle when it has
++/// conversions queued, so a VM flush with an idle converter would wait
++/// forever. Two ferret setups per session cost less than untangling that.
++pub struct Party<V, C> {
++    vm: V,
++    converter: C,
++    /// Requests proven or verified since this setup.
++    pub requests: usize,
++}
++
++impl Verifying {
++    pub fn new() -> Self {
++        let mut rng = rand::rng();
++        let (delta, cot) = cot_sender(&mut rng, Batch::Proof);
++        let vm = Verifier::new(Default::default(), delta, cot);
++        let (_, cot) = cot_sender(&mut rng, Batch::Small);
++        let converter = ShareConversionSender::new(OleSender::new(
++            Block::random(&mut rng),
++            AnySender::new(RandomizeRCOTSender::new(cot)),
++        ));
++        Self {
++            vm,
++            converter,
++            requests: 0,
++        }
++    }
++
++    /// Pays the OT setup now rather than at the first request: one throwaway
++    /// block proven and checked, one share conversion.
++    pub async fn warm_up(&mut self, ctx: &mut Context) -> Result<()> {
++        self.keystream(ctx, 1, None, &[0u8; 12]).await?;
++        self.convert_to_additive(ctx, &[Gf2_128::one()]).await?;
++        debug!("verifier warmed up");
++        Ok(())
++    }
++
++    /// Computes the token record's ciphertext and this side's share of the
++    /// tag. `headers` is the record's plaintext with the token in place.
++    pub async fn ciphertext_and_tag_share(
++        &mut self,
++        ctx: &mut Context,
++        headers: &[u8],
++        span_idx: &[usize],
++        seq: u64,
++        nonce: &[u8; 12],
++    ) -> Result<(Vec<u8>, Gf2_128)> {
++        self.requests += 1;
++        let keystream = self.keystream(ctx, headers.len().div_ceil(16), None, nonce).await?;
++        let ciphertext = xor_keystream(headers, &keystream);
++        let blocks = ghash_blocks(&tls12_aad(seq, APPLICATION_DATA, headers.len()), &ciphertext);
++        let inputs: Vec<Gf2_128> = span_idx.iter().map(|&j| gf(blocks[j])).collect();
++        let shares = self.convert_to_additive(ctx, &inputs).await?;
++        let mine = shares.into_iter().fold(Gf2_128::zero(), |acc, s| acc + s);
++        Ok((ciphertext, mine))
++    }
++
++    /// The finished record, once the borrower's tag share has arrived.
++    pub fn finish_record(
++        nonce: &[u8; 12],
++        ciphertext: &[u8],
++        mine: Gf2_128,
++        theirs: [u8; 16],
++    ) -> Vec<u8> {
++        encode_record(nonce, ciphertext, un_gf(gf(theirs) + mine))
++    }
++}
++
++impl Default for Verifying {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl Proving {
++    pub fn new() -> Self {
++        let mut rng = rand::rng();
++        let vm = Prover::new(Default::default(), cot_receiver(&mut rng, Batch::Proof));
++        let converter = ShareConversionReceiver::new(OleReceiver::new(AnyReceiver::new(
++            RandomizeRCOTReceiver::new(cot_receiver(&mut rng, Batch::Small)),
++        )));
++        Self {
++            vm,
++            converter,
++            requests: 0,
++        }
++    }
++
++    /// Mirrors [`Verifying::warm_up`].
++    pub async fn warm_up(&mut self, ctx: &mut Context) -> Result<()> {
++        self.keystream(ctx, 1, Some([0u8; 16]), &[0u8; 12]).await?;
++        self.convert_to_additive(ctx, &[Gf2_128::one()]).await?;
++        debug!("prover warmed up");
++        Ok(())
++    }
++
++    /// Proves the keystream for the record and returns this side's tag share.
++    /// `template` is the record's plaintext with the span filled with
++    /// placeholders; only the blocks outside the span count.
++    pub async fn tag_share(
++        &mut self,
++        ctx: &mut Context,
++        key: &[u8; 16],
++        template: &[u8],
++        span_idx: &[usize],
++        seq: u64,
++        nonce: &[u8; 12],
++    ) -> Result<[u8; 16]> {
++        self.requests += 1;
++        let keystream = self.keystream(ctx, template.len().div_ceil(16), Some(*key), nonce).await?;
++
++        let h = gf(aes_block(key, [0u8; 16]));
++        let e_j0 = gf(aes_block(key, counter_block(nonce, 1)));
++        let ciphertext = xor_keystream(template, &keystream);
++        let blocks = ghash_blocks(&tls12_aad(seq, APPLICATION_DATA, template.len()), &ciphertext);
++        let powers = h_powers(h, blocks.len());
++        let local = blocks
++            .iter()
++            .zip(&powers)
++            .enumerate()
++            .filter(|(j, _)| !span_idx.contains(j))
++            .fold(Gf2_128::zero(), |acc, (_, (block, power))| acc + gf(*block) * *power);
++        let inputs: Vec<Gf2_128> = span_idx.iter().map(|&j| powers[j]).collect();
++        let shares = self.convert_to_additive(ctx, &inputs).await?;
++        let joint = shares.into_iter().fold(Gf2_128::zero(), |acc, s| acc + s);
++        Ok(un_gf(e_j0 + local + joint))
++    }
++}
++
++impl Default for Proving {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl<V, C> Party<V, C>
++where
++    V: Vm<mpz_vm_core::memory::binary::Binary>,
++    C: MultiplicativeToAdditive<Gf2_128> + Flush,
++    <C as MultiplicativeToAdditive<Gf2_128>>::Error: std::fmt::Display,
++    <C as Flush>::Error: std::fmt::Display,
++{
++    /// Runs the keystream circuit for `blocks` counter blocks and returns the
++    /// keystream. `key` is `Some` on the prover only. On the verifier the
++    /// outputs are correct for whatever key the prover committed to, or the
++    /// proof fails and this errors.
++    async fn keystream(
++        &mut self,
++        ctx: &mut Context,
++        blocks: usize,
++        key: Option<[u8; 16]>,
++        nonce: &[u8; 12],
++    ) -> Result<Vec<[u8; 16]>> {
++        let vm = &mut self.vm;
++        let ks = alloc_keystream(vm, blocks, key.is_some())?;
++        if let Some(key) = key {
++            vm.assign(ks.key, key)?;
++        }
++        vm.commit(ks.key)?;
++        for (i, ctr) in ks.counters.iter().enumerate() {
++            // J0 is counter 1; the keystream starts at counter 2.
++            vm.assign(*ctr, counter_block(nonce, i as u32 + 2))?;
++            vm.commit(*ctr)?;
++        }
++        vm.flush(ctx).await?;
++        vm.execute(ctx).await?;
++        // The verifier's check of the proof happens in this flush; a prover
++        // that cheated is caught before the keystream is used.
++        vm.flush(ctx).await.context("keystream proof")?;
++        ks.outputs
++            .into_iter()
++            .map(|mut out| {
++                out.try_recv()?
++                    .context("keystream block was not decoded")
++            })
++            .collect()
++    }
++
++    /// Additive shares of `my_input * their_input`, one per element.
++    async fn convert_to_additive(&mut self, ctx: &mut Context, inputs: &[Gf2_128]) -> Result<Vec<Gf2_128>> {
++        if inputs.is_empty() {
++            return Ok(Vec::new());
++        }
++        let converter = &mut self.converter;
++        MultiplicativeToAdditive::<Gf2_128>::alloc(converter, inputs.len())
++            .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
++        let mut out = converter
++            .queue_to_additive(inputs)
++            .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
++        converter
++            .flush(ctx)
++            .await
++            .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
++        Ok(out
++            .try_recv()
++            .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?
++            .context("shares were not computed")?
++            .shares)
++    }
 +}
 +
 +/// The keystream circuit: one key schedule, then one AES block per counter.
@@ -2105,7 +4385,7 @@ index 0000000..7d31aa6
 +    outputs: Vec<DecodeFutureTyped<BitVec, [u8; 16]>>,
 +}
 +
-+/// Declares the circuit so it can be preprocessed before the handshake.
++/// Declares the circuit.
 +fn alloc_keystream<V: Vm<mpz_vm_core::memory::binary::Binary>>(
 +    vm: &mut V,
 +    blocks: usize,
@@ -2140,388 +4420,12 @@ index 0000000..7d31aa6
 +    })
 +}
 +
-+/// Runs the keystream circuit and returns the keystream. `key` is `Some` on
-+/// the borrower only. On the pool the outputs come out of the verifier, so
-+/// they are correct for whatever key the borrower committed to, or the proof
-+/// fails and this errors.
-+async fn compute_keystream<V: Vm<mpz_vm_core::memory::binary::Binary>>(
-+    vm: &mut V,
-+    ctx: &mut Context,
-+    ks: Keystream,
-+    key: Option<[u8; 16]>,
-+    nonce: &[u8; 12],
-+) -> Result<Vec<[u8; 16]>> {
-+    if let Some(key) = key {
-+        vm.assign(ks.key, key)?;
-+    }
-+    vm.commit(ks.key)?;
-+    for (i, ctr) in ks.counters.iter().enumerate() {
-+        // J0 is counter 1; the keystream starts at counter 2.
-+        vm.assign(*ctr, counter_block(nonce, i as u32 + 2))?;
-+        vm.commit(*ctr)?;
-+    }
-+    vm.flush(ctx).await?;
-+    vm.execute(ctx).await?;
-+    // The verifier's check of the proof happens in this flush; a prover that
-+    // cheated is caught before the keystream is used.
-+    vm.flush(ctx).await.context("keystream proof")?;
-+    ks.outputs
-+        .into_iter()
-+        .map(|mut out| {
-+            out.try_recv()?
-+                .context("keystream block was not decoded")
-+        })
-+        .collect()
-+}
-+
-+/// Additive shares of `my_input * their_input`, one per element.
-+async fn to_additive<C>(
-+    converter: &mut C,
-+    ctx: &mut Context,
-+    inputs: &[Gf2_128],
-+) -> Result<Vec<Gf2_128>>
-+where
-+    C: MultiplicativeToAdditive<Gf2_128> + Flush,
-+    <C as MultiplicativeToAdditive<Gf2_128>>::Error: std::fmt::Display,
-+    <C as Flush>::Error: std::fmt::Display,
-+{
-+    if inputs.is_empty() {
-+        return Ok(Vec::new());
-+    }
-+    let mut out = converter
-+        .queue_to_additive(inputs)
-+        .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
-+    converter
-+        .flush(ctx)
-+        .await
-+        .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
-+    Ok(out
-+        .try_recv()
-+        .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?
-+        .context("shares were not computed")?
-+        .shares)
-+}
-+
 +// ---------------------------------------------------------------------------
-+// Pool
-+
-+/// What the pool measured.
-+pub struct PoolReport {
-+    /// Circuit and OT preprocessing, overlapped with the handshake.
-+    pub preprocess: Duration,
-+    /// From the borrower's header to its `Splice` request.
-+    pub handshake: Duration,
-+    /// Keystream, tag and writing the record.
-+    pub splice: Duration,
-+    /// The token record as sent to the server.
-+    pub record: Vec<u8>,
-+    /// Its plaintext, with the token in place. Never log it.
-+    pub headers: Vec<u8>,
-+}
-+
-+// The report holds the token; a `?report` in a log line must not print it.
-+impl std::fmt::Debug for PoolReport {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-+        f.debug_struct("PoolReport")
-+            .field("preprocess", &self.preprocess)
-+            .field("handshake", &self.handshake)
-+            .field("splice", &self.splice)
-+            .field("record_len", &self.record.len())
-+            .finish()
-+    }
-+}
-+
-+/// Runs the pool's side of one borrowed request.
-+///
-+/// `mpc`, `up`, `down` are the three channels, in order. `server` is the
-+/// connection to the API server; the pool does not verify it (the borrower
-+/// does, and the token record is only written after the borrower's handshake
-+/// has completed). `token` goes into the borrower's `Authorization` header.
-+/// `tamper` is a test hook for a misbehaving pool.
-+pub async fn run_pool<S>(
-+    mpc: Context,
-+    mut up: Context,
-+    mut down: Context,
-+    server: S,
-+    server_name: &str,
-+    token: &str,
-+    tamper: Tamper,
-+) -> Result<PoolReport>
-+where
-+    S: AsyncRead + AsyncWrite,
-+{
-+    ensure!(
-+        token.len() == TOKEN_LEN,
-+        "refusing to lend a {}-byte credential: only {TOKEN_LEN}-byte ones keep the span tight",
-+        token.len()
-+    );
-+    ensure!(
-+        !token.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
-+        "credential contains whitespace or control characters"
-+    );
-+
-+    let started = Instant::now();
-+    let prelude = async {
-+        down.io_mut()
-+            .send(Hello {
-+                version: PROTOCOL_VERSION,
-+                token_len: token.len(),
-+                server_name: server_name.to_string(),
-+            })
-+            .await
-+            .context("prelude: greeting the borrower")?;
-+        let request: RequestHeader = up
-+            .io_mut()
-+            .expect_next()
-+            .await
-+            .context("prelude: waiting for the borrower's header")?;
-+        check_template(&request, token.len(), server_name).context("borrower's header rejected")?;
-+        Ok::<_, anyhow::Error>(request)
-+    };
-+    let request = tokio::time::timeout(SETUP_TIMEOUT, prelude)
-+        .await
-+        .context("prelude timed out")??;
-+
-+    let mut headers = request.template.clone();
-+    let span = &mut headers[request.token.clone()];
-+    span.fill(b' ');
-+    span[..token.len()].copy_from_slice(token.as_bytes());
-+    if let Some(tamper) = tamper {
-+        tamper(&mut headers);
-+    }
-+    let blocks = headers.len().div_ceil(16);
-+    let span_idx = span_blocks(&request);
-+
-+    // Preprocess while the borrower's handshake is relayed.
-+    let (mut vm, mut converter) = pool_vm();
-+    let mut ks = Some(alloc_keystream(&mut vm, blocks, false)?);
-+    MultiplicativeToAdditive::<Gf2_128>::alloc(&mut converter, span_idx.len())
-+        .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
-+    let pre = async move {
-+        let mut mpc = mpc;
-+        let t = Instant::now();
-+        vm.preprocess(&mut mpc).await.context("preprocessing the circuit")?;
-+        vm.flush(&mut mpc).await.context("preparing the keystream proof")?;
-+        debug!("pool: circuit preprocessed");
-+        converter
-+            .flush(&mut mpc)
-+            .await
-+            .map_err(|e| anyhow::anyhow!("preprocessing the share conversion: {e}"))?;
-+        Ok::<_, anyhow::Error>((vm, converter, mpc, t.elapsed()))
-+    };
-+    tokio::pin!(pre);
-+    let mut pre_done = false;
-+    let mut parts = None;
-+    let mut preprocess = Duration::ZERO;
-+
-+    // Relay. Reads and writes on the server socket must not block each other,
-+    // or the pool stalls writing a large body while the server stalls writing
-+    // the response; writes are queued and drained by their own select arm.
-+    let (mut rd, mut wr) = tokio::io::split(server);
-+    let mut buf = vec![0u8; 64 << 10];
-+    let mut out: Vec<u8> = Vec::new();
-+    let mut written = 0;
-+    let mut server_open = true;
-+    let mut spliced = false;
-+    let mut handshake_bytes = 0usize;
-+    let mut sent = 0usize;
-+    let mut deframer = Deframer::default();
-+    let mut handshake = Duration::ZERO;
-+    let mut splice = Duration::ZERO;
-+    let mut record = Vec::new();
-+    let setup_deadline = tokio::time::sleep(SETUP_TIMEOUT);
-+    tokio::pin!(setup_deadline);
-+    let deadline = tokio::time::sleep(RELAY_MAX_DURATION);
-+    tokio::pin!(deadline);
-+
-+    loop {
-+        tokio::select! {
-+            res = &mut pre, if !pre_done => {
-+                pre_done = true;
-+                let (vm, converter, mpc, took) = res?;
-+                parts = Some((vm, converter, mpc));
-+                preprocess = took;
-+                info!(?preprocess, "pool: preprocessed");
-+            }
-+            // Stop taking frames while the server is behind on the bytes queued.
-+            frame = tokio::time::timeout(RELAY_IDLE_TIMEOUT, up.io_mut().expect_next::<Frame>()),
-+                if out.len() - written < MAX_PENDING_BYTES =>
-+            {
-+                let frame = match frame.context("no frame from the borrower for 10 min")? {
-+                    Ok(frame) => frame,
-+                    // The borrower closing its end is also how a borrow ends.
-+                    Err(e) => {
-+                        debug!("pool: borrower left: {e}");
-+                        break;
-+                    }
-+                };
-+                match frame {
-+                    Frame::Bytes(bytes) => {
-+                        ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
-+                        if spliced {
-+                            sent += bytes.len();
-+                            ensure!(sent <= MAX_SENT_BYTES, "borrower sent more than {MAX_SENT_BYTES} bytes");
-+                            if server_open {
-+                                out.extend_from_slice(&bytes);
-+                            }
-+                        } else {
-+                            handshake_bytes += bytes.len();
-+                            ensure!(
-+                                handshake_bytes <= MAX_HANDSHAKE_BYTES,
-+                                "more than {MAX_HANDSHAKE_BYTES} bytes of handshake"
-+                            );
-+                            deframer.push(&bytes);
-+                            while let Some(rec) = deframer.next_record()? {
-+                                // The token record must be the first
-+                                // application data on this connection.
-+                                ensure!(
-+                                    rec[0] != 0x17,
-+                                    "borrower sent application data before the token record"
-+                                );
-+                                out.extend_from_slice(&rec);
-+                            }
-+                        }
-+                    }
-+                    Frame::Splice { seq, nonce } => {
-+                        ensure!(!spliced, "borrower asked for a second token record");
-+                        ensure!(deframer.is_empty(), "partial record pending at the splice");
-+                        ensure!(server_open, "server closed before the token record");
-+                        handshake = started.elapsed();
-+                        if !pre_done {
-+                            let (vm, converter, mpc, took) = (&mut pre).await?;
-+                            pre_done = true;
-+                            parts = Some((vm, converter, mpc));
-+                            preprocess = took;
-+                        }
-+                        let (vm, converter, mpc) = parts.as_mut().expect("preprocessed");
-+                        let t = Instant::now();
-+                        record = splice_record(
-+                            vm,
-+                            converter,
-+                            mpc,
-+                            &mut up,
-+                            ks.take().expect("one splice"),
-+                            &headers,
-+                            &span_idx,
-+                            seq,
-+                            &nonce,
-+                        )
-+                        .await?;
-+                        out.extend_from_slice(&record);
-+                        down.io_mut()
-+                            .send(Frame::Spliced)
-+                            .await
-+                            .context("telling the borrower the record is written")?;
-+                        spliced = true;
-+                        splice = t.elapsed();
-+                        info!(?handshake, ?splice, "pool: token record written");
-+                    }
-+                    Frame::Done => break,
-+                    other => bail!("unexpected {other} from the borrower"),
-+                }
-+            }
-+            _ = &mut setup_deadline, if !spliced => {
-+                bail!("setup timed out");
-+            }
-+            _ = &mut deadline => {
-+                bail!("borrow ran for more than {} s", RELAY_MAX_DURATION.as_secs());
-+            }
-+            n = wr.write(&out[written..]), if written < out.len() => {
-+                written += n.context("writing to the server")?;
-+                if written == out.len() {
-+                    out.clear();
-+                    written = 0;
-+                }
-+            }
-+            n = rd.read(&mut buf), if server_open => {
-+                let n = n.context("reading from the server")?;
-+                if n == 0 {
-+                    server_open = false;
-+                    // The borrower may already have left after the server's
-+                    // close_notify; then there is nobody to tell.
-+                    if down.io_mut().send(Frame::ServerClosed).await.is_err() {
-+                        debug!("pool: borrower gone before the server closed");
-+                        break;
-+                    }
-+                } else if let Err(e) = down.io_mut().send(Frame::Bytes(buf[..n].to_vec())).await {
-+                    if spliced {
-+                        debug!("pool: borrower left: {e}");
-+                        break;
-+                    }
-+                    return Err(anyhow::Error::from(e).context("forwarding the server's bytes"));
-+                }
-+            }
-+        }
-+    }
-+    if server_open && written < out.len() {
-+        wr.write_all(&out[written..]).await.context("writing the rest to the server")?;
-+    }
-+    let _ = wr.shutdown().await;
-+    ensure!(spliced, "the borrower left before the token record was written");
-+    info!("pool: done");
-+
-+    Ok(PoolReport {
-+        preprocess,
-+        handshake,
-+        splice,
-+        record,
-+        headers,
-+    })
-+}
-+
-+/// Computes and encodes the token record on the pool's side.
-+#[allow(clippy::too_many_arguments)]
-+async fn splice_record(
-+    vm: &mut PoolVm,
-+    converter: &mut PoolConverter,
-+    ctx: &mut Context,
-+    up: &mut Context,
-+    ks: Keystream,
-+    headers: &[u8],
-+    span_idx: &[usize],
-+    seq: u64,
-+    nonce: &[u8; 12],
-+) -> Result<Vec<u8>> {
-+    let keystream = compute_keystream(vm, ctx, ks, None, nonce).await?;
-+    let ciphertext = xor_keystream(headers, &keystream);
-+
-+    // The tag: the borrower covers every block it knows; for the span's blocks
-+    // this side inputs its ciphertext block, the borrower the matching power
-+    // of H, and each gets an additive share of the product.
-+    let blocks = ghash_blocks(&tls12_aad(seq, APPLICATION_DATA, headers.len()), &ciphertext);
-+    let inputs: Vec<Gf2_128> = span_idx.iter().map(|&j| gf(blocks[j])).collect();
-+    let shares = to_additive(converter, ctx, &inputs).await?;
-+    let mine = shares.into_iter().fold(Gf2_128::zero(), |acc, s| acc + s);
-+
-+    let share = match up.io_mut().expect_next::<Frame>().await? {
-+        Frame::TagShare(share) => share,
-+        other => bail!("expected the borrower's tag share, got {other}"),
-+    };
-+    let tag = un_gf(gf(share) + mine);
-+    Ok(encode_record(nonce, &ciphertext, tag))
-+}
-+
-+// ---------------------------------------------------------------------------
-+// Borrower
-+
-+/// What the borrower got.
-+#[derive(Debug)]
-+pub struct BorrowerReport {
-+    /// The whole response, headers included.
-+    pub response: Vec<u8>,
-+    /// Time from sending the body to the first response byte.
-+    pub first_byte: Duration,
-+    /// The traffic keys, for diagnostics in tests.
-+    pub keys: TrafficKeys,
-+    /// Sequence number of the token record.
-+    pub splice_seq: u64,
-+    /// The header as the borrower asked for it (token span filled with x).
-+    pub header: RequestHeader,
-+}
++// The borrower's TLS client
 +
 +/// The borrower's TLS client configuration: TLS 1.2 with AES-128-GCM only,
 +/// since that is the record format the pool's spliced record uses.
-+fn tls_config(roots: &rustls::RootCertStore) -> Result<Arc<rustls::ClientConfig>> {
++pub fn tls_config(roots: &rustls::RootCertStore) -> Result<Arc<rustls::ClientConfig>> {
 +    let provider = CryptoProvider {
 +        cipher_suites: vec![
 +            ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -2539,50 +4443,16 @@ index 0000000..7d31aa6
 +}
 +
 +/// The session as rustls leaves it after the handshake.
-+struct Session {
-+    keys: TrafficKeys,
-+    /// Next client sequence number: the token record's.
-+    write_seq: u64,
++pub struct Handshaken {
++    pub keys: TrafficKeys,
++    /// Next client sequence number: the first token record's.
++    pub write_seq: u64,
 +    /// Next server sequence number.
-+    read_seq: u64,
++    pub read_seq: u64,
 +}
 +
-+/// Runs the TLS handshake over the relay and takes the keys out.
-+async fn handshake(
-+    up: &mut Context,
-+    down: &mut Context,
-+    config: Arc<rustls::ClientConfig>,
-+    server_name: &str,
-+) -> Result<Session> {
-+    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())?;
-+    let mut conn = rustls::ClientConnection::new(config, name)?;
-+    loop {
-+        let mut bytes = Vec::new();
-+        while conn.wants_write() {
-+            conn.write_tls(&mut bytes)?;
-+        }
-+        if !bytes.is_empty() {
-+            up.io_mut().send(Frame::Bytes(bytes)).await?;
-+        }
-+        if !conn.is_handshaking() {
-+            break;
-+        }
-+        match tokio::time::timeout(SETUP_TIMEOUT, down.io_mut().expect_next::<Frame>())
-+            .await
-+            .context("no bytes from the server")??
-+        {
-+            Frame::Bytes(bytes) => {
-+                let mut rest = &bytes[..];
-+                while !rest.is_empty() {
-+                    ensure!(conn.read_tls(&mut rest)? > 0, "TLS client refused the server's bytes");
-+                    conn.process_new_packets()
-+                        .context("TLS handshake with the server")?;
-+                }
-+            }
-+            Frame::ServerClosed => bail!("server closed the connection during the handshake"),
-+            other => bail!("unexpected {other} during the handshake"),
-+        }
-+    }
++/// Takes the keys out of a finished rustls connection.
++pub fn extract_keys(conn: rustls::ClientConnection) -> Result<Handshaken> {
 +    let secrets = conn
 +        .dangerous_extract_secrets()
 +        .context("taking the traffic keys out of the TLS client")?;
@@ -2590,7 +4460,7 @@ index 0000000..7d31aa6
 +    let (read_seq, rx) = secrets.rx;
 +    let (client_write_key, client_write_iv) = gcm_parts(tx)?;
 +    let (server_write_key, server_write_iv) = gcm_parts(rx)?;
-+    Ok(Session {
++    Ok(Handshaken {
 +        keys: TrafficKeys {
 +            client_write_key,
 +            client_write_iv,
@@ -2611,209 +4481,6 @@ index 0000000..7d31aa6
 +        )),
 +        _ => bail!("the negotiated cipher is not AES-128-GCM"),
 +    }
-+}
-+
-+/// Runs the borrower's side of one borrowed request.
-+///
-+/// `template` is the header text with [`TOKEN_MARKER`](crate::TOKEN_MARKER)
-+/// and optionally [`BODY_LEN_MARKER`](crate::BODY_LEN_MARKER).
-+/// `expected_server` is the name the borrower verifies the server's
-+/// certificate for. `token_len` is the length of the credential the borrower
-+/// expects; a pool announcing another length is refused. The response is
-+/// copied to `out` as it arrives.
-+#[allow(clippy::too_many_arguments)]
-+pub async fn run_borrower(
-+    mpc: Context,
-+    mut up: Context,
-+    mut down: Context,
-+    template: &str,
-+    body: Vec<u8>,
-+    roots: rustls::RootCertStore,
-+    expected_server: &str,
-+    token_len: usize,
-+    mut out: Box<dyn AsyncWrite + Unpin + Send>,
-+) -> Result<BorrowerReport> {
-+    let config = tls_config(&roots)?;
-+
-+    let setup = async {
-+        let hello: Hello = down.io_mut().expect_next().await?;
-+        info!(?hello, "borrower: pool says hello");
-+        ensure!(
-+            hello.version == PROTOCOL_VERSION,
-+            "pool speaks protocol version {}, this borrower {PROTOCOL_VERSION}",
-+            hello.version
-+        );
-+        ensure!(
-+            hello.token_len == token_len,
-+            "pool announced a {}-byte token, expected {token_len}",
-+            hello.token_len
-+        );
-+
-+        // Only the part through the Authorization line is the pool's record;
-+        // the remaining headers go in the borrower's own first record.
-+        let (hidden, trailer) = split_template(template)?;
-+        let header = fill_template(&hidden, token_len, body.len())?;
-+        up.io_mut().send(header.clone()).await?;
-+        let blocks = header.template.len().div_ceil(16);
-+        let span_idx = span_blocks(&header);
-+
-+        let (mut vm, mut converter) = borrower_vm();
-+        let ks = alloc_keystream(&mut vm, blocks, true)?;
-+        MultiplicativeToAdditive::<Gf2_128>::alloc(&mut converter, span_idx.len())
-+            .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
-+
-+        // Preprocess and shake hands at the same time.
-+        let mut mpc = mpc;
-+        let pre = async {
-+            let t = Instant::now();
-+            vm.preprocess(&mut mpc).await.context("preprocessing the circuit")?;
-+            vm.flush(&mut mpc).await.context("preparing the keystream proof")?;
-+            debug!("borrower: circuit preprocessed");
-+            converter
-+                .flush(&mut mpc)
-+                .await
-+                .map_err(|e| anyhow::anyhow!("preprocessing the share conversion: {e}"))?;
-+            info!(took = ?t.elapsed(), "borrower: preprocessed");
-+            Ok::<_, anyhow::Error>(())
-+        };
-+        let hs = handshake(&mut up, &mut down, config, expected_server);
-+        let ((), session) = tokio::try_join!(pre, hs)?;
-+        info!(
-+            write_seq = session.write_seq,
-+            read_seq = session.read_seq,
-+            "borrower: handshake done, holds the traffic keys"
-+        );
-+
-+        // The token record takes the next client sequence number.
-+        let seq = session.write_seq;
-+        let mut nonce = [0u8; 12];
-+        nonce[..4].copy_from_slice(&session.keys.client_write_iv);
-+        nonce[4..].copy_from_slice(&seq.to_be_bytes());
-+        up.io_mut().send(Frame::Splice { seq, nonce }).await?;
-+
-+        let key = session.keys.client_write_key;
-+        let keystream = compute_keystream(&mut vm, &mut mpc, ks, Some(key), &nonce).await?;
-+
-+        // Tag share: every block this side knows, locally; the span's blocks
-+        // through the share conversion with the pool's ciphertext.
-+        let h = gf(aes_block(&key, [0u8; 16]));
-+        let e_j0 = gf(aes_block(&key, counter_block(&nonce, 1)));
-+        let ciphertext = xor_keystream(&header.template, &keystream);
-+        let blocks = ghash_blocks(&tls12_aad(seq, APPLICATION_DATA, header.template.len()), &ciphertext);
-+        let powers = h_powers(h, blocks.len());
-+        let local = blocks
-+            .iter()
-+            .zip(&powers)
-+            .enumerate()
-+            .filter(|(j, _)| !span_idx.contains(j))
-+            .fold(Gf2_128::zero(), |acc, (_, (block, power))| acc + gf(*block) * *power);
-+        let inputs: Vec<Gf2_128> = span_idx.iter().map(|&j| powers[j]).collect();
-+        let shares = to_additive(&mut converter, &mut mpc, &inputs).await?;
-+        let joint = shares.into_iter().fold(Gf2_128::zero(), |acc, s| acc + s);
-+        up.io_mut()
-+            .send(Frame::TagShare(un_gf(e_j0 + local + joint)))
-+            .await?;
-+
-+        Ok::<_, anyhow::Error>((header, trailer, session))
-+    };
-+    let (header, trailer, session) = tokio::time::timeout(SETUP_TIMEOUT, setup)
-+        .await
-+        .context("setup timed out")??;
-+    let keys = session.keys.clone();
-+    let splice_seq = session.write_seq;
-+    let (mut writer, mut reader) =
-+        LocalRecordLayer::new(&keys, splice_seq + 1, session.read_seq).split();
-+
-+    // Read the response while the body is still being sent. The pool's
-+    // `Spliced` arrives on the same channel, so the reader relays it.
-+    let (spliced_tx, spliced_rx) = tokio::sync::oneshot::channel();
-+    let t = Instant::now();
-+    let reading = tokio::spawn(async move {
-+        let mut spliced_tx = Some(spliced_tx);
-+        let mut deframer = Deframer::default();
-+        let mut response = Vec::new();
-+        let mut first_byte = None;
-+        loop {
-+            match tokio::time::timeout(RELAY_IDLE_TIMEOUT, down.io_mut().expect_next::<Frame>())
-+                .await
-+                .context("no frame from the pool for 10 min")??
-+            {
-+                Frame::Spliced => {
-+                    if let Some(tx) = spliced_tx.take() {
-+                        let _ = tx.send(());
-+                    }
-+                }
-+                Frame::Bytes(bytes) => {
-+                    ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
-+                    deframer.push(&bytes);
-+                    while let Some(record) = deframer.next_record()? {
-+                        let (typ, plaintext) = reader.decrypt(&record)?;
-+                        match typ {
-+                            APPLICATION_DATA => {
-+                                first_byte.get_or_insert_with(|| t.elapsed());
-+                                out.write_all(&plaintext).await?;
-+                                out.flush().await?;
-+                                response.extend_from_slice(&plaintext);
-+                            }
-+                            ALERT => {
-+                                ensure!(
-+                                    plaintext == CLOSE_NOTIFY,
-+                                    "unexpected alert from the server: {plaintext:?}"
-+                                );
-+                                debug!("borrower: server sent close_notify");
-+                                return Ok((response, first_byte.unwrap_or_default()));
-+                            }
-+                            typ => bail!("unexpected record type {typ}"),
-+                        }
-+                    }
-+                }
-+                Frame::ServerClosed => {
-+                    debug!("borrower: server closed the connection");
-+                    return Ok((response, first_byte.unwrap_or_default()));
-+                }
-+                other => bail!("unexpected {other} from the pool"),
-+            }
-+        }
-+    });
-+
-+    // The body waits for the token record to be on the wire.
-+    if spliced_rx.await.is_err() {
-+        // The reader ended first: a server alert, most likely.
-+        let err = match reading.await? {
-+            Ok(_) => anyhow::anyhow!("server closed before the token record was written"),
-+            Err(e) => e,
-+        };
-+        return Err(err);
-+    }
-+    let payload = [trailer, body].concat();
-+    let mut frame = Vec::with_capacity(FRAME_TARGET + MAX_RECORD_PLAINTEXT + 64);
-+    for chunk in payload.chunks(MAX_RECORD_PLAINTEXT) {
-+        frame.extend_from_slice(&writer.encrypt(APPLICATION_DATA, chunk)?);
-+        if frame.len() >= FRAME_TARGET {
-+            up.io_mut().send(Frame::Bytes(std::mem::take(&mut frame))).await?;
-+        }
-+    }
-+    if !frame.is_empty() {
-+        up.io_mut().send(Frame::Bytes(frame)).await?;
-+    }
-+    debug!(bytes = payload.len(), "borrower: request sent");
-+
-+    let (response, first_byte) = tokio::time::timeout(RELAY_MAX_DURATION, reading)
-+        .await
-+        .context("borrow ran too long")???;
-+
-+    let close_notify = writer.encrypt(ALERT, &CLOSE_NOTIFY)?;
-+    let _ = up.io_mut().send(Frame::Bytes(close_notify)).await;
-+    let _ = up.io_mut().send(Frame::Done).await;
-+    info!("borrower: done");
-+
-+    Ok(BorrowerReport {
-+        response,
-+        first_byte,
-+        keys,
-+        splice_seq,
-+        header,
-+    })
 +}
 +
 +#[cfg(test)]
@@ -2873,7 +4540,7 @@ index 0000000..7d31aa6
 +            pool_joint = pool_joint + (product + a);
 +        }
 +        let share = un_gf(e_j0 + local + borrower_joint);
-+        let tag = un_gf(gf(share) + pool_joint);
++        let record = Verifying::finish_record(&nonce, &ciphertext, pool_joint, share);
 +
 +        let cipher = Aes128Gcm::new(GenericArray::from_slice(&key));
 +        let mut reference = plaintext.clone();
@@ -2881,8 +4548,8 @@ index 0000000..7d31aa6
 +            .encrypt_in_place_detached(GenericArray::from_slice(&nonce), &aad, &mut reference)
 +            .unwrap();
 +        assert_eq!(reference, ciphertext);
-+        assert_eq!(tag[..], expected[..]);
-+        assert_eq!(encode_record(&nonce, &ciphertext, tag).len(), 5 + 8 + 226 + 16);
++        assert_eq!(record.len(), 5 + 8 + 226 + 16);
++        assert_eq!(record[record.len() - 16..], expected[..]);
 +    }
 +
 +    #[test]

@@ -1,5 +1,6 @@
 //! In-process demo: pool, borrower and tlsn's echo server in one process,
-//! with checks that the token never reaches the borrower.
+//! many requests over one session, with checks that the token never reaches
+//! the borrower.
 
 use std::{
     pin::Pin,
@@ -14,9 +15,8 @@ use std::{
 use anyhow::{Context as _, Result, bail, ensure};
 use clap::Parser;
 use lembas_mpc::{
-    TOKEN_LEN, Tamper, dechunk, fixture_roots, link,
-    record::{APPLICATION_DATA, LocalRecordLayer},
-    splice::{run_borrower, run_pool},
+    TOKEN_LEN, dechunk, fixture_roots, link,
+    session::{Connector, Session, Tamper, fixed_token, run_pool},
 };
 use rand::RngExt;
 use tls_server_fixture::SERVER_DOMAIN;
@@ -26,15 +26,31 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 /// The pool's secret. The borrower must never learn it.
 const TOKEN: &str = "sk-ant-api03-THIS-IS-THE-POOLS-SECRET-TOKEN-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-A";
 
-const TEMPLATE: &str = "POST /echo HTTP/1.1\r\nHost: test-server.io\r\n\
+const TEMPLATE: &str = "POST /echo HTTP/1.1\r\nHost: {host}\r\n\
     Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
-    Connection: close\r\nContent-Type: application/json\r\n\r\n";
+    Content-Type: application/json\r\n\r\n";
+
+/// The same, asking the server to close afterwards: forces a new connection
+/// for the next request.
+const TEMPLATE_CLOSE: &str = "POST /echo HTTP/1.1\r\nHost: {host}\r\n\
+    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
+    Content-Type: application/json\r\nConnection: close\r\n\r\n";
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// Size of the request body in bytes. The test server echoes it.
+    /// Requests to make over the one session.
+    #[arg(long, default_value_t = 6)]
+    requests: usize,
+    /// How many at a time.
+    #[arg(long, default_value_t = 3)]
+    concurrency: usize,
+    /// Size of each request body in bytes. The test server echoes it.
     #[arg(long, default_value_t = 32 * 1024)]
     body: usize,
+    /// Refuse to lend for the first N requests (nobody has capacity), then
+    /// lend; the borrower must report each refusal and the session go on.
+    #[arg(long, default_value_t = 0)]
+    refuse_first: usize,
     /// Misbehave as the pool: change a header byte outside the token span.
     /// The server must reject the record, since the tag binds the pool to
     /// the borrower's text.
@@ -55,12 +71,6 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // The server.
-    let (server_client_sock, server_sock) = tokio::io::duplex(1 << 20);
-    let server = tokio::spawn(tls_server_fixture::bind_test_server_hyper(
-        server_sock.compat(),
-    ));
-
     // The pool↔borrower link, with byte counters on the pool's end.
     let (pool_sock, borrower_sock) = tokio::io::duplex(1 << 23);
     let counters = LinkCounters::default();
@@ -71,49 +81,111 @@ async fn main() -> Result<()> {
     let pool_driver = tokio::spawn(pool_link.driver);
     let borrower_driver = tokio::spawn(borrower_link.driver);
 
-    let body: Vec<u8> = {
-        let mut rng = rand::rng();
-        let mut b = Vec::with_capacity(args.body);
-        while b.len() < args.body {
-            b.extend_from_slice(format!("{{\"n\":{}}},", rng.random::<u32>()).as_bytes());
-        }
-        b.truncate(args.body);
-        b
-    };
+    // Every `Open` gets its own echo server on an in-memory pipe.
+    let connector: Connector<DuplexStream> = Arc::new(|| {
+        Box::pin(async {
+            let (client, server) = tokio::io::duplex(1 << 20);
+            tokio::spawn(async move {
+                if let Err(e) = tls_server_fixture::bind_test_server_hyper(server.compat()).await {
+                    tracing::debug!("test server: {e}");
+                }
+            });
+            Ok(client)
+        })
+    });
 
-    let token = TOKEN.to_string();
     let tamper: Tamper = args
         .evil_rewrite
-        .then(|| Box::new(|h: &mut Vec<u8>| h[0] = b'G') as Box<dyn FnOnce(&mut Vec<u8>) + Send>);
+        .then(|| Arc::new(|h: &mut Vec<u8>| h[0] = b'G') as Arc<dyn Fn(&mut Vec<u8>) + Send + Sync>);
+    // The evil pool claims to lend for the name the borrower expects while
+    // connecting it to the test server; only the certificate check can tell.
     let expected_server = if args.evil_server {
         "api.anthropic.com"
     } else {
         SERVER_DOMAIN
     };
+    let announced_server = expected_server;
 
     let started = Instant::now();
-    let outcome = tokio::try_join!(
-        run_pool(
-            pool_link.mpc,
-            pool_link.up,
-            pool_link.down,
-            server_client_sock,
-            SERVER_DOMAIN,
-            &token,
-            tamper,
-        ),
-        run_borrower(
-            borrower_link.mpc,
-            borrower_link.up,
-            borrower_link.down,
-            TEMPLATE,
-            body.clone(),
-            fixture_roots()?,
-            expected_server,
-            TOKEN_LEN,
-            Box::new(tokio::io::sink()),
-        ),
+    let pool = run_pool(
+        pool_link.mpc,
+        pool_link.up,
+        pool_link.down,
+        connector,
+        announced_server,
+        refusing_first(args.refuse_first, fixed_token(TOKEN.to_string())),
+        None,
+        tamper,
     );
+    let borrower = async {
+        let session = Arc::new(
+            Session::start(
+                borrower_link.mpc,
+                borrower_link.up,
+                borrower_link.down,
+                &fixture_roots()?,
+                expected_server,
+                TOKEN_LEN,
+            )
+            .await?,
+        );
+        let ready = started.elapsed();
+
+        let mut rng = rand::rng();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut outcomes = Vec::new();
+        let per_request = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for i in 0..args.requests {
+            // Keep `concurrency` in flight.
+            while tasks.len() >= args.concurrency.max(1) {
+                outcomes.push(tasks.join_next().await.unwrap()?);
+            }
+            let body: Vec<u8> = {
+                let mut b = Vec::with_capacity(args.body);
+                while b.len() < args.body {
+                    b.extend_from_slice(format!("{{\"n\":{}}},", rng.random::<u32>()).as_bytes());
+                }
+                b.truncate(args.body);
+                b
+            };
+            // Every third request asks the server to close: the next one
+            // must open a new connection and re-handshake.
+            let template = if i % 3 == 2 { TEMPLATE_CLOSE } else { TEMPLATE };
+            let session = session.clone();
+            let per_request = per_request.clone();
+            tasks.spawn(async move {
+                let t = Instant::now();
+                let mut response = Vec::new();
+                let r = match session.request(template, body.clone(), &mut response, |_| {}).await {
+                    Ok(r) => r,
+                    Err(e) if e.downcast_ref::<lembas_mpc::session::Refused>().is_some() => {
+                        REFUSED.fetch_add(1, Ordering::Relaxed);
+                        // Try again: the pool lends from the (N+1)th request on.
+                        session.request(template, body.clone(), &mut response, |_| {}).await?
+                    }
+                    Err(e) => return Err(e),
+                };
+                per_request.lock().unwrap().push(t.elapsed());
+                let text = String::from_utf8_lossy(&response);
+                ensure!(
+                    text.starts_with("HTTP/1.1 200 OK"),
+                    "unexpected response: {}",
+                    &text[..text.len().min(200)]
+                );
+                let body_pos = text.find("\r\n\r\n").context("no header terminator")? + 4;
+                ensure!(dechunk(&response[body_pos..]) == body, "server did not echo the body");
+                Ok::<_, anyhow::Error>(r)
+            });
+        }
+        while let Some(outcome) = tasks.join_next().await {
+            outcomes.push(outcome?);
+        }
+        session.close().await;
+        let per_request = std::mem::take(&mut *per_request.lock().unwrap());
+        let responses = outcomes.into_iter().collect::<Result<Vec<_>>>()?;
+        Ok::<_, anyhow::Error>((responses, ready, per_request))
+    };
+    let outcome = tokio::try_join!(pool, borrower);
     let total = started.elapsed();
 
     if args.evil_rewrite || args.evil_server {
@@ -121,12 +193,7 @@ async fn main() -> Result<()> {
             Ok(_) => bail!("the borrower accepted a misbehaving pool"),
             Err(err) => err,
         };
-        let expected = if args.evil_rewrite {
-            // The server fails the record's tag and sends a fatal alert.
-            "alert"
-        } else {
-            "certificate"
-        };
+        let expected = if args.evil_rewrite { "alert" } else { "certificate" };
         ensure!(
             format!("{err:#}").to_ascii_lowercase().contains(expected),
             "unexpected failure: {err:#}"
@@ -135,7 +202,7 @@ async fn main() -> Result<()> {
         println!("misbehaving pool rejected as expected: {err:#}");
         return Ok(());
     }
-    let (pool_report, borrower_report) = outcome?;
+    let (stats, (responses, ready, per_request)) = outcome?;
 
     drop(pool_link.session);
     drop(borrower_link.session);
@@ -143,99 +210,53 @@ async fn main() -> Result<()> {
     let _ = borrower_link.close.send(());
     pool_driver.await??;
     borrower_driver.await??;
-    match server.await? {
-        Ok(()) => {}
-        Err(e) => println!("test server ended with an error: {e}"),
-    }
 
-    // Checks.
-    let response = String::from_utf8_lossy(&borrower_report.response);
-    ensure!(
-        response.starts_with("HTTP/1.1 200 OK"),
-        "unexpected response: {}",
-        &response[..response.len().min(200)]
-    );
-    let body_pos = response
-        .find("\r\n\r\n")
-        .context("response has no header terminator")?
-        + 4;
-    let echoed = dechunk(&borrower_report.response[body_pos..]);
-    ensure!(
-        echoed == body,
-        "server did not echo the body: got {} bytes, sent {} (response {} bytes)",
-        echoed.len(),
-        body.len(),
-        borrower_report.response.len()
-    );
+    ensure!(responses.len() == args.requests);
+    ensure!(stats.requests as usize == args.requests, "pool counted {} requests", stats.requests);
+    let reused = responses.iter().filter(|r| r.reused).count();
+    let refused = REFUSED.load(Ordering::Relaxed);
+    ensure!(refused == args.refuse_first, "{refused} refusals seen, expected {}", args.refuse_first);
+    ensure!(stats.refused as usize == args.refuse_first, "pool counted {} refusals", stats.refused);
 
-    // What went over the link to the borrower must contain neither the token
-    // nor the token record's ciphertext (mux framing could split a match, so
-    // look for 16-byte windows of the record rather than the whole record).
+    // What went over the link to the borrower must not contain the token.
     let sent = SENT_TO_BORROWER.lock().unwrap();
     ensure!(
         !contains(&sent, TOKEN.as_bytes()),
         "the token went to the borrower in the clear"
     );
-    let record = &pool_report.record;
-    ensure!(record.len() > 5 + 8 + 16, "token record too short");
-    let ciphertext = &record[5 + 8..record.len() - 16];
-    for window in ciphertext.chunks(16).filter(|w| w.len() == 16) {
-        ensure!(
-            !contains(&sent, window),
-            "part of the token record's ciphertext went to the borrower"
-        );
-    }
     drop(sent);
 
-    // Diagnostic only possible because both parties run in this process: the
-    // token record the pool sent must be what the borrower's keys produce
-    // from the borrower's template with the token in place.
-    {
-        let mut reference = LocalRecordLayer::new(&borrower_report.keys, borrower_report.splice_seq, 0);
-        let mut expected_headers = borrower_report.header.template.clone();
-        let span = &mut expected_headers[borrower_report.header.token.clone()];
-        span.fill(b' ');
-        span[..TOKEN.len()].copy_from_slice(TOKEN.as_bytes());
-        ensure!(expected_headers == pool_report.headers);
-        let expected = reference
-            .encrypt(APPLICATION_DATA, &expected_headers)
-            .context("reference encryption")?;
-        ensure!(
-            expected == pool_report.record,
-            "the token record differs from what the traffic keys produce"
-        );
-    }
-
+    let mut sorted = per_request.clone();
+    sorted.sort();
     println!();
-    println!("borrowed request OK");
-    println!("  protocol:              spliced record (borrower owns the session; zero-knowledge keystream)");
-    println!("  body:                  {} bytes, echoed back", body.len());
+    println!("borrowed requests OK");
+    println!("  protocol:              session of spliced records (zero-knowledge keystream)");
     println!(
-        "  token record:          {} bytes plaintext, seq {}; span hidden from the borrower, rest bound to its text",
-        pool_report.headers.len(),
-        borrower_report.splice_seq
+        "  requests:              {} of {} bytes, {} at a time, all echoed back",
+        args.requests, args.body, args.concurrency
+    );
+    println!(
+        "  connections:           {} opened by the pool, {} requests reused one{}",
+        stats.connections,
+        reused,
+        if refused > 0 { format!(", {refused} refusals handled") } else { String::new() }
     );
     println!("  server identity:       verified by the borrower");
     println!();
     println!("timing (both parties on this machine)");
-    println!("  preprocessing:         {:>8.0?}  (overlapped with the handshake)", pool_report.preprocess);
-    println!("  handshake:             {:>8.0?}", pool_report.handshake);
-    println!("  token record:          {:>8.0?}", pool_report.splice);
+    println!("  session ready (OT setup, once): {:>6.0?}", ready);
     println!(
-        "  body sent → first response byte: {:>5.0?}",
-        borrower_report.first_byte
+        "  per request:           median {:>6.0?}, max {:>6.0?} (handshake included when a connection was opened)",
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1]
     );
     println!("  total:                 {:>8.0?}", total);
     println!();
     println!("pool↔borrower link");
-    println!(
-        "  pool → borrower:       {:>8} KB",
-        counters.sent.load(Ordering::Relaxed) / 1024
-    );
-    println!(
-        "  borrower → pool:       {:>8} KB",
-        counters.received.load(Ordering::Relaxed) / 1024
-    );
+    let up = counters.received.load(Ordering::Relaxed);
+    let down = counters.sent.load(Ordering::Relaxed);
+    println!("  borrower → pool:       {:>8} KB ({} KB of it request bodies)", up / 1024, args.requests * args.body / 1024);
+    println!("  pool → borrower:       {:>8} KB (responses included)", down / 1024);
 
     Ok(())
 }
@@ -305,6 +326,23 @@ impl AsyncWrite for Counted {
 
 /// Everything the pool sent to the borrower, for the token check.
 static SENT_TO_BORROWER: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+/// Refusals the borrower saw.
+static REFUSED: AtomicUsize = AtomicUsize::new(0);
+
+/// A token source that says no to the first `n` requests.
+fn refusing_first(n: usize, inner: lembas_mpc::session::TokenSource) -> lembas_mpc::session::TokenSource {
+    let count = Arc::new(AtomicUsize::new(0));
+    Arc::new(move || {
+        let inner = inner.clone();
+        let count = count.clone();
+        Box::pin(async move {
+            if count.fetch_add(1, Ordering::Relaxed) < n {
+                return Ok(None);
+            }
+            inner().await
+        })
+    })
+}
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)

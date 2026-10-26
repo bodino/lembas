@@ -4,15 +4,15 @@ Research branch. See `../docs/mpc-tls.md` for the design and findings.
 
 ## What is here
 
-- `lembas-mpc/` — the crate: `src/splice.rs` is the protocol (the borrower is an
-  ordinary TLS 1.2 client over a relay through the pool; the pool inserts the one
-  record that carries the token, with its keystream proven in zero knowledge by the
-  borrower and its tag from the borrower's GHASH terms plus one share conversion per
-  token block), `src/record.rs` the local TLS 1.2 AES-GCM record layer the borrower
-  runs after the handshake, `src/lib.rs` the template policy and the link plumbing,
-  `src/main.rs` the `demo` binary (everything in one process, with leak checks),
-  `src/bin/lembas-mpc.rs` the `lembas-mpc` binary (pool and borrower over TCP or
-  stdin/stdout, a chat).
+- `lembas-mpc/` — the crate: `src/splice.rs` has the primitives (the borrower is an
+  ordinary TLS 1.2 client over a relay through the pool; the pool inserts one record
+  per request, the one carrying the token, with its keystream proven in zero knowledge
+  by the borrower and its tag from the borrower's GHASH terms plus one share conversion
+  per token block), `src/session.rs` the protocol (one session, many connections, many
+  requests, one setup), `src/local.rs` the borrower's local HTTP proxy, `src/record.rs`
+  the local TLS 1.2 AES-GCM record layer, `src/lib.rs` the template policy and the link
+  plumbing, `src/main.rs` the `demo` binary (everything in one process, with checks),
+  `src/bin/lembas-mpc.rs` the `lembas-mpc` binary (pool, borrower, proxy, chat).
 - `tlsn-eb19c82-lembas-splice.patch` — adds the crate to TLSNotary's workspace at commit
   `eb19c82` (2026-10-21), with the `Cargo.lock` entries that follow. The crate uses
   tlsn only for its mux and its test server; everything else comes from mpz and rustls.
@@ -39,19 +39,20 @@ cargo test -p lembas-mpc --release
 ## In-process demo
 
 ```sh
-./target/release/demo                      # 32 KB body
-./target/release/demo --body 16777216      # 16 MB body
+./target/release/demo                                  # one session, 6 requests, 3 at a time
+./target/release/demo --requests 60 --concurrency 4 --body 1024
+./target/release/demo --refuse-first 2 --requests 6    # the pool has no lender for the first two
 ./target/release/demo --evil-rewrite       # pool edits a header byte: the server rejects the record
 ./target/release/demo --evil-server        # pool connects to the wrong server: the borrower refuses
 ```
 
-The demo runs the pool, the borrower and tlsn's hyper echo server in one process
-and checks that the body was echoed, that neither the token nor the token record's
-ciphertext crossed the pool↔borrower link, and that the token record is exactly what
-the borrower's keys produce from its template with the token in place.
+The demo runs the pool, the borrower and tlsn's echo server in one process: one
+session, requests in parallel over connections that are reused (every third request
+asks the server to close, so the next opens a new one), each body echoed back, the
+token never on the pool↔borrower link.
 
-Typical numbers on one Mac: about 90 ms in total and half a megabyte each way on the
-link, most of it the proof system's setup, overlapped with the TLS handshake.
+Typical numbers on one Mac: about 100 ms and 0.9 MB each way to set a session up, then
+20 ms of proving and a few tens of KB per request.
 
 ## Chat
 
@@ -59,18 +60,18 @@ link, most of it the proof system's setup, overlapped with the TLS handshake.
 mpc-tls/chat.sh            # starts a pool with your token from state.json, opens the chat
 ```
 
-Every message you type is one borrowed request: a fresh TLS handshake relayed through
-the pool, the spliced token record, then the streamed answer. Expect about 0.1 s of
-overhead per turn on top of the model's time. `lembas-mpc chat --pool host:port`
-talks to a pool you started yourself.
+The conversation is one session; every message you type is one borrowed request on
+it, with the connection reused when the server allows. `lembas-mpc chat --pool
+host:port` talks to a pool you started yourself.
 
 ## Inside lembas
 
 `./build.sh` at the repo root builds this helper (both architectures) into the app and
-into `build/lembas-mpc` for the pool; nothing here needs to be run by hand. The pool and
-the agent each spawn one helper per borrowed request in `--stdio` mode, with the link on
-stdin/stdout and the response (borrower side) written to a `--output` FIFO. See "In
-lembas" in `../docs/mpc-tls.md`.
+into `build/lembas-mpc` for the pool; nothing here needs to be run by hand. The pool
+spawns `pool --stdio --control-fd 3` per member session and lends a token per request
+over fd 3; the agent spawns `proxy --stdio --listen 127.0.0.1:0 --port-file …` once and
+sends each request to the local port as plain HTTP. See "In lembas" in
+`../docs/mpc-tls.md`.
 
 ## Two processes
 

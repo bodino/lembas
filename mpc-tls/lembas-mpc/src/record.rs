@@ -104,6 +104,17 @@ impl LocalRecordWriter {
         }
     }
 
+    /// The next sequence number this writer will use.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Skips to a sequence number: the pool's token record took the one
+    /// before it.
+    pub fn set_seq(&mut self, seq: u64) {
+        self.seq = seq;
+    }
+
     /// Encrypts one record and returns it encoded, ready for the wire. The
     /// explicit nonce is the sequence number, as rustls does it.
     pub fn encrypt(&mut self, typ: u8, plaintext: &[u8]) -> Result<Vec<u8>> {

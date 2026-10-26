@@ -1,14 +1,16 @@
-// Private borrowing: the agent's side of a borrowed request with a spliced token record.
+// Private borrowing: the agent's side of borrowed requests with spliced token records.
 //
-// With the "Private borrowing" switch on, a borrowed request does not go to the pool
-// as HTTP. Instead the agent opens a WebSocket to the pool's /pool/borrow, the pool
-// names a donor and bridges the socket to its `lembas-mpc pool` helper, and this agent
-// bridges the other end to `lembas-mpc borrower`. This side runs the TLS session to
-// Anthropic and holds its keys alone; the pool's helper relays the bytes and writes the
-// one record that carries the token, computed so that it never sees the keys and this
-// side never sees the token (see docs/mpc-tls.md). The pool cannot read the request or
-// the answer, so the agent tells it what happened at the end: usage to meter, or a
-// usage limit so it parks that donor.
+// With the "Private borrowing" switch on, borrowed requests do not go to the pool as
+// HTTP. The agent keeps one session with the pool for as long as it has requests: a
+// WebSocket to the pool's /pool/borrow, bridged to a `lembas-mpc proxy` helper that
+// runs the TLS connections to Anthropic itself and holds their keys alone. Each
+// request from Claude Code goes to the helper's local port as plain HTTP; the helper
+// sends everything but the token, and the pool's helper writes the one record that
+// carries a lender's token, computed so that it never sees the keys and this side
+// never sees the token (see docs/mpc-tls.md). The pool cannot read the request or the
+// answer, so the agent tells it what happened after each request: usage to meter, or
+// a usage limit so it parks that lender. Five Claude Code sessions share the one
+// helper; it opens a connection per request in flight and reuses them.
 
 import Foundation
 
@@ -21,13 +23,15 @@ let mpcHelperPath = env["LEMBAS_MPC_HELPER"]
 let forcePool = env["LEMBAS_AGENT_FORCE_POOL"] == "1"
 
 let anthropicHost = "api.anthropic.com"
-// Headers the agent never forwards into the template; the pool's relay drops the same.
+// Headers the agent never forwards; the helper drops the same and supplies its own.
 let templateDropHeaders: Set<String> = ["host", "connection", "content-length", "authorization", "x-api-key",
                                         "accept-encoding", "transfer-encoding", "expect"]
-// lembas-mpc's MAX_HEADER_LEN for the pool's record (request line through the
-// Authorization line), less the alignment padding it may add. The other headers follow
-// in a record this side encrypts alone, so they cost nothing in MPC.
-let maxHiddenBytes = 320 - 16
+// The pool's record is the request line, Host, Content-Length and the Authorization
+// line, at most lembas-mpc's MAX_HEADER_LEN (320 bytes) with the token span aligned.
+// What is left for the request line, with room to spare.
+let maxRequestLine = 110
+// How long to wait for the helper to come up (it pays the OT setup first).
+let sessionStartTimeout: TimeInterval = 90
 
 // Re-read per borrow, so the switch in the app takes effect without restarting the agent.
 func currentConfig() -> AgentConfig? {
@@ -47,23 +51,31 @@ enum PrivateBorrowError: Error, CustomStringConvertible {
 
 enum PrivateOutcome {
   case served // the response reached Claude Code, whatever its status
-  case donorExhausted(String) // that donor's token hit a limit or is dead; try the next
+  case lenderExhausted // that lender's token hit a limit or is dead; the pool parks it on our report
 }
 
 extension Agent {
-  // Up to three donors; the pool picks each one and is told which to skip.
+  // Up to three lenders: each attempt gets whichever the pool picks next.
   func tryPrivate(_ req: HTTPRequest, _ out: HTTPResponder) async -> Bool {
     guard let pool else { return false }
-    var exclude: [String] = []
-    for _ in 0..<3 {
+    for attempt in 0..<3 {
+      let session: PrivateSession
       do {
-        let borrow = try PrivateBorrow(pool: pool, poolToken: poolToken, request: req, exclude: exclude)
-        switch try await borrow.run(out, agent: self) {
+        session = try await PrivateSessions.shared.session(pool: pool, poolToken: poolToken)
+      } catch {
+        log("private borrow: no session: \(error)")
+        return false
+      }
+      do {
+        switch try await session.perform(req, out, agent: self) {
         case .served: return true
-        case .donorExhausted(let owner): exclude.append(owner)
+        case .lenderExhausted:
+          // Our report parks that lender; give it a moment to land before asking again.
+          if attempt < 2 { try? await Task.sleep(nanoseconds: 300_000_000) }
         }
       } catch {
         log("private borrow failed: \(error)")
+        if !session.alive { await PrivateSessions.shared.discard(session) }
         return false
       }
     }
@@ -71,125 +83,114 @@ extension Agent {
   }
 }
 
-final class PrivateBorrow {
-  private let request: HTTPRequest
-  private let model: String?
-  private let dir: URL
-  private let templateURL: URL
-  private let bodyURL: URL
-  private let fifoPath: String
+// The one session per agent, started on first use and replaced when it dies.
+actor PrivateSessions {
+  static let shared = PrivateSessions()
+  private var current: PrivateSession?
+  private var starting: Task<PrivateSession, Error>?
+
+  func session(pool: String, poolToken: String) async throws -> PrivateSession {
+    if let current, current.alive { return current }
+    if let starting { return try await starting.value }
+    let task = Task { try await PrivateSession.start(pool: pool, poolToken: poolToken) }
+    starting = task
+    defer { starting = nil }
+    let session = try await task.value
+    current = session
+    return session
+  }
+
+  func discard(_ session: PrivateSession) {
+    if current === session {
+      current = nil
+      session.shutdown()
+    }
+  }
+}
+
+final class PrivateSession {
+  let port: UInt16
   private let ws: URLSessionWebSocketTask
-  private let helper = Process()
+  private let helper: Process
+  private let dir: URL
+  private let inbound: Task<Void, Error>
+  private let outbound: Task<Void, Error>
+  private let liveness: Liveness
 
-  init(pool: String, poolToken: String, request: HTTPRequest, exclude: [String]) throws {
-    self.request = request
-    model = modelName(request.body)
-    let template = try PrivateBorrow.template(for: request)
+  var alive: Bool { liveness.alive && helper.isRunning }
 
-    // The request lives briefly in a private temp folder: template and body as files
-    // the helper reads, and a FIFO it streams the response into.
-    let fm = FileManager.default
-    dir = fm.temporaryDirectory.appendingPathComponent("lembas-borrow-\(UUID().uuidString)")
-    try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-    templateURL = dir.appendingPathComponent("request.http")
-    bodyURL = dir.appendingPathComponent("body")
-    fifoPath = dir.appendingPathComponent("response").path
-    try Data(template.utf8).write(to: templateURL)
-    try request.body.write(to: bodyURL)
-    for file in [templateURL, bodyURL] { try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path) }
-    guard mkfifo(fifoPath, 0o600) == 0 else { throw PrivateBorrowError.helper("mkfifo: \(String(cString: strerror(errno)))") }
+  private init(port: UInt16, ws: URLSessionWebSocketTask, helper: Process, dir: URL,
+               inbound: Task<Void, Error>, outbound: Task<Void, Error>, liveness: Liveness) {
+    self.port = port
+    self.ws = ws
+    self.helper = helper
+    self.dir = dir
+    self.inbound = inbound
+    self.outbound = outbound
+    self.liveness = liveness
+  }
 
+  final class Liveness: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = true
+    var alive: Bool { lock.withLock { value } }
+    func end() { lock.withLock { value = false } }
+  }
+
+  static func start(pool: String, poolToken: String) async throws -> PrivateSession {
+    // 1. The WebSocket; the pool says whether it can lend privately at all.
     guard var parts = URLComponents(string: pool + "/pool/borrow") else { throw PrivateBorrowError.pool("bad pool URL") }
     parts.scheme = parts.scheme == "https" ? "wss" : "ws"
-    if !exclude.isEmpty { parts.queryItems = [URLQueryItem(name: "exclude", value: exclude.joined(separator: ","))] }
     var wsRequest = URLRequest(url: parts.url!)
     wsRequest.setValue("Bearer \(poolToken)", forHTTPHeaderField: "authorization")
-    ws = session.webSocketTask(with: wsRequest)
+    let ws = session.webSocketTask(with: wsRequest)
     ws.maximumMessageSize = 64 << 20
-  }
-
-  // The header lembas sends on a borrowed request, with holes for the token and the
-  // body length. Same policy as the pool's relay: Claude Code's headers minus the
-  // per-hop ones, the two beta flags a subscription token needs, a Claude Code user
-  // agent, no compression. The pool's helper checks the token hole is exactly the
-  // Authorization value and Host is Anthropic. Authorization comes right after
-  // Content-Length: everything up to it goes in the pool's record, byte by costly byte.
-  static func template(for request: HTTPRequest) throws -> String {
-    let hidden = "\(request.method) \(request.path) HTTP/1.1\r\nHost: \(anthropicHost)\r\n" +
-      "Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n"
-    guard hidden.utf8.count <= maxHiddenBytes else {
-      throw PrivateBorrowError.template("request line too long for private borrowing (\(hidden.utf8.count) bytes)")
-    }
-    var text = hidden + "Connection: close\r\n"
-    var betas = ["claude-code-20250219", "oauth-2025-04-20"]
-    var userAgent = "claude-cli/2.1.0 (external, cli)"
-    for (name, value) in request.headers where !templateDropHeaders.contains(name) {
-      guard !value.contains("\r"), !value.contains("\n"), !name.contains(":") else { throw PrivateBorrowError.template("bad header \(name)") }
-      switch name {
-      case "anthropic-beta":
-        for beta in value.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) where !beta.isEmpty && !betas.contains(beta) {
-          betas.append(beta)
-        }
-      case "user-agent":
-        if value.hasPrefix("claude-cli/") { userAgent = value }
-      default:
-        text += "\(name): \(value)\r\n"
-      }
-    }
-    text += "anthropic-beta: \(betas.joined(separator: ","))\r\nuser-agent: \(userAgent)\r\naccept-encoding: identity\r\n\r\n"
-    return text
-  }
-
-  func run(_ out: HTTPResponder, agent: Agent) async throws -> PrivateOutcome {
-    defer { cleanup() }
     ws.resume()
-
-    // 1. The pool names the donor, or says why it can't lend.
     guard case .string(let first) = try await ws.receive(),
           let hello = try? JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any] else {
-      throw PrivateBorrowError.pool("expected the donor's name first")
+      ws.cancel(with: .protocolError, reason: nil)
+      throw PrivateBorrowError.pool("expected a session greeting first")
     }
-    guard hello["type"] as? String == "donor", let owner = hello["owner"] as? String else {
+    guard hello["type"] as? String == "session" else {
+      ws.cancel(with: .normalClosure, reason: nil)
       throw PrivateBorrowError.pool("\(hello["code"] ?? "error"): \(hello["message"] ?? first)")
     }
-    log("private borrow: \(owner) lends; \(request.method) \(request.path) (\(request.body.count) bytes)")
 
-    // 2. The helper. Its stdin/stdout are the link to the pool; the response comes
-    //    out of the FIFO; its logs join ours.
+    // 2. The helper. Its stdin/stdout are the link to the pool; it serves requests on
+    //    a local port it writes to a file; its logs join ours.
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("lembas-session-\(UUID().uuidString)")
+    try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    let portFile = dir.appendingPathComponent("port")
+    let helper = Process()
     helper.executableURL = URL(fileURLWithPath: mpcHelperPath)
-    helper.arguments = ["borrower", "--stdio", "--output", fifoPath, "--server-name", anthropicHost,
-                        "--template", templateURL.path, "--body", bodyURL.path]
+    helper.arguments = ["proxy", "--stdio", "--listen", "127.0.0.1:0", "--port-file", portFile.path,
+                        "--server-name", anthropicHost]
     helper.environment = ["RUST_LOG": env["LEMBAS_MPC_LOG"] ?? "warn"]
     let toHelper = Pipe(), fromHelper = Pipe()
     helper.standardInput = toHelper
     helper.standardOutput = fromHelper
     helper.standardError = FileHandle.standardError
-    // Opening the FIFO blocks until the helper opens its end. If the helper dies
-    // first, open the write end ourselves for a moment so the reader sees EOF.
-    let fifoPath = self.fifoPath
-    helper.terminationHandler = { _ in
-      for _ in 0..<50 {
-        let fd = open(fifoPath, O_WRONLY | O_NONBLOCK)
-        if fd >= 0 { close(fd); return }
-        usleep(20_000)
-      }
+    let liveness = Liveness()
+    helper.terminationHandler = { _ in liveness.end(); ws.cancel(with: .goingAway, reason: nil) }
+    do { try helper.run() } catch {
+      ws.cancel(with: .goingAway, reason: nil)
+      try? fm.removeItem(at: dir)
+      throw PrivateBorrowError.helper("could not start \(mpcHelperPath): \(error.localizedDescription)")
     }
-    let fifoOpen = Task.detached { open(fifoPath, O_RDONLY) }
-    do { try helper.run() } catch { throw PrivateBorrowError.helper("could not start \(mpcHelperPath): \(error.localizedDescription)") }
-    out.whenClosed { [helper] in if helper.isRunning { helper.terminate() } }
 
-    // 3. The bridge: pool → helper and helper → pool, until either side is done.
-    let ws = self.ws
-    let helper = self.helper
+    // 3. The bridge: pool → helper and helper → pool, for the life of the session.
     let inbound = Task {
       let stdin = toHelper.fileHandleForWriting
-      defer { try? stdin.close() }
+      defer { try? stdin.close(); liveness.end() }
       while true {
         switch try await ws.receive() {
         case .data(let data):
-          // Frames for a helper that has already finished are late by definition.
           if helper.isRunning { try stdin.write(contentsOf: data) }
-        case .string(let text): throw PrivateBorrowError.pool(text) // the pool only speaks up when something failed
+        case .string(let text):
+          // The pool only speaks up when something failed on its side.
+          log("private borrow: pool says \(text)")
+          throw PrivateBorrowError.pool(text)
         @unknown default: break
         }
       }
@@ -198,43 +199,88 @@ final class PrivateBorrow {
       for await chunk in chunks(of: fromHelper.fileHandleForReading) { try await ws.send(.data(chunk)) }
     }
 
-    // 4. The response, as the helper decrypts it.
-    let fd = await fifoOpen.value
-    guard fd >= 0 else { throw PrivateBorrowError.helper("could not open the response pipe") }
-    var response = HTTPResponseReader(chunks(of: FileHandle(fileDescriptor: fd, closeOnDealloc: true)))
+    // 4. The port, once the helper has set up with the pool.
+    let deadline = Date().addingTimeInterval(sessionStartTimeout)
+    var port: UInt16?
+    while port == nil {
+      if let text = try? String(contentsOf: portFile, encoding: .utf8), let p = UInt16(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        port = p
+        break
+      }
+      guard helper.isRunning, liveness.alive, Date() < deadline else { break }
+      try await Task.sleep(nanoseconds: 50_000_000)
+    }
+    guard let port else {
+      inbound.cancel()
+      outbound.cancel()
+      if helper.isRunning { helper.terminate() }
+      ws.cancel(with: .goingAway, reason: nil)
+      try? fm.removeItem(at: dir)
+      throw PrivateBorrowError.helper("session did not come up")
+    }
+    log("private borrow: session ready on 127.0.0.1:\(port)")
+    return PrivateSession(port: port, ws: ws, helper: helper, dir: dir, inbound: inbound, outbound: outbound, liveness: liveness)
+  }
+
+  // One request through the helper's local port.
+  func perform(_ request: HTTPRequest, _ out: HTTPResponder, agent: Agent) async throws -> PrivateOutcome {
+    let model = modelName(request.body)
+    var bytes = Data(try PrivateSession.requestHead(for: request).utf8)
+    bytes.append(request.body)
+
+    let fd = try connectLocal(port)
+    // Owns the descriptor; the reader task below keeps it until EOF or we return.
+    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    let writer = Task.detached {
+      try writeAll(fd, bytes)
+    }
+    var response = HTTPResponseReader(chunks(of: handle))
     let head: HTTPURLResponse
     do {
       head = try await response.head(url: URL(string: "https://\(anthropicHost)\(request.path)")!)
     } catch {
-      // No response at all: the pool's side failed, and its text frame says why.
-      inbound.cancel()
-      if case .failure(let poolError) = await inbound.result, let poolError = poolError as? PrivateBorrowError { throw poolError }
+      writer.cancel()
+      if !alive { throw PrivateBorrowError.helper("session ended: \(error)") }
       throw error
     }
+    _ = try await writer.value
+
+    // The helper's own answers: nobody lending (503) or a failure (502).
+    if let kind = head.value(forHTTPHeaderField: "x-lembas-error") {
+      var body = Data()
+      for try await chunk in response.body { body.append(chunk) }
+      let message = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])
+        .flatMap { ($0["error"] as? [String: Any])?["message"] as? String } ?? String(decoding: body, as: UTF8.self)
+      throw kind == "refused" ? PrivateBorrowError.pool("no_capacity: \(message)") : PrivateBorrowError.helper(message)
+    }
+    let reqNo = head.value(forHTTPHeaderField: "x-lembas-request").flatMap(Int.init) ?? 0
+    log("private borrow: request \(reqNo) \(request.method) \(request.path) (\(request.body.count) bytes) → \(head.statusCode)")
 
     let outcome: PrivateOutcome
     let tap = UsageTap(contentType: head.value(forHTTPHeaderField: "content-type"))
     if head.statusCode == 429 || head.statusCode == 401 {
-      // Decide before answering Claude Code: a limit on this donor means another donor.
+      // Decide before answering Claude Code: a limit on this lender means another lender.
       var body = Data()
       for try await chunk in response.body { body.append(chunk) }
       let text = String(decoding: body, as: UTF8.self)
       if head.statusCode == 401 {
-        log("private borrow: \(owner)'s token is dead (401)")
-        report(["type": "dead", "status": 401, "model": model as Any])
-        outcome = .donorExhausted(owner)
+        log("private borrow: the lender's token is dead (401)")
+        report(["type": "dead", "req": reqNo, "status": 401, "model": model as Any])
+        outcome = .lenderExhausted
       } else if isUsageLimit(head, text) {
         let seconds = retryAfterSeconds(head) ?? defaultLimitSeconds
-        log("private borrow: \(owner)'s token hit its limit: \(describeLimit(head, text))")
-        report(["type": "limit", "status": 429, "forMs": Int(seconds * 1000), "model": model as Any])
-        outcome = .donorExhausted(owner)
+        log("private borrow: the lender's token hit its limit: \(describeLimit(head, text))")
+        report(["type": "limit", "req": reqNo, "status": 429, "forMs": Int(seconds * 1000), "model": model as Any])
+        outcome = .lenderExhausted
       } else {
         await agent.sendFixed(out, head, body) // transient rate limit: Claude Code retries
-        report(["type": "result", "status": 429, "usd": 0, "model": model as Any])
+        report(["type": "result", "req": reqNo, "status": 429, "usd": 0, "model": model as Any])
         outcome = .served
       }
     } else {
-      await out.start(status: head.statusCode, headers: agent.responseHeaders(head))
+      var headers = agent.responseHeaders(head)
+      headers = headers.filter { $0.0.lowercased() != "x-lembas-request" }
+      await out.start(status: head.statusCode, headers: headers)
       var pending = Data()
       do {
         for try await chunk in response.body {
@@ -252,16 +298,40 @@ final class PrivateBorrow {
       await out.chunk(pending)
       await out.end()
       let usd = costUsd(model: model, usage: tap.finish())
-      report(["type": "result", "status": head.statusCode, "usd": usd, "model": model as Any])
+      report(["type": "result", "req": reqNo, "status": head.statusCode, "usd": usd, "model": model as Any])
       outcome = .served
     }
-
-    // 5. Let the helpers finish their close, then drop the socket.
-    _ = await outbound.result
-    inbound.cancel()
-    await waitForExit()
-    ws.cancel(with: .normalClosure, reason: nil)
     return outcome
+  }
+
+  // The request as the helper wants it: plain HTTP/1.1 with Content-Length. Same
+  // header policy as the pool's relay: Claude Code's headers minus the per-hop ones,
+  // the two beta flags a subscription token needs, a Claude Code user agent, no
+  // compression. The helper puts the request line, Host, Content-Length and the
+  // Authorization line in the pool's record and sends the rest itself.
+  static func requestHead(for request: HTTPRequest) throws -> String {
+    let line = "\(request.method) \(request.path) HTTP/1.1\r\n"
+    guard line.utf8.count <= maxRequestLine else {
+      throw PrivateBorrowError.template("request line too long for private borrowing (\(line.utf8.count) bytes)")
+    }
+    var text = line + "Host: \(anthropicHost)\r\nContent-Length: \(request.body.count)\r\n"
+    var betas = ["claude-code-20250219", "oauth-2025-04-20"]
+    var userAgent = "claude-cli/2.1.0 (external, cli)"
+    for (name, value) in request.headers where !templateDropHeaders.contains(name) {
+      guard !value.contains("\r"), !value.contains("\n"), !name.contains(":") else { throw PrivateBorrowError.template("bad header \(name)") }
+      switch name {
+      case "anthropic-beta":
+        for beta in value.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) where !beta.isEmpty && !betas.contains(beta) {
+          betas.append(beta)
+        }
+      case "user-agent":
+        if value.hasPrefix("claude-cli/") { userAgent = value }
+      default:
+        text += "\(name): \(value)\r\n"
+      }
+    }
+    text += "anthropic-beta: \(betas.joined(separator: ","))\r\nuser-agent: \(userAgent)\r\n\r\n"
+    return text
   }
 
   private func report(_ object: [String: Any]) {
@@ -270,15 +340,44 @@ final class PrivateBorrow {
     ws.send(.string(String(decoding: data, as: UTF8.self))) { _ in }
   }
 
-  private func waitForExit() async {
-    for _ in 0..<100 where helper.isRunning { try? await Task.sleep(nanoseconds: 50_000_000) }
-    if helper.isRunning { helper.terminate() }
-  }
-
-  private func cleanup() {
+  func shutdown() {
+    inbound.cancel()
+    outbound.cancel()
     if helper.isRunning { helper.terminate() }
     ws.cancel(with: .goingAway, reason: nil)
     try? FileManager.default.removeItem(at: dir)
+  }
+}
+
+// A TCP connection to the helper's local port.
+func connectLocal(_ port: UInt16) throws -> Int32 {
+  let fd = socket(AF_INET, SOCK_STREAM, 0)
+  guard fd >= 0 else { throw PrivateBorrowError.helper("socket: \(String(cString: strerror(errno)))") }
+  var addr = sockaddr_in()
+  addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+  addr.sin_family = sa_family_t(AF_INET)
+  addr.sin_port = port.bigEndian
+  addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+  let rc = withUnsafePointer(to: &addr) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+  }
+  guard rc == 0 else {
+    let message = String(cString: strerror(errno))
+    close(fd)
+    throw PrivateBorrowError.helper("connecting to the session: \(message)")
+  }
+  var one: Int32 = 1
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+  return fd
+}
+
+func writeAll(_ fd: Int32, _ data: Data) throws {
+  var offset = 0
+  while offset < data.count {
+    let n = data.withUnsafeBytes { raw in write(fd, raw.baseAddress! + offset, data.count - offset) }
+    if n > 0 { offset += n } else if n < 0 && errno == EINTR { continue } else {
+      throw PrivateBorrowError.helper("writing the request: \(String(cString: strerror(errno)))")
+    }
   }
 }
 

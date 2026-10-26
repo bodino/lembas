@@ -33,8 +33,9 @@ day, your unused capacity can help them.
   answer. The switch is strict: if the pool can't lend privately, borrowing pauses
   instead of falling back to the relay the pool can read. In return the pool has to
   take your agent's word for what the request cost and whether it hit a limit, since
-  it can no longer see Anthropic's answer. About 0.1 s of overhead per request and
-  half a megabyte each way between your Mac and the pool.
+  it can no longer see Anthropic's answer. About a megabyte each way to set up when
+  the agent starts borrowing, then a few tens of KB and some 20 ms per request, with
+  the connections to Anthropic kept open and reused.
 
 The pieces:
 

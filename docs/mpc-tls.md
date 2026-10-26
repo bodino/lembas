@@ -101,8 +101,41 @@ redundant, since DEAP exists to protect the follower's private inputs and the po
 none. Dropping it cut the traffic from 3.6 MB to about 1.2 MB, and ferret on top of KOS
 for the proof's correlated OTs cut it again to about 0.5 MB each way.
 
-One connection per borrowed request today. Nothing in the design prevents a second
-splice on a kept-alive connection; see "Open".
+### Sessions: many requests, many connections, one setup
+
+A borrower keeps one **session** with the pool for as long as it has requests (in
+lembas, for the life of the agent): one link, one prover and verifier with their OT
+setup, many TLS connections to Anthropic opened on demand and reused with HTTP
+keep-alive, and one spliced token record per request. Five Claude Code sessions on one
+Mac share the one helper; it opens a connection per request in flight (at most 16) and
+proves the records one at a time. Frames carry a connection id; the pool keeps per
+connection the state it needs to enforce, before every token record, that the record
+begins a fresh HTTP request:
+
+- before the first splice on a connection only handshake records pass;
+- after a splice the borrower may send exactly the announced request length (its
+  remaining headers plus `Content-Length` of body; the borrower now sends the pool its
+  whole header, which the pool checks and counts but does not encrypt), measured from
+  the relayed records' plaintext lengths: fewer bytes would make the next token record
+  part of this body, more would make it the body of a pipelined request;
+- the next splice must announce the sequence number the pool expects from the records
+  it counted, and no borrower record may reuse a token record's explicit nonce.
+
+A request's frame, proof and tag share go out under one lock on the borrower, and the
+pool runs its proofs on one task in arrival order, so the two transcripts on the `mpc`
+channel line up whatever the concurrency. The pool answers each request with
+`Accepted` (a lender was found; the proof starts) or `Refused` (nobody lends right now;
+the connection stays usable). A connection the server closed while idle is noticed
+before anything is sent and the request moves to a fresh one. Every 32 requests the
+borrower renews the setup (mpz's VMs keep every wire they ever allocated, about 3 MB
+per request on each side), one more OT setup for bounded memory.
+
+The pool side takes a token per request from its parent over a control descriptor
+(`--control-fd 3`, JSON lines), so lenders are chosen per request and can change
+within a session. The borrower side is a local HTTP/1.1 proxy (`lembas-mpc proxy`):
+the agent sends each request as plain HTTP to a local port and reads the response as
+the server sent it, plus one header, `x-lembas-request`, the pool's number for the
+request, which the agent quotes when it reports the outcome.
 
 ## What each side can do
 
@@ -114,9 +147,11 @@ splice on a kept-alive connection; see "Open".
 
 ## What's been built (2026-10-25/26)
 
-The crate `lembas-mpc` (`mpc-tls/lembas-mpc/`): `splice.rs` is the protocol, `record.rs`
-the local TLS 1.2 AES-GCM record layer the borrower runs after the handshake (about 150
-lines over `aes-gcm`), `lib.rs` the template policy and the link plumbing. The TLS
+The crate `lembas-mpc` (`mpc-tls/lembas-mpc/`): `splice.rs` has the primitives
+(keystream proof, tag, TLS client), `session.rs` the protocol (frames, the pool's
+per-connection gate, the borrower's connection pool), `local.rs` the borrower's local
+HTTP proxy and response framing, `record.rs` the local TLS 1.2 AES-GCM record layer the
+borrower runs after the handshake, `lib.rs` the template policy and the link plumbing. The TLS
 client is rustls 0.23 restricted to TLS 1.2 and the two ECDHE AES-128-GCM suites, with
 secret extraction on and resumption off. From tlsn the crate uses only `tlsn-mux` (the
 multiplexed link) and the test server fixture; from mpz, the QuickSilver prover and
@@ -130,21 +165,23 @@ measurements below. The crate could become a standalone one depending on tlsn's
 published components.
 
 The link carries three mux channels, opened in the same order on both sides: `mpc` for
-the two-party computation, `up` for everything the borrower sends (its header, then
-frames), `down` for everything the pool sends (its `Hello`, then frames). Frames are
-`Bytes` (TLS bytes either way), `Splice { seq, nonce }`, `TagShare`, `Spliced`,
-`ServerClosed`, `Done`. `Hello` starts with `PROTOCOL_VERSION`, now 4; an old peer gets
-a clean refusal.
+the two-party computation, `up` for everything the borrower sends, `down` for
+everything the pool sends (its `Hello` first). Up: `Open`, `Bytes`, `Request { header,
+trailer, seq, nonce }`, `TagShare`, `Close`, `Renew`, `Done`; down: `Opened`,
+`OpenFailed`, `Bytes`, `Accepted { req }`, `Spliced { req }`, `Refused`,
+`ServerClosed`; all but `Renew`/`Done` carry a connection id. `Hello` starts with
+`PROTOCOL_VERSION`, now 5; an old peer gets a clean refusal.
 
-The demo (`demo`) runs the pool, the borrower and tlsn's hyper echo server in one
-process over in-memory pipes and checks: the body is echoed; the token never appears on
-the pool↔borrower link, nor does any 16-byte window of the token record's ciphertext;
-and the token record is byte-for-byte what the borrower's keys produce from its
-template with the token in place, at the sequence number the borrower announced.
+The demo (`demo`) runs the pool, the borrower and tlsn's echo server in one process
+over in-memory pipes: one session, `--requests` requests `--concurrency` at a time
+(every third asks the server to close, so the next must open a new connection), each
+body echoed back; `--refuse-first N` makes the pool refuse the first N requests and
+checks the session goes on; the token never appears on the pool↔borrower link.
 `--evil-rewrite` (the pool changes a header byte outside the span) ends with the
-server's `bad_record_mac` alert reaching the borrower; `--evil-server` (the borrower
-expects `api.anthropic.com`, the pool connects it to the test server) fails in the
-borrower's certificate check.
+server's `bad_record_mac` alert reaching the borrower; `--evil-server` (the pool
+announces the name the borrower expects but connects it to the test server) fails in
+the borrower's certificate check. The pool's per-connection gate has a unit test of
+its own (`session::tests`).
 
 **Measured** on one Mac, both parties local, 32 KB body, 210-byte token record:
 
@@ -157,23 +194,34 @@ borrower's certificate check.
 | bytes borrower → pool | **504 KB** (32 KB of it body) | 3.6 MB | 33.8 MB | 19.6 MB |
 | bytes pool → borrower | **525 KB** | 56 KB | 303 KB | 302 KB |
 
-Ferret trades a fixed setup (the ~0.5 MB each way, mostly its base correlations and
-LPN expansion) for a per-gate cost near zero, which is why the pool's side went up and
-the borrower's came down; with plain KOS the borrower pays 16 bytes per AND gate (the
-1.2 MB figure). A 16 MB body adds its own size and about 0.1 s (226 ms in total).
-Against `api.anthropic.com` with the user's subscription token, in two processes over
-TCP: a non-streaming `POST /v1/messages` with the headers lembas uses returned 200 and
-the model's answer in 1.3 s, a streaming one in 1.4 s, of which about 65 ms handshake
-(preprocessing hidden behind it) and 20 ms for the token record; the rest is the
-model.
+Ferret trades a fixed setup for a per-gate cost near zero; with plain KOS the borrower
+pays 16 bytes per AND gate (the 1.2 MB figure). The table is for one request per
+session, the shape before sessions.
+
+**Sessions, measured** (demo, 1 KB bodies, 4 at a time):
+
+| | per session | per request |
+|---|---|---|
+| setup (two ferret instances: proof and share conversion) | ~0.9 MB each way, 105 ms | — |
+| proof and tag | — | 20 ms of proving, serialized; ~13 KB borrower → pool |
+| ferret extension for the proof (one per ~13 requests) | — | ~80–120 KB pool → borrower, amortized |
+| setup renewal every 32 requests | — | ~30 KB each way, amortized |
+| new TLS connection (when none is idle) | — | 2 round trips, no MPC |
+
+Sixty requests in 2 s locally, 22 connections opened and 38 reused. The proof instance
+extends ferret a million correlations at a time (16 MB of memory a side) so that an
+extension serves a dozen requests; the share conversion keeps mpz's small parameters.
+Through lembas's pool and agent against `api.anthropic.com`: eight requests over one
+session, four of them at once and two streaming, all 200, each metered to the lender,
+later ones on reused connections; the two helpers sat at about 140 MB of memory each.
 
 ## In lembas (2026-10-25)
 
 Wired in behind a **Private Borrowing** switch in the app's ⚙ menu, stored as
 `privateBorrowing` in `~/.config/lembas.json` and re-read by the agent per request.
-The helper's command line and the bridge did not change with the new protocol; the
-pool no longer passes `--low-bandwidth`, and `--roots` on the pool side is accepted
-but has nothing to verify.
+Since sessions, the agent keeps one helper and one WebSocket per pool for as long as it
+runs (started on the first borrowed request, replaced if it dies), and the pool keeps
+one helper per borrowing member.
 
 - **Transport.** The agent opens a WebSocket to the pool's `GET /pool/borrow` with its
   pool token (the same HTTPS address as everything else, so Tailscale Funnel carries
@@ -181,44 +229,44 @@ but has nothing to verify.
   `unsupported`, `no_capacity`, `helper`), the agent's last frame reports the outcome.
   Binary frames are the tlsn-mux byte stream. `src/ws.ts` is a hand-written RFC 6455
   server, since the pool has no npm dependencies and Node ships only the client.
-- **Helpers.** One `lembas-mpc` process per borrowed request on each side, both in
-  `--stdio` mode: the pool spawns `pool --stdio` with the donor's freshly refreshed
-  token in its environment and pipes the socket to its stdin/stdout; the agent spawns
-  `borrower --stdio` with the template and body as files in a 0700 temp folder and the
-  response coming back through a FIFO, parsed and streamed to Claude Code (chunked
-  transfer decoded, usage metered locally).
-- **Template.** The agent builds it from Claude Code's request with the relay's header
-  policy (hop headers dropped, the two beta flags merged in, a Claude Code user agent,
-  `accept-encoding: identity`), `Content-Length: {body_len}` before `Authorization:
-  Bearer {token}`. Only the part through the Authorization line is the pool's record
-  (`MAX_HEADER_LEN` 320 bytes, about 210 in practice); the other headers follow in the
-  borrower's own first record and cost nothing.
+- **Helpers.** The pool spawns `pool --stdio --control-fd 3` per member session,
+  pipes the WebSocket to its stdin/stdout, and answers its `need_token` lines on fd 3
+  with a lender's freshly refreshed token and a request number (or `refuse`). The agent
+  spawns `proxy --stdio --listen 127.0.0.1:0 --port-file …` once, bridges its
+  stdin/stdout to the WebSocket, and sends each Claude Code request to the local port
+  as plain HTTP (Claude Code's headers minus the per-hop ones, the two beta flags, a
+  Claude Code user agent); the helper puts the request line, `Host`, `Content-Length`
+  and the Authorization line in the pool's record and sends the rest itself. The
+  response comes back as the server sent it, one connection per request, and the agent
+  streams it to Claude Code (chunked transfer decoded, usage metered locally).
 - **Metering and limits move to the borrower.** The pool can't see the response, so
-  the agent reports `{type: result, status, model, usd}` (metered with the same table
-  the agent uses for direct requests), `{type: limit, forMs}` on a usage-limit 429
-  (the pool parks the donor and the agent retries the next donor, up to three, naming
-  the ones to skip in the `exclude` query), `{type: dead}` on a 401, or
-  `{type: failed}`. The pool trusts these; a dishonest borrower could under-report or
+  the agent reports per request, with the request number from `x-lembas-request`:
+  `{type: result, req, status, model, usd}` (metered with the same table the agent uses
+  for direct requests), `{type: limit, req, forMs}` on a usage-limit 429 (the pool
+  parks that lender; the agent retries, and the pool picks another), `{type: dead,
+  req}` on a 401. The pool trusts these; a dishonest borrower could under-report or
   park a friend's token. Among friends this is accepted and stated in the README.
 - **Strict.** With the switch on the agent never falls back to the readable relay. If
   the pool has no helper (`privateBorrowing: false` in `GET /pool`) or a private borrow
   fails, Claude Code gets Anthropic's own limit error and the app says borrowing is
   paused.
-- **Lifetimes.** Setup 90 s, relay idle 10 min (`RELAY_IDLE_TIMEOUT`, matching the
-  agent's request timeout), mux close handshake 5 s (`CLOSE_TIMEOUT`); the pool ends
-  the helper's stdin when the socket closes and kills it after 5 s, SIGKILL after 10.
+- **Lifetimes.** Setup, connect and splice steps 90 s each; a response may pause for
+  10 min between bytes (`RESPONSE_IDLE_TIMEOUT`, matching the agent's request
+  timeout); a session with no frame for 2 h ends; mux close handshake 5 s. The pool
+  ends the helper's stdin when the socket closes and kills it after 5 s, SIGKILL after
+  10.
 - **Build.** `./build.sh` clones tlsn at eb19c82 into `build/tlsn`, applies the patch,
   copies in `mpc-tls/lembas-mpc`, builds for arm64 and x86_64 and puts the universal
   helper in the app bundle and in `build/lembas-mpc` for the pool. The release
   workflow caches the Rust build.
-- **Verified end to end** (2026-10-26) with the zero-knowledge helper: a scratch pool
-  on 8790 (copy of the live config and state, never the live pool) and the freshly
-  built agent on 8791 with `LEMBAS_AGENT_FORCE_POOL=1`; a Claude Code-style
-  `POST /v1/messages` as katya came back 200 through alessandro's token, plain and
-  streaming, in 1.1–1.3 s, metered by the pool as "privately". Two earlier attempts
-  were refused with `no_capacity` because the pool's usage fetch for the donor had
-  failed transiently and the null is cached for 60 s; that is the existing lending
-  policy ("if it can't be read, nobody borrows"), not the private path.
+- **Verified end to end** (2026-10-26, sessions) with a scratch pool on 8790 (copy of
+  the live config and state, never the live pool) and the freshly built agent on 8791
+  with `LEMBAS_AGENT_FORCE_POOL=1`: eight Claude Code-style requests as katya over one
+  session, four at once, two streaming, all 200 through alessandro's token, each
+  metered by the pool as "privately" with its request number. Refusals (`no_capacity`,
+  which also happens when the pool's usage fetch for a lender fails transiently and
+  the null is cached for 60 s) come back to Claude Code as the agent's usual error, and
+  the session goes on.
 
 ## Security, as it stands
 
@@ -244,11 +292,11 @@ but has nothing to verify.
   holding the key, it could then decrypt. The handshake is not in MPC and there is no
   garbled circuit, so the earlier concerns about key-exchange conversions and
   garbling orientation are gone.
-- **Bounds.** Setup (prelude, preprocessing, handshake, splice) has a 90 s deadline on
-  both sides; at most 64 KB of handshake from the borrower before the splice; frames
-  of at most 256 KB; the relay gives up after 10 minutes without a frame from either
-  side and after an hour in total; the pool holds at most 4 MB of the borrower's bytes
-  for a slow server and relays at most 68 MB per borrow; `Content-Length` at most 64 MB.
+- **Bounds.** Each setup, connect and splice step has a 90 s deadline; at most 64 KB of
+  handshake per connection before its first splice; frames of at most 256 KB; at most
+  16 connections per session; a request's bytes are exactly its announced length
+  (trailer at most 8 KB, `Content-Length` at most 64 MB); a session ends after 2 h
+  without a frame; per-connection queues give backpressure to a slow server.
 
 ## Findings
 
@@ -323,16 +371,36 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
    per-correlation cost negligible at the price of a fixed setup, ~0.5 MB each way.
    For lembas, where the borrower is on a home uplink and the pool on a better one,
    this is the right trade; for very small circuits plain KOS would be cheaper.
+23. **mpz's KOS extends once; ferret extends forever.** A session needs correlations
+   per request, so the share conversion could not stay on KOS; it has a ferret
+   instance of its own. Sharing the proof's instance was tried and deadlocks: a
+   shared handle's `flush` is a barrier every live handle must reach, and the converter
+   skips its flush when nothing is queued. Two setups per session cost less than
+   untangling that.
+24. **Ferret's batch size is the per-request cost.** With mpz's default parameters
+   (256k correlations per extension) every third request paid a ~200 KB extension;
+   choosing a million per extension (16 MB of memory a side) makes it one per dozen.
+   The first extension must use the small parameters, since it runs on the bootstrap
+   correlations; a selector that ignores that panics inside ferret.
+25. **Proofs must be ordered like requests.** With concurrent requests, the borrower's
+   proof order and the pool's splice order can differ unless the request frame, the
+   proof and the tag share go out under one lock on the borrower and the pool proves
+   on one task in arrival order. The first version raced; a renewal landing between a
+   request and its proof made it visible.
+26. **Say yes before proving.** The borrower must not start its proof until the pool
+   has a lender: a refusal left the borrower proving alone for 90 s. Hence `Accepted`.
+27. **One request per local connection.** The agent reads a response to the end of the
+   stream; a keep-alive proxy left it waiting forever and leaked a reader thread per
+   request. The proxy now closes after each response.
+28. **Never guess a descriptor.** Detecting the control channel by trying fd 3 worked
+   under Node (which opens it before exec) and closed tokio's own kqueue under
+   anything else. The parent names it (`--control-fd`).
 
 ## Open
 
-- **Keep-alive: one connection per Claude Code session.** Once the borrower holds the
-  key and the token record is spliced, a second request on the same connection needs
-  only another splice: no handshake. The pool would need to know where the previous
-  request ended before allowing the next splice; it knows `Content-Length` (it wrote
-  it) and can count the borrower's plaintext bytes from the relayed record lengths.
-  Most of the 0.5 MB is ferret's setup, which a kept-alive helper would pay once per
-  session rather than per request.
+- **Memory.** About 140 MB per helper with sessions (two ferret instances and the VM's
+  wires until the next renewal). A smaller proof batch or a shorter renewal period
+  trades bandwidth for memory if the pool ever hosts many borrowers at once.
 - **Standalone crate.** Nothing in `lembas-mpc` depends on the tlsn workspace except
   `tlsn-mux` and the test fixture; with those as git dependencies the patch goes away
   entirely and `build.sh` no longer needs a tlsn checkout.
