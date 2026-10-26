@@ -17,6 +17,8 @@ export class WebSocketConnection extends EventEmitter {
   // in, so a large frame arriving in small pieces costs linear, not quadratic, copying.
   private pending: Buffer[] = [];
   private pendingBytes = 0;
+  private offset = 0; // consumed bytes of pending[0]
+  private draining = false;
   private fragments: Buffer[] = [];
   private fragmentBytes = 0;
   private fragmentText = false;
@@ -51,7 +53,14 @@ export class WebSocketConnection extends EventEmitter {
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
     socket.setNoDelay?.(true);
     const ws = new WebSocketConnection(socket);
-    if (head.length) ws.feed(head);
+    // Bytes that came with the upgrade are parsed once the caller has attached its
+    // listeners (it does so right after this returns): a bad first frame must reach
+    // its error handler, a good one its message handler.
+    // `head` is a view into Node's parser buffer, which it reuses: copy it first.
+    if (head.length) {
+      const first = Buffer.from(head);
+      queueMicrotask(() => ws.feed(first));
+    }
     return ws;
   }
 
@@ -94,27 +103,65 @@ export class WebSocketConnection extends EventEmitter {
     return this.socket.write(Buffer.concat([header, payload]));
   }
 
-  // The first `n` pending bytes, without consuming them.
+  // The first `n` pending bytes, without consuming them (fewer if that is all there is).
   private peek(n: number): Buffer {
-    if (this.pending.length === 1) return this.pending[0].subarray(0, n);
-    return Buffer.concat(this.pending, Math.min(n, this.pendingBytes));
+    const first = this.pending[0].subarray(this.offset);
+    if (first.length >= n || this.pending.length === 1) return first.subarray(0, n);
+    return Buffer.concat([first, ...this.pending.slice(1)], Math.min(n, this.pendingBytes));
   }
 
+  // Consumes `n` bytes. A frame inside the first chunk is a view with the offset
+  // advanced, so a stream of small frames costs linear time; only a frame that spans
+  // chunks is copied together.
   private take(n: number): Buffer {
-    const out = this.pending.length === 1 ? this.pending[0].subarray(0, n) : Buffer.concat(this.pending, this.pendingBytes).subarray(0, n);
-    let rest = Buffer.concat(this.pending, this.pendingBytes).subarray(n);
-    if (this.pending.length === 1) rest = this.pending[0].subarray(n);
-    this.pending = rest.length ? [rest] : [];
-    this.pendingBytes = rest.length;
+    const first = this.pending[0].subarray(this.offset);
+    let out: Buffer;
+    if (first.length >= n) {
+      out = first.subarray(0, n);
+      this.offset += n;
+    } else {
+      const parts = [first];
+      let have = first.length;
+      let i = 1;
+      while (have < n) {
+        parts.push(this.pending[i]);
+        have += this.pending[i].length;
+        i++;
+      }
+      out = Buffer.concat(parts, have).subarray(0, n);
+      this.pending = this.pending.slice(i - 1);
+      this.offset = this.pending[0].length - (have - n);
+    }
+    this.pendingBytes -= n;
+    if (this.offset === this.pending[0].length) {
+      this.pending.shift();
+      this.offset = 0;
+    }
     return out;
   }
+
+  // Frames parsed per turn of the event loop before yielding: a member sending a
+  // million tiny frames must not stall every other member's session.
+  private static readonly FRAME_BUDGET = 2000;
 
   private feed(chunk: Buffer): void {
     if (chunk.length) {
       this.pending.push(chunk);
       this.pendingBytes += chunk.length;
     }
-    for (;;) {
+    if (this.draining) return; // the scheduled continuation picks the new bytes up
+    for (let parsed = 0; ; parsed++) {
+      if (parsed >= WebSocketConnection.FRAME_BUDGET) {
+        this.draining = true;
+        this.socket.pause();
+        setImmediate(() => {
+          this.draining = false;
+          if (this.closed) return;
+          this.socket.resume();
+          this.feed(Buffer.alloc(0));
+        });
+        return;
+      }
       if (this.pendingBytes < 2) return;
       const head = this.peek(10);
       const fin = (head[0] & 0x80) !== 0;
@@ -187,7 +234,7 @@ export class WebSocketConnection extends EventEmitter {
   }
 
   private fail(reason: string): void {
-    this.emit("error", new Error(reason));
+    if (this.listenerCount("error") > 0) this.emit("error", new Error(reason));
     this.closed = true;
     this.socket.destroy();
     this.emit("close", 1002);

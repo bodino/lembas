@@ -1930,8 +1930,10 @@ struct MainView: View {
 func isLocalNetworkHost(_ host: String?) -> Bool {
   guard let host = host?.lowercased() else { return false }
   if host == "localhost" || host == "::1" || host.hasSuffix(".local") { return true }
-  let parts = host.split(separator: ".").compactMap { Int($0) }
-  guard parts.count == 4 else { return false }
+  // Exactly four labels, each a byte: "10.1.2.3.evil.com" is a hostname, not an address.
+  let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+  let parts = labels.compactMap { UInt8($0) }.map(Int.init)
+  guard labels.count == 4, parts.count == 4 else { return false }
   if parts[0] == 127 || parts[0] == 10 { return true }
   if parts[0] == 192 && parts[1] == 168 { return true }
   if parts[0] == 172 && (16...31).contains(parts[1]) { return true }
