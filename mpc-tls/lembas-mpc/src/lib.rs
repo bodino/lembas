@@ -162,12 +162,16 @@ pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &st
     for (i, line) in head.split("\r\n").enumerate() {
         let line_range = pos..pos + line.len();
         pos += line.len() + 2;
+        ensure!(!line.contains(['\r', '\n']), "header line with a stray CR or LF");
         if i == 0 {
             ensure!(line.ends_with(" HTTP/1.1"), "first line must be an HTTP/1.1 request line");
             ensure!(line.matches(' ').count() == 2, "malformed request line");
+            ensure!(
+                line.bytes().all(|b| (0x21..=0x7e).contains(&b) || b == b' '),
+                "request line with a control or non-ASCII byte"
+            );
             continue;
         }
-        ensure!(!line.contains(['\r', '\n']), "header line with a stray CR or LF");
         ensure!(!line.starts_with([' ', '\t']), "header line starts with whitespace");
         let (name, value) = line.split_once(':').context("malformed header line")?;
         ensure!(is_header_name(name), "malformed header name");

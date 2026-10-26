@@ -1,6 +1,6 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { accessSync, chmodSync, constants as fsConstants, fchmodSync, fstatSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants as fsConstants, fchmodSync, fstatSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { Ledger, type LendPolicy, type LendRule } from "./ledger.ts";
 import { WebSocketConnection } from "./ws.ts";
@@ -152,7 +152,11 @@ async function anthropicToken(name: string): Promise<string> {
     if (tokens.expiresAt - 120_000 > Date.now()) return tokens.accessToken;
     const refreshed = await refreshOAuth(name);
     if (refreshed) return refreshed;
-    if (tokens.expiresAt > Date.now() && ledger.oauth(name)) return tokens.accessToken; // refresh hiccup, still valid
+    // Whatever is stored now is what counts: the refresh steps aside when a new login
+    // was deposited meanwhile, and the token read above belongs to the old one.
+    const current = Object.hasOwn(users, name) ? ledger.oauth(name) : undefined;
+    if (!current) throw new Error(`${name} has not connected a subscription`);
+    if (current.expiresAt > Date.now()) return current.accessToken; // the new login, or a refresh hiccup with the old one still valid
     throw new Error(`${name}'s login could not be refreshed`);
   }
   const legacy = users[name]?.claudeToken;
@@ -180,10 +184,23 @@ const usageCache = new Map<string, { at: number } & UsageProbe>();
 // person's usage windows, as a percentage. Cached because Anthropic rate limits this
 // endpoint hard. `status` is the HTTP status of the last real answer (401 means the
 // login is dead), null when nothing came back.
+const probing = new Map<string, Promise<UsageProbe>>();
 async function probeUsage(name: string, maxAgeMs = USAGE_CACHE_MS): Promise<UsageProbe> {
   const cached = usageCache.get(name);
   if (cached && Date.now() - cached.at < maxAgeMs) return cached;
+  // One question upstream per member at a time, whoever asks: a burst of status reads,
+  // or a lease probing every lender, must not fan out into a burst at Anthropic, where
+  // this endpoint rate-limits hard and one 429 would leave everyone "unknown".
+  let inFlight = probing.get(name);
+  if (!inFlight) {
+    inFlight = fetchUsage(name).finally(() => probing.delete(name));
+    probing.set(name, inFlight);
+  }
+  return inFlight;
+}
 
+async function fetchUsage(name: string): Promise<UsageProbe> {
+  const generation = generationOf(name);
   let usage: Utilization | null = null;
   let status: number | null = null;
   try {
@@ -231,6 +248,9 @@ async function probeUsage(name: string, maxAgeMs = USAGE_CACHE_MS): Promise<Usag
   } catch {
     // Network or parse failure, or no credential; fall through with null.
   }
+  // A new login (or a removal) landed while Anthropic answered: this is the old
+  // account's usage and says nothing about the new one.
+  if (generationOf(name) !== generation || !Object.hasOwn(users, name)) return { usage: null, status: null };
   const probe = { at: Date.now(), usage, status };
   usageCache.set(name, probe);
   return probe;
@@ -804,19 +824,35 @@ async function reportDirectLimit(raw: Buffer, res: http.ServerResponse, caller: 
 // The app itself always comes from GitHub releases, never from a pool.
 const INSTALLER_DIR = new URL("../installer/", import.meta.url);
 
-function serveInstaller(req: http.IncomingMessage, res: http.ServerResponse, file: string): void {
+// Kept in memory, re-read when the file on disk changes (checked at most every few
+// seconds): these are public, and a visitor must not cost the pool a disk read each.
+const installerCache = new Map<string, { body: Buffer; mtimeMs: number; checkedAt: number }>();
+function installerFile(file: string): Buffer | null {
+  const now = Date.now();
+  const cached = installerCache.get(file);
+  if (cached && now - cached.checkedAt < 5_000) return cached.body;
+  try {
+    const url = new URL(file, INSTALLER_DIR);
+    const { mtimeMs } = statSync(url);
+    const body = cached?.mtimeMs === mtimeMs ? cached.body : readFileSync(url);
+    installerCache.set(file, { body, mtimeMs, checkedAt: now });
+    return body;
+  } catch {
+    installerCache.delete(file);
+    return null;
+  }
+}
+
+function serveInstaller(res: http.ServerResponse, file: string): void {
   const types: Record<string, string> = {
     "join.sh": "text/x-shellscript; charset=utf-8",
     "logo.png": "image/png", // for the invite page
   };
   if (!types[file]) return sendError(res, 404, "not_found_error", "Not found.");
-  try {
-    const body = readFileSync(new URL(file, INSTALLER_DIR));
-    res.writeHead(200, { "content-type": types[file] });
-    res.end(body);
-  } catch {
-    sendError(res, 404, "not_found_error", "Installer file missing on the server.");
-  }
+  const body = installerFile(file);
+  if (!body) return sendError(res, 404, "not_found_error", "Installer file missing on the server.");
+  res.writeHead(200, { "content-type": types[file] });
+  res.end(body);
 }
 
 async function setTokens(raw: Buffer, res: http.ServerResponse, caller: string): Promise<void> {
@@ -842,6 +878,7 @@ async function setTokens(raw: Buffer, res: http.ServerResponse, caller: string):
     saveConfig();
   }
   usageCache.delete(caller);
+  ledger.unpark(caller); // whatever the old login hit, this one hasn't
   console.log(`[pool] ${caller} connected their subscription (OAuth tokens stored)`);
   sendJson(res, 200, { ok: true });
 }
@@ -903,14 +940,41 @@ async function readSmallBody(req: http.IncomingMessage, limit = 4096): Promise<B
   return Buffer.concat(chunks);
 }
 
+// Fixed one-minute windows, one small record per key: counting a flood past the cap
+// costs nothing and remembers nothing, so the limiter never adds to the load it stops.
+type Window = { since: number; count: number };
+function allow(table: Map<string, Window>, key: string, max: number, now = Date.now()): boolean {
+  let window = table.get(key);
+  if (!window || now - window.since >= 60_000) {
+    window = { since: now, count: 0 };
+    table.set(key, window);
+  }
+  if (window.count >= max) return false;
+  window.count++;
+  return true;
+}
+
+// Members: the app and agent write a few times a minute and read every 30 s.
 const MAX_WRITES_PER_MINUTE = 120;
-const writes = new Map<string, number[]>();
-function allowWrite(caller: string): boolean {
+const MAX_READS_PER_MINUTE = 60;
+const writes = new Map<string, Window>();
+const reads = new Map<string, Window>();
+const allowWrite = (caller: string) => allow(writes, caller, MAX_WRITES_PER_MINUTE);
+const allowRead = (caller: string) => allow(reads, caller, MAX_READS_PER_MINUTE);
+
+// Anyone: the invite page, its logo and the join script, per client address.
+const MAX_PUBLIC_PER_MINUTE = 30;
+const publicHits = new Map<string, Window>();
+function allowPublic(client: string): boolean {
   const now = Date.now();
-  const recentWrites = (writes.get(caller) ?? []).filter((t) => t > now - 60_000);
-  recentWrites.push(now);
-  writes.set(caller, recentWrites);
-  return recentWrites.length <= MAX_WRITES_PER_MINUTE;
+  if (publicHits.size > MAX_TRACKED_CLIENTS) {
+    for (const [who, window] of publicHits) if (now - window.since >= 60_000) publicHits.delete(who);
+    for (const who of publicHits.keys()) {
+      if (publicHits.size <= MAX_TRACKED_CLIENTS / 2) break;
+      publicHits.delete(who);
+    }
+  }
+  return allow(publicHits, client, MAX_PUBLIC_PER_MINUTE, now);
 }
 
 function isAdmin(name: string): boolean {
@@ -1153,12 +1217,16 @@ async function leavePool(res: http.ServerResponse, caller: string): Promise<void
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (req.method === "GET" && ["/join.sh", "/logo.png"].includes(req.url ?? "")) {
-      return serveInstaller(req, res, req.url!.slice(1));
+    if (req.method === "GET") {
+      const file = ["/join.sh", "/logo.png"].includes(req.url ?? "") ? req.url!.slice(1) : undefined;
+      const inviteCode = req.url?.match(INVITE_PATH)?.[1];
+      if (file || inviteCode) {
+        // Public, so priced per visitor: one client can't keep the pool busy with them.
+        if (!allowPublic(clientId(req))) return sendError(res, 429, "rate_limit_error", "Too many requests. Try again in a minute.");
+        return file ? serveInstaller(res, file) : invitePage(req, res, inviteCode!);
+      }
     }
     if (req.method === "POST" && req.url === "/pool/redeem") return await redeem(req, res);
-    const inviteCode = req.method === "GET" ? req.url?.match(INVITE_PATH)?.[1] : undefined;
-    if (inviteCode) return invitePage(req, res, inviteCode);
     // Valid tokens always get through: the block only stops guessing, and members often
     // share an address (a home network, or this Mac reaching itself over the tailnet).
     const caller = authenticate(req);
@@ -1169,17 +1237,22 @@ const server = http.createServer(async (req, res) => {
       return sendError(res, 401, "authentication_error", "Unknown pool token.");
     }
 
-    if (req.url === "/pool" && req.method === "GET") return sendJson(res, 200, await status(caller));
-    // Everything that writes: the body first (bounded), then once more "still a
-    // member, same token?", since a removal may have landed while it uploaded. Writes
-    // are also rate-limited per member; the app and agent send a few a minute.
+    if (req.url === "/pool" && req.method === "GET") {
+      // Status asks Anthropic about every member (cached a minute, one question in
+      // flight each); a member hammering it still can't make the pool hammer Anthropic.
+      if (!allowRead(caller)) return sendError(res, 429, "rate_limit_error", "Too many requests to the pool; slow down.");
+      return sendJson(res, 200, await status(caller));
+    }
+    // Everything that writes: rate-limited per member before the body is even read,
+    // then the body (bounded), then once more "still a member, same token?", since a
+    // removal may have landed while it uploaded.
     if (req.method === "PUT" || req.method === "POST") {
+      if (!allowWrite(caller)) return sendError(res, 429, "rate_limit_error", "Too many requests to the pool; slow down.");
       const token = users[caller].token;
       const raw = await readSmallBody(req, MAX_BODY);
       if (!Object.hasOwn(users, caller) || users[caller].token !== token) {
         return sendError(res, 401, "authentication_error", "You are no longer a member of this pool.");
       }
-      if (!allowWrite(caller)) return sendError(res, 429, "rate_limit_error", "Too many requests to the pool; slow down.");
       if (req.url === "/pool/tokens" && req.method === "PUT") return await setTokens(raw, res, caller);
       if (req.url === "/pool/share" && req.method === "PUT") return await setShare(raw, res, caller);
       if (req.url === "/pool/presence" && req.method === "PUT") return await setPresence(raw, res, caller);
@@ -1247,6 +1320,8 @@ try {
 // Slow clients on the public listener can't hold connections open for free.
 server.headersTimeout = 15_000;
 server.requestTimeout = 30_000;
+server.keepAliveTimeout = 5_000;
+server.maxRequestsPerSocket = 1000; // then reconnect: a kept-alive socket isn't a free firehose
 server.maxConnections = 512;
 server.on("error", (err) => {
   console.log(`[pool] cannot listen on ${host}:${port}: ${err.message}`);
@@ -1261,6 +1336,8 @@ if (config.publicUrl && !coversLoopback) {
   const local = http.createServer(server.listeners("request")[0] as http.RequestListener);
   local.headersTimeout = server.headersTimeout;
   local.requestTimeout = server.requestTimeout;
+  local.keepAliveTimeout = server.keepAliveTimeout;
+  local.maxRequestsPerSocket = server.maxRequestsPerSocket;
   local.maxConnections = server.maxConnections;
   local.on("upgrade", server.listeners("upgrade")[0] as (...args: unknown[]) => void);
   local.on("error", (err) => console.log(`[pool] cannot also listen on 127.0.0.1:${port} for ${config.publicUrl}: ${err.message}`));

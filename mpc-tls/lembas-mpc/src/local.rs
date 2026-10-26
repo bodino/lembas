@@ -394,6 +394,7 @@ fn parse_request(head: &[u8]) -> Result<(String, usize)> {
         !method.is_empty()
             && method.bytes().all(|b| b.is_ascii_alphabetic())
             && path.starts_with('/')
+            && path.bytes().all(|b| (0x21..=0x7e).contains(&b))
             && version.starts_with("HTTP/1.")
             && parts.next().is_none(),
         "malformed request line"

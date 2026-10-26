@@ -85,8 +85,8 @@ from the public source, never from a pool, so whoever runs your pool can't ship 
 your Mac. The app installs a release only if its `version.json` is signed by the lembas
 release key (Ed25519; the public half is pinned in the app, the private half lives in
 the workflow's `release` environment, which signs only after a reviewer approves and
-runs nothing from the tag's checkout), so neither can anyone who merely gets to
-publish a release or push a tag. When a new release is out, lembas shows **Install latest build…** at the
+runs nothing from the tag's checkout, while the build job that does has no credentials
+at all), so neither can anyone who merely gets to publish a release or push a tag. When a new release is out, lembas shows **Install latest build…** at the
 bottom; one click updates and relaunches. Check where a download came from with
 `gh attestation verify lembas.zip --repo bodino/lembas`.
 
@@ -137,9 +137,11 @@ such a pool can't lend at all, and its members' menu says so).
   `/version.json` and `/logo.png` needs a pool token (192 random bits). Invite codes
   are 16 characters (~79 bits) and single-use; the invite page only displays, it never
   joins anyone.
-- 10 failed tokens or codes from one client block it for 10 minutes; 30 failed codes
-  across everyone pause redemption for 10 minutes. Valid tokens are never blocked.
-  Unauthenticated bodies are capped.
+- 10 failed tokens or codes from one client block it for 10 minutes. Valid tokens are
+  never blocked. Unauthenticated bodies are capped, the public pages are rate-limited
+  per visitor, and members' own reads and writes per member, so one client can't keep
+  the pool (or Anthropic's usage endpoint, which the pool asks once per member at a
+  time) busy.
 - The pool listens only on your Tailscale IP and, for Funnel, on `127.0.0.1`.
 - Keep 2FA on your Tailscale account: it controls the Funnel.
 

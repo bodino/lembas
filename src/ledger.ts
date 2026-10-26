@@ -17,6 +17,9 @@ type State = {
   // Every pool request (own and borrowed) in the last 8 days. Used to attribute the
   // utilization points Anthropic reports between two samples to who caused them.
   usageLog: Array<{ t: number; owner: string; consumer: string; usd: number }>;
+  // Per owner: when they last used Claude Code themselves (the newest own entry in
+  // usageLog), so presence doesn't scan the log on every status.
+  lastOwnUse: Record<string, number>;
   // Full OAuth credentials for members who connected their subscription via the login flow.
   // These carry user:profile scope, so the pool can read real utilization windows.
   oauth: Record<string, { accessToken: string; refreshToken: string; expiresAt: number }>;
@@ -47,9 +50,12 @@ export class Ledger {
     this.path = path;
     // Defaults first so state files written by older versions keep loading.
     this.state = {
-      lends: {}, policies: {}, presence: {}, parkedUntil: {}, spend: {}, borrowLog: [], usageLog: [], oauth: {},
+      lends: {}, policies: {}, presence: {}, parkedUntil: {}, spend: {}, borrowLog: [], usageLog: [], lastOwnUse: {}, oauth: {},
       ...(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {}),
     };
+    for (const e of this.state.usageLog) {
+      if (e.consumer === e.owner && e.t > (this.state.lastOwnUse[e.owner] ?? 0)) this.state.lastOwnUse[e.owner] = e.t;
+    }
     // Old per-borrower slices become "may borrow when I'm away".
     for (const rules of Object.values(this.state.lends)) {
       for (const [consumer, rule] of Object.entries(rules) as Array<[string, LendRule & { fiveHour?: number; sevenDay?: number }]>) {
@@ -88,8 +94,7 @@ export class Ledger {
   // use for `awayAfterMinutes`. Own use comes from the agent's usage reports.
   presence(owner: string, now = Date.now()): Presence {
     const marks = this.state.presence[owner] ?? {};
-    let lastUse = 0;
-    for (const e of this.state.usageLog) if (e.owner === owner && e.consumer === owner && e.t > lastUse) lastUse = e.t;
+    const lastUse = this.state.lastOwnUse[owner] ?? 0;
     const lastActive = Math.max(lastUse, marks.backAt ?? 0);
     if ((marks.awayAt ?? 0) > lastActive) return { away: true, manual: true, since: marks.awayAt! };
     const after = this.policy(owner).awayAfterMinutes * 60_000;
@@ -150,12 +155,29 @@ export class Ledger {
       .map((e) => e.usd));
   }
 
-  private static readonly MAX_LOG = 200_000;
+  // Every status and every lease scans these logs, and every save writes them out, so
+  // they are capped: in all, and per owner, so that one member looping reports can't
+  // push everyone else's history out, only their own.
+  private static readonly MAX_LOG = 100_000;
+  private static readonly MAX_LOG_PER_OWNER = 20_000;
 
   private pruneLog(now = Date.now()): void {
     const cutoff = now - 8 * 86_400_000; // weekly caps need at most 7 days of history
-    this.state.borrowLog = this.state.borrowLog.filter((e) => e.t >= cutoff).slice(-Ledger.MAX_LOG);
-    this.state.usageLog = this.state.usageLog.filter((e) => e.t >= cutoff).slice(-Ledger.MAX_LOG);
+    const prune = (log: State["usageLog"]) => {
+      const kept: State["usageLog"] = [];
+      const perOwner = new Map<string, number>();
+      for (let i = log.length - 1; i >= 0 && kept.length < Ledger.MAX_LOG; i--) {
+        const e = log[i];
+        if (e.t < cutoff) continue;
+        const n = (perOwner.get(e.owner) ?? 0) + 1;
+        if (n > Ledger.MAX_LOG_PER_OWNER) continue;
+        perOwner.set(e.owner, n);
+        kept.push(e);
+      }
+      return kept.reverse();
+    };
+    this.state.borrowLog = prune(this.state.borrowLog);
+    this.state.usageLog = prune(this.state.usageLog);
   }
 
   // Forget everything tied to a member who left the pool. Spend history and logs stay,
@@ -210,6 +232,7 @@ export class Ledger {
     const t = Date.now();
     this.state.usageLog.push({ t, owner, consumer, usd });
     if (consumer !== owner) this.state.borrowLog.push({ t, owner, consumer, usd });
+    else this.state.lastOwnUse[owner] = Math.max(this.state.lastOwnUse[owner] ?? 0, t);
     if (this.state.usageLog.length > Ledger.MAX_LOG || this.state.borrowLog.length > Ledger.MAX_LOG) this.pruneLog();
     this.save();
   }

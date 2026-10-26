@@ -103,7 +103,11 @@ actor PrivateSessions {
   private var starting: Task<PrivateSession, Error>?
 
   func session(pool: String, poolToken: String) async throws -> PrivateSession {
-    if let current, current.alive { return current }
+    if let current {
+      if current.alive { return current }
+      current.shutdown() // dead, but its helper or socket may still be around
+      self.current = nil
+    }
     if let starting { return try await starting.value }
     let task = Task { try await PrivateSession.start(pool: pool, poolToken: poolToken) }
     starting = task
@@ -151,6 +155,7 @@ final class PrivateSession {
   }
 
   static func start(pool: String, poolToken: String) async throws -> PrivateSession {
+    sweepStaleSessionDirectories()
     // 1. The WebSocket; the pool says whether it can lend privately at all.
     guard var parts = URLComponents(string: pool + "/pool/borrow") else { throw PrivateBorrowError.pool("bad pool URL") }
     parts.scheme = parts.scheme == "https" ? "wss" : "ws"
@@ -159,8 +164,19 @@ final class PrivateSession {
     let ws = session.webSocketTask(with: wsRequest)
     ws.maximumMessageSize = 64 << 20
     ws.resume()
-    guard case .string(let first) = try await withTimeout(sessionStartTimeout, "the pool's session greeting", { try await ws.receive() }),
-          let hello = try? JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any] else {
+    let first: String
+    do {
+      // The deadline closes the WebSocket itself: receive() doesn't notice cancellation,
+      // and a pool that accepts and says nothing must not hold the agent forever.
+      let message = try await withTimeout(sessionStartTimeout, "the pool's session greeting",
+                                          onTimeout: { ws.cancel(with: .goingAway, reason: nil) }, { try await ws.receive() })
+      guard case .string(let text) = message else { throw PrivateBorrowError.pool("expected a session greeting first") }
+      first = text
+    } catch {
+      ws.cancel(with: .goingAway, reason: nil)
+      throw error
+    }
+    guard let hello = try? JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any] else {
       ws.cancel(with: .protocolError, reason: nil)
       throw PrivateBorrowError.pool("expected a session greeting first")
     }
@@ -265,7 +281,7 @@ final class PrivateSession {
     do {
       // The helper answers within its own limits (90 s to splice, 10 min idle on a
       // response); past that the session is wedged, and the request must not hang.
-      head = try await withTimeout(responseHeadTimeout, "the response head", {
+      head = try await withTimeout(responseHeadTimeout, "the response head", onTimeout: { _ = Darwin.shutdown(fd, SHUT_RDWR) }, {
         try await response.head(url: URL(string: "https://\(anthropicHost)\(request.path)")!)
       })
     } catch {
@@ -341,6 +357,12 @@ final class PrivateSession {
   // compression. The helper puts the request line, Host, Content-Length and the
   // Authorization line in the pool's record and sends the rest itself.
   static func requestHead(for request: HTTPRequest) throws -> String {
+    // Both come from Claude Code's request line, but they go into the pool's record as
+    // text: a method that is a token and a path of visible ASCII, or nothing.
+    guard !request.method.isEmpty, request.method.utf8.allSatisfy({ $0 >= 0x41 && $0 <= 0x5a }),
+          request.path.hasPrefix("/"), request.path.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7f }) else {
+      throw PrivateBorrowError.template("bad request line")
+    }
     let line = "\(request.method) \(request.path) HTTP/1.1\r\n"
     guard line.utf8.count <= maxRequestLine else {
       throw PrivateBorrowError.template("request line too long for private borrowing (\(line.utf8.count) bytes)")
@@ -390,16 +412,81 @@ struct TimedOut: Error, CustomStringConvertible {
   var description: String { "timed out waiting for \(what)" }
 }
 
-func withTimeout<T: Sendable>(_ seconds: TimeInterval, _ what: String, _ op: @escaping @Sendable () async throws -> T) async throws -> T {
-  try await withThrowingTaskGroup(of: T.self) { group in
-    group.addTask { try await op() }
-    group.addTask {
-      try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-      throw TimedOut(what: what)
+// The first of the two tasks (or the caller's cancellation) to finish decides; the
+// others are cancelled and their results dropped.
+final class TimeoutRace<T: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<T, Error>?
+  private var result: Result<T, Error>?
+  private var tasks: [Task<Void, Never>] = []
+  func start(_ continuation: CheckedContinuation<T, Error>) {
+    let settled = lock.withLock { () -> Result<T, Error>? in
+      if result == nil { self.continuation = continuation }
+      return result
     }
-    let first = try await group.next()!
-    group.cancelAll()
-    return first
+    if let settled { continuation.resume(with: settled) }
+  }
+  func add(_ task: Task<Void, Never>) {
+    let over = lock.withLock { () -> Bool in tasks.append(task); return result != nil }
+    if over { task.cancel() }
+  }
+  func finish(_ outcome: Result<T, Error>) -> Bool {
+    let (first, continuation, tasks) = lock.withLock { () -> (Bool, CheckedContinuation<T, Error>?, [Task<Void, Never>]) in
+      guard result == nil else { return (false, nil, []) }
+      result = outcome
+      defer { self.continuation = nil }
+      return (true, self.continuation, self.tasks)
+    }
+    guard first else { return false }
+    tasks.forEach { $0.cancel() }
+    continuation?.resume(with: outcome)
+    return true
+  }
+}
+
+// Resolves the caller at the deadline whether or not `op` has noticed: a task group
+// would wait for the operation to leave, and an await on a socket read or a URLSession
+// callback may never do so. `onTimeout` is where to pull the plug (close the socket,
+// cancel the WebSocket) so the orphaned operation ends too, instead of hanging on
+// behind the caller's back.
+func withTimeout<T: Sendable>(_ seconds: TimeInterval, _ what: String, onTimeout: @escaping @Sendable () -> Void = {},
+                              _ op: @escaping @Sendable () async throws -> T) async throws -> T {
+  let race = TimeoutRace<T>()
+  return try await withTaskCancellationHandler {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+      race.start(continuation)
+      race.add(Task {
+        let outcome: Result<T, Error>
+        do { outcome = .success(try await op()) } catch { outcome = .failure(error) }
+        _ = race.finish(outcome)
+      })
+      race.add(Task {
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        guard !Task.isCancelled, race.finish(.failure(TimedOut(what: what))) else { return }
+        onTimeout()
+      })
+    }
+  } onCancel: {
+    _ = race.finish(.failure(CancellationError()))
+  }
+}
+
+// Session directories an agent that was killed (a restart, a crash) left behind: the
+// socket of a dead session refuses to connect; one that connects belongs to a live
+// session, possibly another profile's agent, and is left alone. So is anything recent:
+// another agent may have made its directory and not bound its socket yet.
+func sweepStaleSessionDirectories() {
+  let fm = FileManager.default
+  guard let names = try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path) else { return }
+  for name in names where name.hasPrefix("lembas-") {
+    let dir = fm.temporaryDirectory.appendingPathComponent(name)
+    guard let modified = (try? fm.attributesOfItem(atPath: dir.path))?[.modificationDate] as? Date,
+          Date().timeIntervalSince(modified) > 600 else { continue }
+    if let fd = try? connectLocal(dir.appendingPathComponent("s").path) {
+      close(fd)
+      continue
+    }
+    try? fm.removeItem(at: dir)
   }
 }
 
