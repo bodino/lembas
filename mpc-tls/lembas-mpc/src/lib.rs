@@ -71,6 +71,8 @@ pub const MAX_PENDING_BYTES: usize = 4 << 20;
 /// Changes whenever `Hello` or what follows it changes; the wire codec is not
 /// self-describing, so this is what turns an old peer into a clean error.
 pub const PROTOCOL_VERSION: u32 = 5;
+/// Threads for the two-party computation (`LEMBAS_MPC_THREADS` overrides).
+pub const MPC_THREADS: usize = 4;
 
 /// The pool's opening message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,10 +370,15 @@ where
     let mut conn = tlsn_mux::Connection::new(io, config);
     let handle = conn.handle()?;
 
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
-    match ThreadPool::builder().num_threads(cores).build_global() {
+    // Threads for the two-party computation. Each keeps an allocator cache of
+    // its own, so more threads mean more resident memory for the same work;
+    // the proofs are short and mostly sequential, so a few are plenty.
+    let threads = std::env::var("LEMBAS_MPC_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MPC_THREADS);
+    match ThreadPool::builder().num_threads(threads).build_global() {
         Ok(()) | Err(ThreadPoolBuildError::AlreadyInitialized) => {}
         Err(e) => bail!("thread pool: {e}"),
     }

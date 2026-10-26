@@ -157,12 +157,12 @@ secret extraction on and resumption off. From tlsn the crate uses only `tlsn-mux
 multiplexed link) and the test server fixture; from mpz, the QuickSilver prover and
 verifier, KOS and ferret correlated OT, OLE and share conversion, and the AES circuits.
 
-**The tlsn fork is gone.** The patch (`mpc-tls/tlsn-eb19c82-lembas-splice.patch`) now
-only adds the crate to tlsn's workspace, with the `Cargo.lock` entries that follow; the
-earlier patch with the `mpc-tls` changes (hidden header record, server verification by
-the follower, key hand-off, relay) is kept as `mpc-tls/legacy/` for the record, with its
-measurements below. The crate could become a standalone one depending on tlsn's
-published components.
+**The tlsn fork is gone, and so is the patch.** The crate is a standalone Cargo project
+(`mpc-tls/lembas-mpc`, with its own `Cargo.lock` and `rust-toolchain.toml`) on pinned
+git dependencies: TLSNotary's multiplexer and test server, mpz. `build.sh` builds it
+directly for both architectures. The earlier patches (the fork's `mpc-tls` changes for
+the hidden-record protocol, then the workspace-only patch) are in this repository's
+history under `mpc-tls/`, with their measurements below.
 
 The link carries three mux channels, opened in the same order on both sides: `mpc` for
 the two-party computation, `up` for everything the borrower sends, `down` for
@@ -208,12 +208,28 @@ session, the shape before sessions.
 | setup renewal every 32 requests | — | ~30 KB each way, amortized |
 | new TLS connection (when none is idle) | — | 2 round trips, no MPC |
 
-Sixty requests in 2 s locally, 22 connections opened and 38 reused. The proof instance
-extends ferret a million correlations at a time (16 MB of memory a side) so that an
-extension serves a dozen requests; the share conversion keeps mpz's small parameters.
-Through lembas's pool and agent against `api.anthropic.com`: eight requests over one
-session, four of them at once and two streaming, all 200, each metered to the lender,
-later ones on reused connections; the two helpers sat at about 140 MB of memory each.
+Sixty requests in 2 s locally, 22 connections opened and 38 reused. Through lembas's
+pool and agent against `api.anthropic.com`: eight requests over one session, four of
+them at once and two streaming, all 200, each metered to the lender, later ones on
+reused connections.
+
+**Memory**, measured with the demo's `--bench` (only the two-party part, both sides in
+one process) and then on the two helpers as separate processes over 100 requests:
+
+| ferret batch for the proof | resident, both sides, plateau | download per request |
+|---|---|---|
+| small (mpz default, 256k) | 160 MB | ~160 KB |
+| medium (512k, the default now) | 180–195 MB | ~80 KB |
+| large (1M) | 280 MB | ~90 KB |
+
+Those are with mimalloc as the allocator; with the system allocator the large batch sat
+at 405 MB. Memory does not grow with requests beyond the plateau, reached after a dozen
+or so: each proof allocates and frees tens of MB of temporaries (the ZK gate vectors,
+ferret's expansions) and the plateau is the allocator's high-water mark. The VMs' own
+memory grows only by the keys of the values allocated per request (about 80 KB), which
+the setup renewal every 256 requests bounds. As separate processes the two helpers sit
+at about 165 MB each after 100 requests. The share conversion keeps mpz's small
+parameters; it needs under a thousand correlations per request.
 
 ## In lembas (2026-10-25)
 
@@ -395,20 +411,29 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
 28. **Never guess a descriptor.** Detecting the control channel by trying fd 3 worked
    under Node (which opens it before exec) and closed tokio's own kqueue under
    anything else. The parent names it (`--control-fd`).
+29. **The memory is the allocator's high-water mark, not a leak.** Resident memory
+   grows for a dozen proofs and then plateaus, the same with one worker thread or
+   twelve, and the renewal that was meant to bound it only re-allocated the ferret
+   state. mimalloc as the global allocator took a third off; the ferret batch size moves
+   the plateau and the per-request download in opposite directions, and 512k is the
+   best of both.
+30. **A standalone crate was one manifest away.** Everything the helper needs from
+   TLSNotary is published in its git repositories (the multiplexer in `tlsn-utils`, the
+   test server in `tlsn`), and cargo resolves a workspace member from a git dependency
+   by name. No fork, no patch, a 45 s incremental build.
 
 ## Open
 
-- **Memory.** About 140 MB per helper with sessions (two ferret instances and the VM's
-  wires until the next renewal). A smaller proof batch or a shorter renewal period
-  trades bandwidth for memory if the pool ever hosts many borrowers at once.
-- **Standalone crate.** Nothing in `lembas-mpc` depends on the tlsn workspace except
-  `tlsn-mux` and the test fixture; with those as git dependencies the patch goes away
-  entirely and `build.sh` no longer needs a tlsn checkout.
+- **Memory.** About 165 MB per helper at steady state, mostly allocator high-water
+  mark from each proof's temporaries. Reusing those buffers across proofs inside mpz
+  (or a smaller ferret batch, at twice the download per request) would cut it.
 - **Cheaper circuit.** Fewer blocks (drop `Content-Length` from the pool's record if the
   byte-count policy moves to counting relayed bytes), or the 4-byte salt as a private
   input (cosmetic).
-- **Try it with a real friend over Tailscale Funnel.** Half a megabyte each way is a
-  fraction of a second on any home connection, overlapped with the handshake.
+- **Try it with a real friend over Tailscale Funnel.** The transport is verified: a
+  session from this Mac to the live pool through its public Funnel address came up in
+  0.3 s (the refusal that followed was the lending policy, nobody had capacity). What
+  remains is a friend on 1.3.0 with the switch on and a lender with headroom.
 - The direct-first flow tries the private path, falls through to a direct request
   that fails again, and tries the private path once more before giving up; the agent
   should remember a failed private borrow for a minute.

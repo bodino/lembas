@@ -161,7 +161,7 @@ fn counter_block(nonce: &[u8; 12], ctr: u32) -> [u8; 16] {
 /// Which GHASH block indices hold the token span. Ciphertext block `k` is
 /// data block `1 + k`, after the single AAD block; the span is block aligned
 /// (`check_template`), so these blocks hold nothing but the span.
-pub(crate) fn span_blocks(header: &RequestHeader) -> Vec<usize> {
+pub fn span_blocks(header: &RequestHeader) -> Vec<usize> {
     (header.token.start / 16..header.token.end.div_ceil(16))
         .map(|k| 1 + k)
         .collect()
@@ -212,43 +212,45 @@ pub type Verifying = Party<PoolVm, PoolConverter>;
 pub type Proving = Party<BorrowerVm, BorrowerConverter>;
 
 /// Which ferret parameters an instance extends with.
-#[derive(Clone, Copy)]
-enum Batch {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Batch {
     /// mpz's default choice: the smallest set that covers the request,
     /// 256k correlations per extension. Right for the share conversion,
     /// which needs under a thousand per request.
     Small,
-    /// A million correlations per extension, 16 MB of memory. One request's
-    /// proof needs about 75k, so this is one extension (~300 KB, pool to
-    /// borrower) per dozen requests instead of per three; the price is a
-    /// bootstrap of 39k instead of 13k base correlations (about 0.4 MB more,
-    /// borrower to pool, once per session).
+    /// Half a million per extension: measured the best trade for the proof,
+    /// about 95 MB of resident memory a side and 80 KB of download per
+    /// request, against 80 MB and 160 KB for the small batch and 140 MB and
+    /// 90 KB for the large one. (One request's proof needs about 75k
+    /// correlations; the bootstrap costs k base correlations once.)
+    #[default]
+    Medium,
+    /// A million per extension.
     Proof,
 }
 
 fn ferret_config(batch: Batch) -> ferret::FerretConfig {
     let mut builder = ferret::FerretConfig::builder();
     builder.lpn_type(ferret::LpnType::Regular);
-    if let Batch::Proof = batch {
-        // The first extension runs on the bootstrap correlations, which only
-        // cover the smallest parameters; from then on, a million at a time.
-        builder.param_selector(|_, available, _| {
-            if available < 80_000 {
-                // mpz's smallest regular parameters.
-                mpz_core::lpn::LpnParameters {
-                    n: 256_000,
-                    k: 13_249,
-                    t: 2_000,
-                }
-            } else {
-                mpz_core::lpn::LpnParameters {
-                    n: 1_024_000,
-                    k: 38_737,
-                    t: 2_000,
-                }
+    let (n, k) = match batch {
+        Batch::Small => return builder.build().expect("ferret config is valid"),
+        Batch::Medium => (512_000, 22_653),
+        Batch::Proof => (1_024_000, 38_737),
+    };
+    // The first extension runs on the bootstrap correlations, which only
+    // cover the smallest parameters; from then on, the chosen batch.
+    builder.param_selector(move |_, available, _| {
+        if available < 80_000 {
+            // mpz's smallest regular parameters.
+            mpz_core::lpn::LpnParameters {
+                n: 256_000,
+                k: 13_249,
+                t: 2_000,
             }
-        });
-    }
+        } else {
+            mpz_core::lpn::LpnParameters { n, k, t: 2_000 }
+        }
+    });
     builder.build().expect("ferret config is valid")
 }
 
@@ -283,8 +285,13 @@ pub struct Party<V, C> {
 
 impl Verifying {
     pub fn new() -> Self {
+        Self::with_batch(Batch::default())
+    }
+
+    /// With a given ferret batch for the proof's correlations.
+    pub fn with_batch(batch: Batch) -> Self {
         let mut rng = rand::rng();
-        let (delta, cot) = cot_sender(&mut rng, Batch::Proof);
+        let (delta, cot) = cot_sender(&mut rng, batch);
         let vm = Verifier::new(Default::default(), delta, cot);
         let (_, cot) = cot_sender(&mut rng, Batch::Small);
         let converter = ShareConversionSender::new(OleSender::new(
@@ -346,8 +353,13 @@ impl Default for Verifying {
 
 impl Proving {
     pub fn new() -> Self {
+        Self::with_batch(Batch::default())
+    }
+
+    /// With a given ferret batch for the proof's correlations.
+    pub fn with_batch(batch: Batch) -> Self {
         let mut rng = rand::rng();
-        let vm = Prover::new(Default::default(), cot_receiver(&mut rng, Batch::Proof));
+        let vm = Prover::new(Default::default(), cot_receiver(&mut rng, batch));
         let converter = ShareConversionReceiver::new(OleReceiver::new(AnyReceiver::new(
             RandomizeRCOTReceiver::new(cot_receiver(&mut rng, Batch::Small)),
         )));

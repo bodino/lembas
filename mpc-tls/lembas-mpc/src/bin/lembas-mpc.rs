@@ -50,6 +50,11 @@ use tokio::{
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{error, info, warn};
 
+// The proofs allocate and free tens of MB of temporaries per request; the system
+// allocator keeps that as resident memory, mimalloc gives it back.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Request header for the Messages API with a subscription token, as the
 /// lembas pool sends it.
 const MESSAGES_TEMPLATE: &str = "POST /v1/messages HTTP/1.1\r\nHost: {host}\r\n\

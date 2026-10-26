@@ -3,10 +3,7 @@ name = "lembas-mpc"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Borrowed requests with a spliced token record: pool and borrower helpers, and an in-process demo"
-
-[lints]
-workspace = true
+description = "Borrowed requests with spliced token records: the pool and borrower helpers, and an in-process demo"
 
 [lib]
 path = "src/lib.rs"
@@ -20,38 +17,40 @@ name = "lembas-mpc"
 path = "src/bin/lembas-mpc.rs"
 
 [dependencies]
-tls-server-fixture = { workspace = true }
-tlsn-mux = { workspace = true }
+# TLSNotary's multiplexer for the link, and its test server for the demo.
+tlsn-mux = { git = "https://github.com/tlsnotary/tlsn-utils", rev = "e2f31e6a30bc5d1641ed6407fb1a38a595e523ce" }
+tls-server-fixture = { git = "https://github.com/tlsnotary/tlsn", rev = "eb19c8253abb3872854fb6528a756c54ba61acf9" }
 
-mpz-common = { workspace = true }
-mpz-core = { workspace = true }
-mpz-garble-core = { workspace = true }
-mpz-ot = { workspace = true }
-mpz-circuits = { workspace = true, features = ["aes"] }
-mpz-fields = { workspace = true }
-mpz-memory-core = { workspace = true }
-mpz-ole = { workspace = true }
-mpz-share-conversion = { workspace = true }
-mpz-vm-core = { workspace = true }
-mpz-zk = { workspace = true }
+# mpz: the zero-knowledge VM, correlated OT, OLE and share conversion, AES circuits.
+mpz-circuits = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141", features = ["aes"] }
+mpz-common = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-core = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-fields = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-garble-core = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-memory-core = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-ole = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-ot = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-share-conversion = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-vm-core = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
+mpz-zk = { git = "https://github.com/tlsnotary/mpz2", rev = "8f897838f4e24aff9da8e8b012e8ba35ae770141" }
 
-rustls = { workspace = true, features = ["std", "tls12", "ring"] }
-aes = { workspace = true }
-aes-gcm = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pki-types = "1.12"
+rustls-webpki = { version = "0.103", features = ["ring"] }
+webpki-roots = "1.0"
+aes = "0.8"
+aes-gcm = "0.9"
 
-rustls-pki-types = { workspace = true }
-rustls-webpki = { workspace = true }
-webpki-roots = { workspace = true }
-
-anyhow = { workspace = true }
+anyhow = "1.0"
+mimalloc = { version = "0.1", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
-futures = { workspace = true }
-rand = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-serio = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "net", "fs"] }
-tokio-util = { workspace = true, features = ["compat"] }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+futures = "0.3"
+rand = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serio = "0.2"
+thiserror = "1.0"
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "net", "fs"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

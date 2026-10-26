@@ -73,10 +73,11 @@ pub const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const FRAME_TARGET: usize = 64 << 10;
 /// Frames buffered per connection between tasks.
 const CONN_QUEUE: usize = 64;
-/// Requests after which the two-party setup is rebuilt. mpz's VMs keep every
-/// wire they ever allocated (about 3 MB per request on each side), so a long
-/// session trades one more OT setup for bounded memory.
-pub const RENEW_AFTER: usize = 32;
+/// Requests after which the two-party setup is rebuilt. Measured, the VMs do
+/// not grow with requests (resident memory plateaus after a dozen), so this
+/// bounds the slow growth of the VMs' memory (about 80 KB of keys per
+/// request): a renewal costs an OT setup (~0.9 MB) once in a while.
+pub const RENEW_AFTER: usize = 256;
 
 /// Everything the borrower sends.
 #[derive(Serialize, Deserialize)]

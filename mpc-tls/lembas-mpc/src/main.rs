@@ -23,6 +23,11 @@ use tls_server_fixture::SERVER_DOMAIN;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+// The proofs allocate and free tens of MB of temporaries per request; the system
+// allocator keeps that as resident memory, mimalloc gives it back.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// The pool's secret. The borrower must never learn it.
 const TOKEN: &str = "sk-ant-api03-THIS-IS-THE-POOLS-SECRET-TOKEN-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-A";
 
@@ -60,6 +65,13 @@ struct Args {
     /// one it expects. The borrower must refuse during the handshake.
     #[arg(long)]
     evil_server: bool,
+    /// Memory bench: run only the two-party part (one proof and tag share per
+    /// request, no TLS) this many times, printing resident memory as it goes.
+    #[arg(long, default_value_t = 0)]
+    bench: usize,
+    /// Bench: ferret batch for the proof (small, medium, proof).
+    #[arg(long, default_value = "proof")]
+    bench_batch: String,
 }
 
 #[tokio::main]
@@ -70,6 +82,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.bench > 0 {
+        return bench(args.bench, &args.bench_batch).await;
+    }
 
     // The pool↔borrower link, with byte counters on the pool's end.
     let (pool_sock, borrower_sock) = tokio::io::duplex(1 << 23);
@@ -258,6 +273,78 @@ async fn main() -> Result<()> {
     println!("  borrower → pool:       {:>8} KB ({} KB of it request bodies)", up / 1024, args.requests * args.body / 1024);
     println!("  pool → borrower:       {:>8} KB (responses included)", down / 1024);
 
+    Ok(())
+}
+
+/// Resident set size of this process, in MB, as `ps` reports it.
+fn rss_mb() -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok();
+    out.and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        / 1024
+}
+
+/// Only the two-party computation, `n` times, no TLS: where does memory go?
+async fn bench(n: usize, batch: &str) -> Result<()> {
+    use lembas_mpc::splice::{Batch, Proving, Verifying, span_blocks};
+    let batch = match batch {
+        "small" => Batch::Small,
+        "medium" => Batch::Medium,
+        _ => Batch::Proof,
+    };
+    let (pool_sock, borrower_sock) = tokio::io::duplex(1 << 23);
+    let counters = LinkCounters::default();
+    let pool_sock = Counted::new(pool_sock, counters.clone());
+    let pool_link = link(pool_sock.compat())?;
+    let borrower_link = link(borrower_sock.compat())?;
+    let pool_driver = tokio::spawn(pool_link.driver);
+    let borrower_driver = tokio::spawn(borrower_link.driver);
+    let mut mpc_p = pool_link.mpc;
+    let mut mpc_b = borrower_link.mpc;
+    println!("start: {} MB, batch {batch:?}", rss_mb());
+    let mut verifying = Verifying::with_batch(batch);
+    let mut proving = Proving::with_batch(batch);
+    tokio::try_join!(verifying.warm_up(&mut mpc_p), proving.warm_up(&mut mpc_b))?;
+    let (mut up0, mut down0) = (counters.received.load(Ordering::Relaxed), counters.sent.load(Ordering::Relaxed));
+    println!("after setup: {} MB, {} KB up, {} KB down", rss_mb(), up0 / 1024, down0 / 1024);
+    let header = lembas_mpc::fill_template(
+        "POST /v1/messages HTTP/1.1\r\nHost: api.example\r\nContent-Length: 1000\r\nAuthorization: Bearer {token}\r\n",
+        TOKEN_LEN,
+        1000,
+    )?;
+    let span_idx = span_blocks(&header);
+    let mut headers = header.template.clone();
+    headers[header.token.clone()].fill(b'x');
+    let key = [7u8; 16];
+    let t = Instant::now();
+    for i in 1..=n {
+        let nonce = [i as u8; 12];
+        let (a, b) = tokio::try_join!(
+            verifying.ciphertext_and_tag_share(&mut mpc_p, &headers, &span_idx, i as u64, &nonce),
+            proving.tag_share(&mut mpc_b, &key, &header.template, &span_idx, i as u64, &nonce),
+        )?;
+        let _ = (a, b);
+        if i % 8 == 0 || i == n {
+            let (up, down) = (counters.received.load(Ordering::Relaxed), counters.sent.load(Ordering::Relaxed));
+            println!(
+                "after {i} proofs: {} MB, {:.0?} per proof, last 8: {} KB up, {} KB down",
+                rss_mb(),
+                t.elapsed() / i as u32,
+                (up - up0) / 1024,
+                (down - down0) / 1024
+            );
+            (up0, down0) = (up, down);
+        }
+    }
+    drop(pool_link.session);
+    drop(borrower_link.session);
+    let _ = pool_link.close.send(());
+    let _ = borrower_link.close.send(());
+    let _ = pool_driver.await;
+    let _ = borrower_driver.await;
     Ok(())
 }
 

@@ -28,17 +28,18 @@ jobs:
             exit 1
           fi
 
-      # The MPC helper builds TLSNotary from source; cache the registry and the fork's
-      # target directory so a release doesn't start from zero every time.
+      # The MPC helper builds its dependencies (mpz, TLSNotary's multiplexer) from
+      # source; cache the registry and the crate's target directory so a release
+      # doesn't start from zero every time.
       - name: Cache the Rust build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            build/tlsn/target
-          key: tlsn-${{ runner.os }}-${{ hashFiles('mpc-tls/tlsn-*.patch', 'mpc-tls/lembas-mpc/**') }}
-          restore-keys: tlsn-${{ runner.os }}-
+            mpc-tls/lembas-mpc/target
+          key: lembas-mpc-${{ runner.os }}-${{ hashFiles('mpc-tls/lembas-mpc/Cargo.lock') }}
+          restore-keys: lembas-mpc-${{ runner.os }}-
 
       - name: Build
         run: ./build.sh

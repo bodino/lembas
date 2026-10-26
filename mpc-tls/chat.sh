@@ -11,15 +11,14 @@ set -euo pipefail
 
 here=${0:A:h}
 repo=${here:h}
-tlsn=${TLSN_DIR:-/private/tmp/claude-501/-Users-alessandrobifulco-claudus/80f9beba-5162-408c-b4f5-edfece405ac2/scratchpad/vendor/tlsn}
-bin=$tlsn/target/release/lembas-mpc
+bin=${LEMBAS_MPC_BIN:-$here/lembas-mpc/target/release/lembas-mpc}
 user=${1:-alessandro}
 shift $(( $# > 0 ? 1 : 0 ))
 port=${LEMBAS_MPC_PORT:-7700}
 
 if [[ ! -x $bin ]]; then
-  echo "build it first: (cd $tlsn && cargo build --release -p lembas-mpc)" >&2
-  echo "or set TLSN_DIR to a tlsn checkout with the patch applied" >&2
+  echo "build it first: (cd $here/lembas-mpc && cargo build --release)" >&2
+  echo "or set LEMBAS_MPC_BIN to a lembas-mpc binary (the app bundle has one)" >&2
   exit 1
 fi
 

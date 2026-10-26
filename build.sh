@@ -23,27 +23,22 @@ rm -rf build/lembas.app
 mkdir -p "$APP/MacOS" "$APP/Resources"
 cp resources/Info.plist "$APP/Info.plist"
 
-# The MPC-TLS helper for private borrowing (docs/mpc-tls.md): TLSNotary at a pinned
-# commit plus our patch, with our crate copied in, built for both architectures. Needs
-# Rust via rustup (the fork pins its toolchain; the targets are added here). It lands in
-# the app for members' agents and in build/ for the pool. LEMBAS_SKIP_MPC=1 builds the
-# app without it, for quick local work: such a build can't borrow privately.
-TLSN_COMMIT=eb19c82
+# The helper for private borrowing (docs/mpc-tls.md): the lembas-mpc crate in
+# mpc-tls/, a standalone Cargo project on pinned git dependencies (TLSNotary's
+# multiplexer and test server, mpz), built for both architectures. Needs Rust via
+# rustup (the crate pins its toolchain; the targets are added here). It lands in the
+# app for members' agents and in build/ for the pool. LEMBAS_SKIP_MPC=1 builds the app
+# without it, for quick local work: such a build can't borrow privately.
 if [ -z "$LEMBAS_SKIP_MPC" ]; then
   command -v cargo >/dev/null 2>&1 || { echo "lembas needs Rust (https://rustup.rs) for the MPC helper; LEMBAS_SKIP_MPC=1 builds without it." >&2; exit 1; }
-  [ -d build/tlsn/.git ] || git clone -q https://github.com/tlsnotary/tlsn build/tlsn
-  (cd build/tlsn && git checkout -q --detach "$TLSN_COMMIT" 2>/dev/null || { git fetch -q origin "$TLSN_COMMIT" && git checkout -q --detach "$TLSN_COMMIT"; }
-   git reset -q --hard && git clean -qfd && git apply "../../mpc-tls/tlsn-$TLSN_COMMIT-lembas-splice.patch")
-  rm -rf build/tlsn/crates/lembas-mpc
-  cp -R mpc-tls/lembas-mpc build/tlsn/crates/lembas-mpc
-  TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' build/tlsn/rust-toolchain.toml)
+  TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' mpc-tls/lembas-mpc/rust-toolchain.toml)
   for target in aarch64-apple-darwin x86_64-apple-darwin; do
     rustup target add --toolchain "$TOOLCHAIN" $target >/dev/null 2>&1 || rustup toolchain install "$TOOLCHAIN" --profile minimal --target $target
-    (cd build/tlsn && cargo build -q --release -p lembas-mpc --bin lembas-mpc --target $target)
+    (cd mpc-tls/lembas-mpc && cargo build -q --release --bin lembas-mpc --target $target)
   done
-  lipo -create build/tlsn/target/aarch64-apple-darwin/release/lembas-mpc build/tlsn/target/x86_64-apple-darwin/release/lembas-mpc -output build/lembas-mpc
+  lipo -create mpc-tls/lembas-mpc/target/aarch64-apple-darwin/release/lembas-mpc mpc-tls/lembas-mpc/target/x86_64-apple-darwin/release/lembas-mpc -output build/lembas-mpc
   cp build/lembas-mpc "$APP/MacOS/lembas-mpc"
-  echo "built lembas-mpc (tlsn $TLSN_COMMIT + patch, $TOOLCHAIN)"
+  echo "built lembas-mpc (Rust $TOOLCHAIN)"
 fi
 # Every build gets a higher build number, so members' apps see it as an update.
 BUILD=$(date -u +%Y%m%d%H%M)

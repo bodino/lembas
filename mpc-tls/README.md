@@ -1,10 +1,12 @@
 # The spliced token record: helper for borrowed requests
 
-Research branch. See `../docs/mpc-tls.md` for the design and findings.
+See `../docs/mpc-tls.md` for the design and findings.
 
 ## What is here
 
-- `lembas-mpc/` — the crate: `src/splice.rs` has the primitives (the borrower is an
+- `lembas-mpc/` — a standalone Cargo project on pinned git dependencies (TLSNotary's
+  multiplexer and test server, mpz for the zero-knowledge VM and oblivious transfer;
+  no fork, no patch). `src/splice.rs` has the primitives (the borrower is an
   ordinary TLS 1.2 client over a relay through the pool; the pool inserts one record
   per request, the one carrying the token, with its keystream proven in zero knowledge
   by the borrower and its tag from the borrower's GHASH terms plus one share conversion
@@ -13,12 +15,6 @@ Research branch. See `../docs/mpc-tls.md` for the design and findings.
   the local TLS 1.2 AES-GCM record layer, `src/lib.rs` the template policy and the link
   plumbing, `src/main.rs` the `demo` binary (everything in one process, with checks),
   `src/bin/lembas-mpc.rs` the `lembas-mpc` binary (pool, borrower, proxy, chat).
-- `tlsn-eb19c82-lembas-splice.patch` — adds the crate to TLSNotary's workspace at commit
-  `eb19c82` (2026-10-21), with the `Cargo.lock` entries that follow. The crate uses
-  tlsn only for its mux and its test server; everything else comes from mpz and rustls.
-- `legacy/` — the earlier patch, which changed tlsn's `mpc-tls` crate for a protocol
-  with a joint MPC handshake and a key hand-off. Superseded; kept for the measurements
-  in the design doc.
 - `requests/` — the request templates used so far: `echo.*` for tlsn's test server,
   `messages.*` and `stream.json` for `api.anthropic.com` with a subscription token.
   In a template, `{token}` is where the pool's bearer token goes and `{body_len}`
@@ -26,15 +22,17 @@ Research branch. See `../docs/mpc-tls.md` for the design and findings.
 
 ## Build
 
-Needs Rust 1.95 (tlsn pins it in `rust-toolchain.toml`; rustup installs it).
+Needs Rust 1.95 (`rust-toolchain.toml` pins it; rustup installs it). Dependencies are
+fetched from git at pinned revisions and locked in `Cargo.lock`.
 
 ```sh
-git clone https://github.com/tlsnotary/tlsn
-cd tlsn && git checkout eb19c82
-git apply /path/to/claudus/mpc-tls/tlsn-eb19c82-lembas-splice.patch
-cargo build --release -p lembas-mpc
-cargo test -p lembas-mpc --release
+cd mpc-tls/lembas-mpc
+cargo build --release
+cargo test --release
 ```
+
+(The earlier versions were a patch on a TLSNotary checkout; `git log -- mpc-tls` has
+them.)
 
 ## In-process demo
 
@@ -44,6 +42,7 @@ cargo test -p lembas-mpc --release
 ./target/release/demo --refuse-first 2 --requests 6    # the pool has no lender for the first two
 ./target/release/demo --evil-rewrite       # pool edits a header byte: the server rejects the record
 ./target/release/demo --evil-server        # pool connects to the wrong server: the borrower refuses
+./target/release/demo --bench 64 --bench-batch medium   # only the proofs: memory and bytes per request
 ```
 
 The demo runs the pool, the borrower and tlsn's echo server in one process: one
