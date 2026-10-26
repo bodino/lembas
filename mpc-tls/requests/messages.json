@@ -1,0 +1,1 @@
+{"model":"claude-sonnet-5-5","max_tokens":30,"system":"You are Claude Code, Anthropic's official CLI for Claude.","messages":[{"role":"user","content":"Reply with exactly: hello from a borrowed request"}]}

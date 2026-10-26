@@ -1,0 +1,2905 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ed080ae..488e30e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3475,6 +3475,42 @@ version = "0.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
+ 
++[[package]]
++name = "lembas-mpc"
++version = "0.0.0"
++dependencies = [
++ "aes 0.8.4",
++ "aes-gcm",
++ "anyhow",
++ "clap",
++ "futures",
++ "mpz-circuits",
++ "mpz-common",
++ "mpz-core",
++ "mpz-fields",
++ "mpz-garble-core",
++ "mpz-memory-core",
++ "mpz-ole",
++ "mpz-ot",
++ "mpz-share-conversion",
++ "mpz-vm-core",
++ "mpz-zk",
++ "rand 0.10.3",
++ "rustls 0.23.40",
++ "rustls-pki-types",
++ "rustls-webpki 0.103.13",
++ "serde",
++ "serde_json",
++ "serio",
++ "tls-server-fixture",
++ "tlsn-mux",
++ "tokio",
++ "tokio-util",
++ "tracing",
++ "tracing-subscriber",
++ "webpki-roots",
++]
++
+ [[package]]
+ name = "libc"
+ version = "0.2.186"
+diff --git a/Cargo.toml b/Cargo.toml
+index cedabcf..fa06516 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -21,6 +21,7 @@ members = [
+     "crates/harness/runner",
+     "crates/harness/plot",
+     "crates/tlsn",
++    "crates/lembas-mpc",
+ ]
+ # `crates/examples-zk` is intentionally excluded from the workspace. It pulls
+ # in `noir-rs`, which transitively depends on the `noir-lang/noir` monorepo via
+diff --git a/crates/lembas-mpc/Cargo.toml b/crates/lembas-mpc/Cargo.toml
+new file mode 100644
+index 0000000..76f2917
+--- /dev/null
++++ b/crates/lembas-mpc/Cargo.toml
+@@ -0,0 +1,56 @@
++[package]
++name = "lembas-mpc"
++version = "0.0.0"
++edition = "2024"
++publish = false
++description = "Borrowed requests with a spliced token record: pool and borrower helpers, and an in-process demo"
++
++[lints]
++workspace = true
++
++[lib]
++path = "src/lib.rs"
++
++[[bin]]
++name = "demo"
++path = "src/main.rs"
++
++[[bin]]
++name = "lembas-mpc"
++path = "src/bin/lembas-mpc.rs"
++
++[dependencies]
++tls-server-fixture = { workspace = true }
++tlsn-mux = { workspace = true }
++
++mpz-common = { workspace = true }
++mpz-core = { workspace = true }
++mpz-garble-core = { workspace = true }
++mpz-ot = { workspace = true }
++mpz-circuits = { workspace = true, features = ["aes"] }
++mpz-fields = { workspace = true }
++mpz-memory-core = { workspace = true }
++mpz-ole = { workspace = true }
++mpz-share-conversion = { workspace = true }
++mpz-vm-core = { workspace = true }
++mpz-zk = { workspace = true }
++
++rustls = { workspace = true, features = ["std", "tls12", "ring"] }
++aes = { workspace = true }
++aes-gcm = { workspace = true }
++
++rustls-pki-types = { workspace = true }
++rustls-webpki = { workspace = true }
++webpki-roots = { workspace = true }
++
++anyhow = { workspace = true }
++clap = { version = "4.5", features = ["derive"] }
++futures = { workspace = true }
++rand = { workspace = true }
++serde = { workspace = true, features = ["derive"] }
++serde_json = { workspace = true }
++serio = { workspace = true }
++tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time", "net", "fs"] }
++tokio-util = { workspace = true, features = ["compat"] }
++tracing = { workspace = true }
++tracing-subscriber = { workspace = true, features = ["env-filter"] }
+diff --git a/crates/lembas-mpc/src/bin/lembas-mpc.rs b/crates/lembas-mpc/src/bin/lembas-mpc.rs
+new file mode 100644
+index 0000000..2e44dd0
+--- /dev/null
++++ b/crates/lembas-mpc/src/bin/lembas-mpc.rs
+@@ -0,0 +1,601 @@
++//! `lembas-mpc`: the pool and borrower helpers over TCP, or over stdin/stdout
++//! for a parent process that bridges the link (the lembas pool and agent).
++//!
++//! ```text
++//! lembas-mpc fixture  --listen 127.0.0.1:7443
++//! lembas-mpc pool     --listen 127.0.0.1:7700 --server 127.0.0.1:7443 \
++//!                     --server-name test-server.io --roots fixture --token-env LEMBAS_TOKEN
++//! lembas-mpc borrower --pool 127.0.0.1:7700 --template req.http --body req.json
++//! lembas-mpc pool     --stdio ...            # one borrower, link on stdin/stdout
++//! lembas-mpc borrower --stdio --output resp.http --template ... --body ...
++//! ```
++//!
++//! The borrower's template is the request header with `{token}` where the
++//! pool's bearer token goes and `{body_len}` for the body length. The response
++//! is written to stdout (or `--output`) as it arrives.
++//!
++//! The protocol is the spliced record (`lembas_mpc::splice`): the borrower
++//! runs the TLS session itself and the pool inserts the one record that
++//! carries the token.
++
++use std::{
++    io::Write as _,
++    path::PathBuf,
++    pin::Pin,
++    sync::{Arc, Mutex},
++    task::{Context as TaskContext, Poll},
++    time::Instant,
++};
++
++use anyhow::{Context as _, Result, bail};
++use clap::{Parser, Subcommand, ValueEnum};
++use lembas_mpc::{
++    TOKEN_LEN, dechunk, fixture_roots, link, mozilla_roots,
++    splice::{BorrowerReport, run_borrower, run_pool},
++};
++use rustls::RootCertStore;
++use tokio::{
++    io::{AsyncBufReadExt, AsyncWrite, BufReader},
++    net::{TcpListener, TcpStream},
++};
++use tokio_util::compat::TokioAsyncReadCompatExt;
++use tracing::{error, info};
++
++/// Request header for the Messages API with a subscription token, as the
++/// lembas pool sends it.
++const MESSAGES_TEMPLATE: &str = "POST /v1/messages HTTP/1.1\r\nHost: api.anthropic.com\r\n\
++    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
++    Connection: close\r\nContent-Type: application/json\r\nanthropic-version: 2023-06-01\r\n\
++    anthropic-beta: claude-code-20250219,oauth-2025-04-20\r\n\
++    user-agent: claude-cli/2.1.0 (external, cli)\r\naccept-encoding: identity\r\n\r\n";
++
++/// How long to wait for the peer to acknowledge the end of the link.
++const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
++
++/// Subscription tokens are only accepted with a Claude Code system prompt.
++const SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
++
++#[derive(Parser, Debug)]
++#[command(version, about)]
++struct Args {
++    #[command(subcommand)]
++    cmd: Cmd,
++}
++
++#[derive(Copy, Clone, Debug, ValueEnum)]
++enum Roots {
++    /// Mozilla's root certificates.
++    Mozilla,
++    /// tlsn's test server certificate.
++    Fixture,
++}
++
++impl Roots {
++    fn store(self) -> Result<RootCertStore> {
++        match self {
++            Roots::Mozilla => Ok(mozilla_roots()),
++            Roots::Fixture => fixture_roots(),
++        }
++    }
++}
++
++#[derive(Subcommand, Debug)]
++enum Cmd {
++    /// Run the pool: accept borrowers and lend them the token.
++    Pool {
++        /// Address to accept borrowers on.
++        #[arg(long, default_value = "127.0.0.1:7700")]
++        listen: String,
++        /// API server to connect to, host:port.
++        #[arg(long, default_value = "api.anthropic.com:443")]
++        server: String,
++        /// The Host the borrower must use (its certificate check is its own).
++        #[arg(long, default_value = "api.anthropic.com")]
++        server_name: String,
++        /// Accepted for compatibility with older callers; the borrower
++        /// verifies the server's certificate, the pool has nothing to verify.
++        #[arg(long, value_enum, default_value_t = Roots::Mozilla, hide = true)]
++        roots: Roots,
++        /// Environment variable holding the bearer token.
++        #[arg(long, default_value = "LEMBAS_TOKEN")]
++        token_env: String,
++        /// Serve one borrower, then exit.
++        #[arg(long)]
++        once: bool,
++        /// Serve one borrower whose link arrives on stdin/stdout (a parent
++        /// process bridges it), then exit. Nothing else may use stdout.
++        #[arg(long, conflicts_with = "listen")]
++        stdio: bool,
++    },
++    /// Run the borrower: send one request through the pool.
++    Borrower {
++        /// The pool's address.
++        #[arg(long, default_value = "127.0.0.1:7700")]
++        pool: String,
++        /// Request header template with `{token}` and `{body_len}`.
++        #[arg(long)]
++        template: PathBuf,
++        /// Request body file.
++        #[arg(long)]
++        body: PathBuf,
++        /// Name to verify the server's certificate for; defaults to the
++        /// template's Host.
++        #[arg(long)]
++        server_name: Option<String>,
++        #[arg(long, value_enum, default_value_t = Roots::Mozilla)]
++        roots: Roots,
++        /// Write the response here instead of stdout. Required with --stdio.
++        #[arg(long, required_if_eq("stdio", "true"))]
++        output: Option<PathBuf>,
++        /// Length of the credential the pool lends.
++        #[arg(long, default_value_t = TOKEN_LEN)]
++        token_len: usize,
++        /// The link to the pool arrives on stdin/stdout (a parent process
++        /// bridges it); the response goes to --output.
++        #[arg(long, conflicts_with = "pool")]
++        stdio: bool,
++    },
++    /// Run tlsn's HTTPS echo server, for local tests.
++    Fixture {
++        #[arg(long, default_value = "127.0.0.1:7443")]
++        listen: String,
++    },
++    /// Chat with the model; every turn is one borrowed request through the pool.
++    Chat {
++        /// The pool's address.
++        #[arg(long, default_value = "127.0.0.1:7700")]
++        pool: String,
++        #[arg(long, default_value = "claude-sonnet-5-5")]
++        model: String,
++        #[arg(long, default_value_t = 1024)]
++        max_tokens: u32,
++        /// Length of the credential the pool lends.
++        #[arg(long, default_value_t = TOKEN_LEN)]
++        token_len: usize,
++    },
++}
++
++#[tokio::main]
++async fn main() {
++    // Exit explicitly: with the link on stdin/stdout, tokio's blocking stdin
++    // reader would otherwise keep the runtime alive until the peer closes its
++    // end, and the peer is waiting for ours.
++    let code = match run().await {
++        Ok(()) => 0,
++        Err(e) => {
++            eprintln!("lembas-mpc: {e:#}");
++            1
++        }
++    };
++    let _ = std::io::stdout().flush();
++    std::process::exit(code);
++}
++
++async fn run() -> Result<()> {
++    tracing_subscriber::fmt()
++        .with_env_filter(
++            tracing_subscriber::EnvFilter::try_from_default_env()
++                .unwrap_or_else(|_| "lembas_mpc=info,lembas_mpc_bin=info".into()),
++        )
++        .with_writer(std::io::stderr)
++        .init();
++
++    match Args::parse().cmd {
++        Cmd::Fixture { listen } => {
++            let listener = TcpListener::bind(&listen).await?;
++            info!("fixture: listening on {listen}");
++            loop {
++                let (stream, peer) = listener.accept().await?;
++                info!("fixture: connection from {peer}");
++                tokio::spawn(async move {
++                    if let Err(e) = tls_server_fixture::bind_test_server_hyper(stream.compat()).await {
++                        error!("fixture: {e}");
++                    }
++                });
++            }
++        }
++        Cmd::Pool {
++            listen,
++            server,
++            server_name,
++            roots: _,
++            token_env,
++            once,
++            stdio,
++        } => {
++            let token = std::env::var(&token_env)
++                .with_context(|| format!("set {token_env} to the bearer token"))?;
++            if token.is_empty() || token.contains(['\r', '\n']) {
++                bail!("{token_env} does not look like a token");
++            }
++            if stdio {
++                let io = stdio_link();
++                return lend(io.compat(), &server, &server_name, &token).await;
++            }
++            let listener = TcpListener::bind(&listen).await?;
++            info!("pool: listening on {listen}, lending to {server} as {server_name}");
++            loop {
++                let (stream, peer) = listener.accept().await?;
++                info!("pool: borrower connected from {peer}");
++                stream.set_nodelay(true)?;
++                let (server, server_name, token) =
++                    (server.clone(), server_name.clone(), token.clone());
++                let task = async move {
++                    lend(stream.compat(), &server, &server_name, &token).await
++                };
++                if once {
++                    task.await?;
++                    return Ok(());
++                }
++                tokio::spawn(async move {
++                    if let Err(e) = task.await {
++                        let msg = format!("{e:#}");
++                        if msg.starts_with("prelude") {
++                            // Port scanners and liveness probes connect and leave.
++                            tracing::debug!("pool: connection from {peer} ended early: {msg}");
++                        } else {
++                            error!("pool: borrower from {peer} failed: {msg}");
++                        }
++                    }
++                });
++            }
++        }
++        Cmd::Chat {
++            pool,
++            model,
++            max_tokens,
++            token_len,
++        } => chat(&pool, &model, max_tokens, token_len).await,
++        Cmd::Borrower {
++            pool,
++            template,
++            body,
++            server_name,
++            roots,
++            output,
++            token_len,
++            stdio,
++        } => {
++            let template = std::fs::read_to_string(&template)
++                .with_context(|| format!("reading {}", template.display()))?;
++            let body = std::fs::read(&body).with_context(|| format!("reading {}", body.display()))?;
++            let server_name = match server_name {
++                Some(name) => name,
++                None => template
++                    .lines()
++                    .find_map(|l| {
++                        let (k, v) = l.split_once(':')?;
++                        k.trim().eq_ignore_ascii_case("host").then(|| v.trim().to_string())
++                    })
++                    .context("template has no Host header; pass --server-name")?,
++            };
++            let out: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = match output {
++                Some(path) => Box::new(tokio::fs::File::create(path).await?),
++                None => Box::new(tokio::io::stdout()),
++            };
++
++            let started = Instant::now();
++            let roots = roots.store()?;
++            let report = if stdio {
++                let io = stdio_link();
++                borrow(io.compat(), &template, body, roots, &server_name, token_len, out).await?
++            } else {
++                let stream = TcpStream::connect(&pool)
++                    .await
++                    .with_context(|| format!("connecting to the pool at {pool}"))?;
++                stream.set_nodelay(true)?;
++                borrow(stream.compat(), &template, body, roots, &server_name, token_len, out).await?
++            };
++            info!(
++                total = ?started.elapsed(),
++                first_byte = ?report.first_byte,
++                response_bytes = report.response.len(),
++                "borrower: done"
++            );
++            Ok(())
++        }
++    }
++}
++
++/// stdin and stdout as one duplex stream, read and written as plain files.
++/// tokio's `Stdout` goes through std's line-buffered handle, which holds back
++/// a frame that happens to contain no newline until something flushes; the
++/// mux's close frames are exactly that small, and the peer waits for them.
++fn stdio_link() -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
++    use std::os::fd::FromRawFd as _;
++    // SAFETY: fds 0 and 1 stay open for the life of the process, and once the
++    // link is on them nothing else in this process uses them (logs go to
++    // stderr, the response to --output).
++    let stdin = tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(0) });
++    let stdout = tokio::fs::File::from_std(unsafe { std::fs::File::from_raw_fd(1) });
++    tokio::io::join(stdin, stdout)
++}
++
++/// Lends the token to the one borrower whose link is `io`.
++async fn lend<Io>(io: Io, server: &str, server_name: &str, token: &str) -> Result<()>
++where
++    Io: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
++{
++    let started = Instant::now();
++    let link = link(io)?;
++    let driver = tokio::spawn(link.driver);
++
++    let upstream = TcpStream::connect(server)
++        .await
++        .with_context(|| format!("connecting to {server}"))?;
++    upstream.set_nodelay(true)?;
++
++    let report = run_pool(
++        link.mpc,
++        link.up,
++        link.down,
++        upstream,
++        server_name,
++        token,
++        None,
++    )
++    .await;
++
++    info!("pool: closing the link");
++    drop(link.session);
++    let _ = link.close.send(());
++    // The close handshake is a courtesy; a peer that is gone must not hold us.
++    let _ = tokio::time::timeout(CLOSE_TIMEOUT, driver).await;
++    info!("pool: link closed");
++    let report = report?;
++    info!(
++        total = ?started.elapsed(),
++        preprocess = ?report.preprocess,
++        handshake = ?report.handshake,
++        splice = ?report.splice,
++        "pool: borrowed request done"
++    );
++    Ok(())
++}
++
++/// Borrows once over the link `io`.
++#[allow(clippy::too_many_arguments)]
++async fn borrow<Io>(
++    io: Io,
++    template: &str,
++    body: Vec<u8>,
++    roots: RootCertStore,
++    server_name: &str,
++    token_len: usize,
++    out: Box<dyn AsyncWrite + Unpin + Send>,
++) -> Result<BorrowerReport>
++where
++    Io: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
++{
++    let link = link(io)?;
++    let driver = tokio::spawn(link.driver);
++    let report = run_borrower(
++        link.mpc,
++        link.up,
++        link.down,
++        template,
++        body,
++        roots,
++        server_name,
++        token_len,
++        out,
++    )
++    .await;
++    info!("borrower: closing the link");
++    drop(link.session);
++    let _ = link.close.send(());
++    let _ = tokio::time::timeout(CLOSE_TIMEOUT, driver).await;
++    info!("borrower: link closed");
++    report
++}
++
++/// The interactive chat: reads a line, sends the whole conversation as one
++/// borrowed request, streams the answer, repeats.
++async fn chat(pool: &str, model: &str, max_tokens: u32, token_len: usize) -> Result<()> {
++    let mut history: Vec<serde_json::Value> = Vec::new();
++    let mut lines = BufReader::new(tokio::io::stdin()).lines();
++
++    eprintln!("Each message is one borrowed request through the pool at {pool}.");
++    eprintln!("The pool lends the token but cannot read what you type or what comes back.");
++    eprintln!("Empty line or Ctrl-D to quit.");
++    eprintln!();
++
++    loop {
++        print!("you> ");
++        std::io::stdout().flush()?;
++        let Some(line) = lines.next_line().await? else {
++            break;
++        };
++        let line = line.trim().to_string();
++        if line.is_empty() || line == "exit" || line == "quit" {
++            break;
++        }
++
++        history.push(serde_json::json!({"role": "user", "content": line}));
++        let body = serde_json::json!({
++            "model": model,
++            "max_tokens": max_tokens,
++            "stream": true,
++            "system": SYSTEM_PROMPT,
++            "messages": history,
++        });
++
++        print!("claude> ");
++        std::io::stdout().flush()?;
++        let sink = SseSink::new();
++        let text = sink.text.clone();
++        let started = Instant::now();
++
++        let stream = TcpStream::connect(pool)
++            .await
++            .with_context(|| format!("connecting to the pool at {pool}"))?;
++        stream.set_nodelay(true)?;
++        let link = link(stream.compat())?;
++        let driver = tokio::spawn(link.driver);
++        let report = run_borrower(
++            link.mpc,
++            link.up,
++            link.down,
++            MESSAGES_TEMPLATE,
++            serde_json::to_vec(&body)?,
++            mozilla_roots(),
++            "api.anthropic.com",
++            token_len,
++            Box::new(sink),
++        )
++        .await;
++        drop(link.session);
++        let _ = link.close.send(());
++        let _ = driver.await;
++
++        println!();
++        match report {
++            Ok(report) => {
++                let status = report
++                    .response
++                    .split(|&b| b == b'\n')
++                    .next()
++                    .map(|l| String::from_utf8_lossy(l).trim().to_string())
++                    .unwrap_or_default();
++                if !status.contains(" 200 ") {
++                    let body_pos = report
++                        .response
++                        .windows(4)
++                        .position(|w| w == b"\r\n\r\n")
++                        .map(|p| p + 4)
++                        .unwrap_or(report.response.len());
++                    let body = dechunk(&report.response[body_pos..]);
++                    eprintln!("{status}: {}", String::from_utf8_lossy(&body));
++                    history.pop();
++                } else {
++                    let answer = std::mem::take(&mut *text.lock().unwrap());
++                    history.push(serde_json::json!({"role": "assistant", "content": answer}));
++                }
++                eprintln!(
++                    "[borrowed request: {:.1?} total, first byte after {:.1?}]",
++                    started.elapsed(),
++                    report.first_byte
++                );
++            }
++            Err(e) => {
++                eprintln!("request failed: {e:#}");
++                history.pop();
++            }
++        }
++        println!();
++    }
++
++    // Leave at once: tokio's stdin reader is a blocking thread that could
++    // otherwise keep the runtime from shutting down.
++    let _ = std::io::stdout().flush();
++    std::process::exit(0);
++}
++
++/// Receives the raw HTTP response, decodes the chunked SSE body as it arrives,
++/// prints text deltas and collects the answer.
++struct SseSink {
++    buf: Vec<u8>,
++    headers_done: bool,
++    /// Chunked transfer decoding: bytes left in the current chunk, if inside one.
++    chunk_left: Option<usize>,
++    body: Vec<u8>,
++    line_start: usize,
++    text: Arc<Mutex<String>>,
++}
++
++impl SseSink {
++    fn new() -> Self {
++        Self {
++            buf: Vec::new(),
++            headers_done: false,
++            chunk_left: None,
++            body: Vec::new(),
++            line_start: 0,
++            text: Arc::new(Mutex::new(String::new())),
++        }
++    }
++
++    fn feed(&mut self, data: &[u8]) {
++        self.buf.extend_from_slice(data);
++        if !self.headers_done {
++            let Some(p) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") else {
++                return;
++            };
++            self.headers_done = true;
++            self.buf.drain(..p + 4);
++        }
++        // Chunked body -> self.body.
++        loop {
++            match self.chunk_left {
++                Some(0) => {
++                    if self.buf.len() < 2 {
++                        break;
++                    }
++                    self.buf.drain(..2);
++                    self.chunk_left = None;
++                }
++                Some(n) => {
++                    let take = n.min(self.buf.len());
++                    if take == 0 {
++                        break;
++                    }
++                    self.body.extend(self.buf.drain(..take));
++                    self.chunk_left = Some(n - take);
++                }
++                None => {
++                    let Some(eol) = self.buf.windows(2).position(|w| w == b"\r\n") else {
++                        break;
++                    };
++                    let size = std::str::from_utf8(&self.buf[..eol])
++                        .ok()
++                        .and_then(|s| usize::from_str_radix(s.trim(), 16).ok());
++                    self.buf.drain(..eol + 2);
++                    match size {
++                        Some(0) | None => {
++                            self.chunk_left = Some(usize::MAX);
++                            break;
++                        }
++                        Some(n) => self.chunk_left = Some(n),
++                    }
++                }
++            }
++        }
++        // SSE lines.
++        while let Some(eol) = self.body[self.line_start..].iter().position(|&b| b == b'\n') {
++            let line = &self.body[self.line_start..self.line_start + eol];
++            self.line_start += eol + 1;
++            if let Some(json) = line.strip_prefix(b"data: ")
++                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(json)
++            {
++                if v["type"] == "content_block_delta" && v["delta"]["type"] == "text_delta"
++                    && let Some(t) = v["delta"]["text"].as_str()
++                {
++                    print!("{t}");
++                    let _ = std::io::stdout().flush();
++                    self.text.lock().unwrap().push_str(t);
++                } else if v["type"] == "error" {
++                    eprintln!("\n{}", v["error"]);
++                }
++            }
++        }
++    }
++}
++
++impl AsyncWrite for SseSink {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        _cx: &mut TaskContext<'_>,
++        data: &[u8],
++    ) -> Poll<std::io::Result<usize>> {
++        self.feed(data);
++        Poll::Ready(Ok(data.len()))
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++}
+diff --git a/crates/lembas-mpc/src/lib.rs b/crates/lembas-mpc/src/lib.rs
+new file mode 100644
+index 0000000..1b1757a
+--- /dev/null
++++ b/crates/lembas-mpc/src/lib.rs
+@@ -0,0 +1,481 @@
++//! Borrowed requests with a spliced token record.
++//!
++//! The **borrower** runs an ordinary TLS session to the API server through a
++//! relay operated by the **pool**, which holds the token. The pool writes
++//! exactly one record into that session, the one carrying the token, and can
++//! read or forge nothing else; the borrower never learns the token. The
++//! protocol is in [`splice`]; this module holds what both sides share: the
++//! template policy, the wire prelude, the link plumbing.
++//!
++//! The link between pool and borrower must itself be authenticated (in
++//! lembas, the existing pool WebSocket over TLS). A man in the middle on it
++//! can only cause failures, never read or forge, but the pool must know it is
++//! lending to a member.
++//!
++//! The pool and the borrower talk over one byte stream multiplexed by
++//! tlsn-mux. Each side opens three channels in the same order: `mpc` for the
++//! two-party computation, `up` for everything the borrower sends, `down` for
++//! everything the pool sends.
++
++use std::{future::Future, ops::Range, pin::Pin, time::Duration};
++
++use anyhow::{Context as _, Result, bail, ensure};
++use mpz_common::{Context, Session, ThreadPool, ThreadPoolBuildError, mux::Mux};
++use rustls_pki_types::CertificateDer;
++use serde::{Deserialize, Serialize};
++use webpki::anchor_from_trusted_cert;
++
++pub mod record;
++pub mod splice;
++
++/// Largest token record the pool may send: the request line, Host,
++/// Content-Length and the bearer line, about 210 bytes in practice. Each
++/// 16-byte block is one AES block proven in zero knowledge, so this budget is
++/// kept tight; the other headers follow in a record the borrower encrypts
++/// alone.
++pub const MAX_HEADER_LEN: usize = 320;
++
++/// Marker in a borrower's template that becomes the token span.
++pub const TOKEN_MARKER: &str = "{token}";
++/// Marker in a borrower's template that becomes the body length.
++pub const BODY_LEN_MARKER: &str = "{body_len}";
++
++/// How long the prelude, preprocessing, handshake and splice may take.
++/// The relay itself is bounded separately: a model may stream for minutes.
++pub const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
++/// How long the relay waits for the next frame from either side before it
++/// gives up. Long enough for a model's thinking pause (the lembas agent's own
++/// request timeout is the same 10 minutes), short enough that a vanished peer
++/// does not hold the pool's helper forever.
++pub const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
++/// The most a single borrow may last, idle or not.
++pub const RELAY_MAX_DURATION: Duration = Duration::from_secs(3600);
++/// Largest body a template may announce in `Content-Length`. The pool cannot
++/// read the body, so the announced length and the bytes actually relayed are
++/// its only levers against a borrower spending a lender's quota on huge
++/// requests.
++pub const MAX_BODY_LEN: usize = 64 << 20;
++/// Most bytes the pool relays from the borrower to the server in one borrow:
++/// the announced body plus record framing, with room to spare.
++pub const MAX_SENT_BYTES: usize = MAX_BODY_LEN + (4 << 20);
++/// Bytes from the borrower waiting to be written to a slow server; beyond
++/// this the pool stops reading until the server catches up.
++pub const MAX_PENDING_BYTES: usize = 4 << 20;
++/// Changes whenever `Hello` or what follows it changes; the wire codec is not
++/// self-describing, so this is what turns an old peer into a clean error.
++pub const PROTOCOL_VERSION: u32 = 4;
++
++/// The pool's opening message.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct Hello {
++    /// [`PROTOCOL_VERSION`]; the borrower refuses any other.
++    pub version: u32,
++    /// Length of the token the pool will put in the span.
++    pub token_len: usize,
++    /// Server the pool connects to; the borrower's `Host` must match.
++    pub server_name: String,
++}
++
++/// The borrower's request header: the part that becomes the pool's record.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct RequestHeader {
++    /// Header text through the Authorization line, with any bytes in `token`.
++    pub template: Vec<u8>,
++    /// Span the pool fills with the token.
++    pub token: Range<usize>,
++}
++
++/// Length of a subscription token (`sk-ant-oat01-…`) or API key
++/// (`sk-ant-api03-…`); both are 108 bytes.
++///
++/// This is a security invariant, not a convenience: the token span is
++/// `TOKEN_LEN` rounded up to 16-byte blocks, and the slack a pool has for
++/// smuggling bytes into the span is `span - token`. With a 108-byte token
++/// that is 4 bytes, too few for a header. A shorter credential in the same
++/// span would leave room: 112 - 97 = 15 bytes fit `\r\nX: value`. So the
++/// pool refuses to lend any credential of another length, and the borrower
++/// refuses a pool announcing another length.
++pub const TOKEN_LEN: usize = 108;
++
++/// Rounds a span length up to whole 16-byte blocks.
++fn span_len_for(token_len: usize) -> usize {
++    token_len.div_ceil(16) * 16
++}
++
++/// Checks a borrower's template on the pool's side.
++///
++/// The span must be exactly the value of an `Authorization: Bearer` header,
++/// so the token can only ever land where a bearer token belongs, never in a
++/// path or a header the server might echo. It must be block aligned and no
++/// more than 15 bytes longer than the token, which with a working token
++/// leaves the pool no room for anything else (see `fill_template`). `Host`
++/// must name the server the pool connects to.
++pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &str) -> Result<()> {
++    ensure!(
++        token_len == TOKEN_LEN,
++        "only {TOKEN_LEN}-byte credentials can be lent, see TOKEN_LEN"
++    );
++    let text = &header.template;
++    ensure!(
++        text.len() <= MAX_HEADER_LEN,
++        "header is {} bytes; at most {MAX_HEADER_LEN} can be sent",
++        text.len()
++    );
++    ensure!(
++        text.ends_with(b"\r\n") && !text.ends_with(b"\r\n\r\n"),
++        "the token record ends with the Authorization line, not the blank line"
++    );
++    let span = header.token.clone();
++    ensure!(
++        span.start < span.end && span.end <= text.len(),
++        "token span must be inside the header"
++    );
++    ensure!(
++        span.len() == span_len_for(token_len) && span.start.is_multiple_of(16),
++        "token span must be the token length rounded up to 16-byte blocks, block aligned"
++    );
++    ensure!(
++        span.end + 2 == text.len(),
++        "the Authorization line must be the last line of the token record"
++    );
++    let head = std::str::from_utf8(&text[..text.len() - 2]).context("header is not UTF-8")?;
++    ensure!(!head.contains("\r\n\r\n"), "header contains a blank line");
++
++    let mut pos = 0;
++    let mut saw_auth = false;
++    let mut saw_host = false;
++    let mut saw_length = false;
++    let mut names = std::collections::HashSet::new();
++    for (i, line) in head.split("\r\n").enumerate() {
++        let line_range = pos..pos + line.len();
++        pos += line.len() + 2;
++        if i == 0 {
++            ensure!(line.ends_with(" HTTP/1.1"), "first line must be an HTTP/1.1 request line");
++            ensure!(line.matches(' ').count() == 2, "malformed request line");
++            continue;
++        }
++        let (name, value) = line.split_once(':').context("malformed header line")?;
++        let name = name.trim().to_ascii_lowercase();
++        ensure!(names.insert(name.clone()), "header {name} appears twice");
++        let value = value.trim_start();
++        let value_start = line_range.start + (line.len() - value.len());
++        if name == "authorization" {
++            ensure!(!saw_auth, "more than one Authorization header");
++            saw_auth = true;
++            let rest = value
++                .strip_prefix("Bearer")
++                .context("Authorization must be a bearer token")?;
++            let spaces = rest.len() - rest.trim_start_matches(' ').len();
++            ensure!(spaces >= 1, "Authorization must be a bearer token");
++            let expected = value_start + "Bearer".len() + spaces..line_range.end;
++            ensure!(
++                span == expected,
++                "token span must be exactly the bearer token value"
++            );
++        } else {
++            ensure!(
++                span.start >= line_range.end || span.end <= line_range.start,
++                "token span overlaps a header other than Authorization"
++            );
++            if name == "host" {
++                ensure!(!saw_host, "more than one Host header");
++                ensure!(value.trim_end() == server_name, "Host must be {server_name}");
++                saw_host = true;
++            }
++            if name == "content-length" {
++                let len: usize = value.trim_end().parse().context("Content-Length is not a number")?;
++                ensure!(len <= MAX_BODY_LEN, "Content-Length {len} is over the {MAX_BODY_LEN}-byte limit");
++                saw_length = true;
++            }
++        }
++    }
++    ensure!(saw_auth, "no Authorization header");
++    ensure!(saw_host, "no Host header");
++    ensure!(saw_length, "no Content-Length header");
++    Ok(())
++}
++
++/// Splits a full header template (ending in a blank line) at the line that
++/// carries the token: the first part becomes the pool's record, the rest
++/// (remaining headers plus the blank line) is sent by the borrower alone,
++/// ahead of the body. Fewer bytes in the pool's record means fewer AES blocks
++/// to prove, so callers put Authorization right after Host and Content-Length.
++pub fn split_template(template: &str) -> Result<(String, Vec<u8>)> {
++    ensure!(
++        template.ends_with("\r\n\r\n"),
++        "template must end with a blank line"
++    );
++    let marker = template
++        .find(TOKEN_MARKER)
++        .context("template has no {token}")?;
++    let line_end = template[marker..]
++        .find("\r\n")
++        .map(|i| marker + i + 2)
++        .unwrap();
++    let (hidden, rest) = template.split_at(line_end);
++    Ok((hidden.to_string(), rest.as_bytes().to_vec()))
++}
++
++/// Builds the borrower's header from a template with markers.
++///
++/// The token span is pinned to `token_len` rounded up to whole 16-byte blocks
++/// and aligned to a block boundary by padding the end of the preceding header
++/// line with spaces (optional whitespace, which servers strip). The pool fills
++/// the span with its token followed by spaces. A pool that put anything but a
++/// token in the span would break its own credential, and the alignment leaves
++/// it no byte outside the span, so it cannot smuggle in a header.
++pub fn fill_template(template: &str, token_len: usize, body_len: usize) -> Result<RequestHeader> {
++    ensure!(
++        template.matches(TOKEN_MARKER).count() == 1,
++        "template must contain {TOKEN_MARKER} exactly once"
++    );
++    let span_len = span_len_for(token_len);
++    let mut text = template.replace(BODY_LEN_MARKER, &body_len.to_string());
++    let marker = text.find(TOKEN_MARKER).unwrap();
++    let line_start = text[..marker]
++        .rfind("\r\n")
++        .context("the Authorization header must not be the first line")?;
++    ensure!(
++        text[..line_start].contains("\r\n"),
++        "put at least one header before Authorization: the line before it is padded for alignment"
++    );
++    let pad = (16 - marker % 16) % 16;
++    text.insert_str(line_start, &" ".repeat(pad));
++    let start = marker + pad;
++    text.replace_range(start..start + TOKEN_MARKER.len(), &"x".repeat(span_len));
++    // The pool's record ends with the Authorization line; the blank line
++    // comes later, in the borrower's own record (see `split_template`).
++    let mut template = text.into_bytes();
++    ensure!(
++        template.ends_with(b"\r\n") && !template.ends_with(b"\r\n\r\n"),
++        "the pool's record must end right after the Authorization line"
++    );
++    while template.ends_with(b"\r\n\r\n") {
++        template.truncate(template.len() - 2);
++    }
++    Ok(RequestHeader {
++        template,
++        token: start..start + span_len,
++    })
++}
++
++/// Test hook: a misbehaving pool's change to the header after the token is
++/// in place.
++pub type Tamper = Option<Box<dyn FnOnce(&mut Vec<u8>) + Send>>;
++
++/// Roots trusting tlsn's test server.
++pub fn fixture_roots() -> Result<rustls::RootCertStore> {
++    let der = CertificateDer::from_slice(tls_server_fixture::CA_CERT_DER);
++    let anchor = anchor_from_trusted_cert(&der)?.to_owned();
++    Ok(rustls::RootCertStore {
++        roots: vec![anchor],
++    })
++}
++
++/// Mozilla's roots, for real servers.
++pub fn mozilla_roots() -> rustls::RootCertStore {
++    rustls::RootCertStore {
++        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
++    }
++}
++
++/// Multiplexed session over one byte stream, as tlsn does it. The returned
++/// sender closes the session; the driver then runs until the peer agrees.
++#[allow(clippy::type_complexity)]
++pub fn session<Io>(
++    io: Io,
++) -> Result<(
++    Session,
++    Pin<Box<dyn Future<Output = Result<()>> + Send>>,
++    tokio::sync::oneshot::Sender<()>,
++)>
++where
++    Io: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
++{
++    struct MuxHandle(tlsn_mux::Handle);
++
++    impl std::fmt::Debug for MuxHandle {
++        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++            f.write_str("MuxHandle")
++        }
++    }
++
++    impl Mux for MuxHandle {
++        fn open(&self, id: &[u8]) -> Result<mpz_common::io::Io, std::io::Error> {
++            let stream = self.0.new_stream(id).map_err(std::io::Error::other)?;
++            Ok(mpz_common::io::Io::from_io(stream))
++        }
++    }
++
++    let config = tlsn_mux::Config::builder()
++        .keep_alive(true)
++        .close_sync(true)
++        .build()?;
++    let mut conn = tlsn_mux::Connection::new(io, config);
++    let handle = conn.handle()?;
++
++    let cores = std::thread::available_parallelism()
++        .map(|n| n.get())
++        .unwrap_or(8);
++    match ThreadPool::builder().num_threads(cores).build_global() {
++        Ok(()) | Err(ThreadPoolBuildError::AlreadyInitialized) => {}
++        Err(e) => bail!("thread pool: {e}"),
++    }
++
++    let session = Session::builder()
++        .pool(ThreadPool::global())
++        .build(MuxHandle(handle))?;
++
++    // Drive the mux; close it when asked, then run until the peer agrees.
++    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
++    let driver = Box::pin(async move {
++        let mut closing = false;
++        futures::future::poll_fn(|cx| {
++            if !closing && Pin::new(&mut close_rx).poll(cx).is_ready() {
++                closing = true;
++                conn.close();
++            }
++            conn.poll(cx)
++        })
++        .await?;
++        Ok(())
++    });
++
++    Ok((session, driver, close_tx))
++}
++
++/// A connection with three channels opened in the order both sides agree on.
++pub struct Link {
++    pub session: Session,
++    pub driver: Pin<Box<dyn Future<Output = Result<()>> + Send>>,
++    pub close: tokio::sync::oneshot::Sender<()>,
++    /// The two-party computation.
++    pub mpc: Context,
++    /// Everything the borrower sends.
++    pub up: Context,
++    /// Everything the pool sends.
++    pub down: Context,
++}
++
++/// Opens a link over `io`.
++pub fn link<Io>(io: Io) -> Result<Link>
++where
++    Io: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
++{
++    let (session, driver, close) = session(io)?;
++    let mpc = session.new_context()?;
++    let up = session.new_context()?;
++    let down = session.new_context()?;
++    Ok(Link {
++        session,
++        driver,
++        close,
++        mpc,
++        up,
++        down,
++    })
++}
++
++/// Decodes an HTTP/1.1 chunked body; returns the input unchanged if it is not
++/// chunked.
++pub fn dechunk(body: &[u8]) -> Vec<u8> {
++    let mut out = Vec::new();
++    let mut rest = body;
++    loop {
++        let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else {
++            return body.to_vec();
++        };
++        let Ok(size) = usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap_or("x"), 16)
++        else {
++            return body.to_vec();
++        };
++        rest = &rest[eol + 2..];
++        if size == 0 {
++            return out;
++        }
++        // A hostile size would overflow `size + 2`; check before adding.
++        if size > rest.len() || rest.len() < size + 2 {
++            return body.to_vec();
++        }
++        out.extend_from_slice(&rest[..size]);
++        rest = &rest[size + 2..];
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn header(text: &str) -> RequestHeader {
++        fill_template(&split_template(text).unwrap().0, 8, 5).unwrap()
++    }
++
++    #[test]
++    fn template_is_pinned_and_aligned() {
++        let ok = header(
++            "POST /v1/messages HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\r\n",
++        );
++        assert_eq!(ok.token.start % 16, 0);
++        assert_eq!(ok.token.len(), 16);
++        assert_eq!(ok.template.len(), ok.token.end + 2);
++        let text = String::from_utf8(ok.template.clone()).unwrap();
++        assert!(text.ends_with("Bearer xxxxxxxxxxxxxxxx\r\n"));
++        // Only the real credential length is lent (see TOKEN_LEN).
++        assert!(check_template(&ok, 8, "api.example").is_err());
++        let full = "POST /v1/messages HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nAuthorization: Bearer {token}\r\nX-Later: 1\r\n\r\n";
++        let (hidden, trailer) = split_template(full).unwrap();
++        assert_eq!(trailer, b"X-Later: 1\r\n\r\n");
++        let real = fill_template(&hidden, TOKEN_LEN, 5).unwrap();
++        assert_eq!(real.token.len(), 112);
++        check_template(&real, TOKEN_LEN, "api.example").unwrap();
++        assert!(check_template(&real, TOKEN_LEN, "other.example").is_err());
++        // A shorter credential in the same span would leave room to smuggle a
++        // header, which is why it is refused.
++        let smuggled = b"\r\nX: value";
++        assert!(112 - 97 >= smuggled.len());
++        assert!(check_template(&real, 97, "api.example").is_err());
++
++        // The token must be the whole bearer value.
++        let bad = header(
++            "POST / HTTP/1.1\r\nHost: api.example\r\nAuthorization: Bearer {token}extra\r\n\r\n",
++        );
++        assert!(check_template(&bad, 8, "api.example").is_err());
++        // Not in another header.
++        let bad = header("POST / HTTP/1.1\r\nHost: api.example\r\nX-Key: {token}\r\n\r\n");
++        assert!(check_template(&bad, 8, "api.example").is_err());
++        // Not on the request line, and not right after it either (the line
++        // before Authorization is padded).
++        assert!(fill_template("POST /{token} HTTP/1.1\r\nHost: a\r\n\r\n", 8, 0).is_err());
++        assert!(fill_template("POST / HTTP/1.1\r\nAuthorization: Bearer {token}\r\nHost: a\r\n\r\n", 8, 0).is_err());
++        // Duplicate Host is refused.
++        let dup = header("POST / HTTP/1.1\r\nHost: a\r\nHost: api.example\r\nAuthorization: Bearer {token}\r\n\r\n");
++        assert!(check_template(&dup, 8, "api.example").is_err());
++    }
++
++    // The pool cannot read the body, so the template must say how long it is,
++    // within the limit, and may not repeat a header.
++    #[test]
++    fn template_policy_bounds_the_request() {
++        let real = |t: &str, body: usize| fill_template(&split_template(t).unwrap().0, TOKEN_LEN, body).unwrap();
++        let base = "POST / HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\r\n";
++        check_template(&real(base, MAX_BODY_LEN), TOKEN_LEN, "api.example").unwrap();
++        assert!(check_template(&real(base, MAX_BODY_LEN + 1), TOKEN_LEN, "api.example").is_err());
++        let no_length = real("POST / HTTP/1.1\r\nHost: api.example\r\nX: y\r\nAuthorization: Bearer {token}\r\n\r\n", 0);
++        assert!(check_template(&no_length, TOKEN_LEN, "api.example").is_err());
++        let twice = real(
++            "POST / HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nX-A: 1\r\nx-a: 2\r\nAuthorization: Bearer {token}\r\n\r\n",
++            0,
++        );
++        assert!(check_template(&twice, TOKEN_LEN, "api.example").is_err());
++    }
++
++    #[test]
++    fn dechunk_survives_hostile_sizes() {
++        assert_eq!(dechunk(b"3\r\nabc\r\n0\r\n\r\n"), b"abc");
++        // A size that would overflow `size + 2` is returned as-is, not panicked on.
++        let hostile = b"ffffffffffffffff\r\nabc\r\n";
++        assert_eq!(dechunk(hostile), hostile.to_vec());
++        let short = b"10\r\nabc\r\n";
++        assert_eq!(dechunk(short), short.to_vec());
++    }
++}
+diff --git a/crates/lembas-mpc/src/main.rs b/crates/lembas-mpc/src/main.rs
+new file mode 100644
+index 0000000..f4cdd99
+--- /dev/null
++++ b/crates/lembas-mpc/src/main.rs
+@@ -0,0 +1,311 @@
++//! In-process demo: pool, borrower and tlsn's echo server in one process,
++//! with checks that the token never reaches the borrower.
++
++use std::{
++    pin::Pin,
++    sync::{
++        Arc,
++        atomic::{AtomicUsize, Ordering},
++    },
++    task::{Context as TaskContext, Poll},
++    time::Instant,
++};
++
++use anyhow::{Context as _, Result, bail, ensure};
++use clap::Parser;
++use lembas_mpc::{
++    TOKEN_LEN, Tamper, dechunk, fixture_roots, link,
++    record::{APPLICATION_DATA, LocalRecordLayer},
++    splice::{run_borrower, run_pool},
++};
++use rand::RngExt;
++use tls_server_fixture::SERVER_DOMAIN;
++use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
++use tokio_util::compat::TokioAsyncReadCompatExt;
++
++/// The pool's secret. The borrower must never learn it.
++const TOKEN: &str = "sk-ant-api03-THIS-IS-THE-POOLS-SECRET-TOKEN-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-A";
++
++const TEMPLATE: &str = "POST /echo HTTP/1.1\r\nHost: test-server.io\r\n\
++    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
++    Connection: close\r\nContent-Type: application/json\r\n\r\n";
++
++#[derive(Parser, Debug)]
++struct Args {
++    /// Size of the request body in bytes. The test server echoes it.
++    #[arg(long, default_value_t = 32 * 1024)]
++    body: usize,
++    /// Misbehave as the pool: change a header byte outside the token span.
++    /// The server must reject the record, since the tag binds the pool to
++    /// the borrower's text.
++    #[arg(long)]
++    evil_rewrite: bool,
++    /// Misbehave as the pool: connect the borrower to a server other than the
++    /// one it expects. The borrower must refuse during the handshake.
++    #[arg(long)]
++    evil_server: bool,
++}
++
++#[tokio::main]
++async fn main() -> Result<()> {
++    tracing_subscriber::fmt()
++        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
++        .with_writer(std::io::stderr)
++        .init();
++
++    let args = Args::parse();
++
++    // The server.
++    let (server_client_sock, server_sock) = tokio::io::duplex(1 << 20);
++    let server = tokio::spawn(tls_server_fixture::bind_test_server_hyper(
++        server_sock.compat(),
++    ));
++
++    // The pool↔borrower link, with byte counters on the pool's end.
++    let (pool_sock, borrower_sock) = tokio::io::duplex(1 << 23);
++    let counters = LinkCounters::default();
++    let pool_sock = Counted::new(pool_sock, counters.clone());
++
++    let pool_link = link(pool_sock.compat())?;
++    let borrower_link = link(borrower_sock.compat())?;
++    let pool_driver = tokio::spawn(pool_link.driver);
++    let borrower_driver = tokio::spawn(borrower_link.driver);
++
++    let body: Vec<u8> = {
++        let mut rng = rand::rng();
++        let mut b = Vec::with_capacity(args.body);
++        while b.len() < args.body {
++            b.extend_from_slice(format!("{{\"n\":{}}},", rng.random::<u32>()).as_bytes());
++        }
++        b.truncate(args.body);
++        b
++    };
++
++    let token = TOKEN.to_string();
++    let tamper: Tamper = args
++        .evil_rewrite
++        .then(|| Box::new(|h: &mut Vec<u8>| h[0] = b'G') as Box<dyn FnOnce(&mut Vec<u8>) + Send>);
++    let expected_server = if args.evil_server {
++        "api.anthropic.com"
++    } else {
++        SERVER_DOMAIN
++    };
++
++    let started = Instant::now();
++    let outcome = tokio::try_join!(
++        run_pool(
++            pool_link.mpc,
++            pool_link.up,
++            pool_link.down,
++            server_client_sock,
++            SERVER_DOMAIN,
++            &token,
++            tamper,
++        ),
++        run_borrower(
++            borrower_link.mpc,
++            borrower_link.up,
++            borrower_link.down,
++            TEMPLATE,
++            body.clone(),
++            fixture_roots()?,
++            expected_server,
++            TOKEN_LEN,
++            Box::new(tokio::io::sink()),
++        ),
++    );
++    let total = started.elapsed();
++
++    if args.evil_rewrite || args.evil_server {
++        let err = match outcome {
++            Ok(_) => bail!("the borrower accepted a misbehaving pool"),
++            Err(err) => err,
++        };
++        let expected = if args.evil_rewrite {
++            // The server fails the record's tag and sends a fatal alert.
++            "alert"
++        } else {
++            "certificate"
++        };
++        ensure!(
++            format!("{err:#}").to_ascii_lowercase().contains(expected),
++            "unexpected failure: {err:#}"
++        );
++        println!();
++        println!("misbehaving pool rejected as expected: {err:#}");
++        return Ok(());
++    }
++    let (pool_report, borrower_report) = outcome?;
++
++    drop(pool_link.session);
++    drop(borrower_link.session);
++    let _ = pool_link.close.send(());
++    let _ = borrower_link.close.send(());
++    pool_driver.await??;
++    borrower_driver.await??;
++    match server.await? {
++        Ok(()) => {}
++        Err(e) => println!("test server ended with an error: {e}"),
++    }
++
++    // Checks.
++    let response = String::from_utf8_lossy(&borrower_report.response);
++    ensure!(
++        response.starts_with("HTTP/1.1 200 OK"),
++        "unexpected response: {}",
++        &response[..response.len().min(200)]
++    );
++    let body_pos = response
++        .find("\r\n\r\n")
++        .context("response has no header terminator")?
++        + 4;
++    let echoed = dechunk(&borrower_report.response[body_pos..]);
++    ensure!(
++        echoed == body,
++        "server did not echo the body: got {} bytes, sent {} (response {} bytes)",
++        echoed.len(),
++        body.len(),
++        borrower_report.response.len()
++    );
++
++    // What went over the link to the borrower must contain neither the token
++    // nor the token record's ciphertext (mux framing could split a match, so
++    // look for 16-byte windows of the record rather than the whole record).
++    let sent = SENT_TO_BORROWER.lock().unwrap();
++    ensure!(
++        !contains(&sent, TOKEN.as_bytes()),
++        "the token went to the borrower in the clear"
++    );
++    let record = &pool_report.record;
++    ensure!(record.len() > 5 + 8 + 16, "token record too short");
++    let ciphertext = &record[5 + 8..record.len() - 16];
++    for window in ciphertext.chunks(16).filter(|w| w.len() == 16) {
++        ensure!(
++            !contains(&sent, window),
++            "part of the token record's ciphertext went to the borrower"
++        );
++    }
++    drop(sent);
++
++    // Diagnostic only possible because both parties run in this process: the
++    // token record the pool sent must be what the borrower's keys produce
++    // from the borrower's template with the token in place.
++    {
++        let mut reference = LocalRecordLayer::new(&borrower_report.keys, borrower_report.splice_seq, 0);
++        let mut expected_headers = borrower_report.header.template.clone();
++        let span = &mut expected_headers[borrower_report.header.token.clone()];
++        span.fill(b' ');
++        span[..TOKEN.len()].copy_from_slice(TOKEN.as_bytes());
++        ensure!(expected_headers == pool_report.headers);
++        let expected = reference
++            .encrypt(APPLICATION_DATA, &expected_headers)
++            .context("reference encryption")?;
++        ensure!(
++            expected == pool_report.record,
++            "the token record differs from what the traffic keys produce"
++        );
++    }
++
++    println!();
++    println!("borrowed request OK");
++    println!("  protocol:              spliced record (borrower owns the session; zero-knowledge keystream)");
++    println!("  body:                  {} bytes, echoed back", body.len());
++    println!(
++        "  token record:          {} bytes plaintext, seq {}; span hidden from the borrower, rest bound to its text",
++        pool_report.headers.len(),
++        borrower_report.splice_seq
++    );
++    println!("  server identity:       verified by the borrower");
++    println!();
++    println!("timing (both parties on this machine)");
++    println!("  preprocessing:         {:>8.0?}  (overlapped with the handshake)", pool_report.preprocess);
++    println!("  handshake:             {:>8.0?}", pool_report.handshake);
++    println!("  token record:          {:>8.0?}", pool_report.splice);
++    println!(
++        "  body sent → first response byte: {:>5.0?}",
++        borrower_report.first_byte
++    );
++    println!("  total:                 {:>8.0?}", total);
++    println!();
++    println!("pool↔borrower link");
++    println!(
++        "  pool → borrower:       {:>8} KB",
++        counters.sent.load(Ordering::Relaxed) / 1024
++    );
++    println!(
++        "  borrower → pool:       {:>8} KB",
++        counters.received.load(Ordering::Relaxed) / 1024
++    );
++
++    Ok(())
++}
++
++#[derive(Default, Clone)]
++struct LinkCounters {
++    /// Bytes the pool sent to the borrower.
++    sent: Arc<AtomicUsize>,
++    /// Bytes the pool received from the borrower.
++    received: Arc<AtomicUsize>,
++}
++
++/// Counts bytes and records everything the pool sends to the borrower, so the
++/// program can check the token is not among it.
++struct Counted {
++    inner: DuplexStream,
++    counters: LinkCounters,
++}
++
++impl Counted {
++    fn new(inner: DuplexStream, counters: LinkCounters) -> Self {
++        Self { inner, counters }
++    }
++}
++
++impl AsyncRead for Counted {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut TaskContext<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<std::io::Result<()>> {
++        let before = buf.filled().len();
++        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
++        if let Poll::Ready(Ok(())) = &res {
++            let n = buf.filled().len() - before;
++            self.counters.received.fetch_add(n, Ordering::Relaxed);
++        }
++        res
++    }
++}
++
++impl AsyncWrite for Counted {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut TaskContext<'_>,
++        data: &[u8],
++    ) -> Poll<std::io::Result<usize>> {
++        let res = Pin::new(&mut self.inner).poll_write(cx, data);
++        if let Poll::Ready(Ok(n)) = &res {
++            self.counters.sent.fetch_add(*n, Ordering::Relaxed);
++            SENT_TO_BORROWER
++                .lock()
++                .unwrap()
++                .extend_from_slice(&data[..*n]);
++        }
++        res
++    }
++
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
++        Pin::new(&mut self.inner).poll_flush(cx)
++    }
++
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
++        Pin::new(&mut self.inner).poll_shutdown(cx)
++    }
++}
++
++/// Everything the pool sent to the borrower, for the token check.
++static SENT_TO_BORROWER: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
++
++fn contains(haystack: &[u8], needle: &[u8]) -> bool {
++    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
++}
+diff --git a/crates/lembas-mpc/src/record.rs b/crates/lembas-mpc/src/record.rs
+new file mode 100644
+index 0000000..d816b77
+--- /dev/null
++++ b/crates/lembas-mpc/src/record.rs
+@@ -0,0 +1,213 @@
++//! TLS 1.2 AES-128-GCM records with keys this side holds: what the borrower
++//! runs after taking the keys out of rustls, continuing from the sequence
++//! numbers rustls reached (plus one on the client side, for the pool's
++//! record).
++
++use aes_gcm::{Aes128Gcm, NewAead, aead::AeadInPlace};
++use anyhow::{Result, bail, ensure};
++
++/// Largest plaintext a single TLS record may carry.
++pub const MAX_RECORD_PLAINTEXT: usize = 1 << 14;
++
++/// Record content types.
++pub const CHANGE_CIPHER_SPEC: u8 = 0x14;
++pub const ALERT: u8 = 0x15;
++pub const HANDSHAKE: u8 = 0x16;
++pub const APPLICATION_DATA: u8 = 0x17;
++
++/// The `close_notify` alert: warning level, description 0.
++pub const CLOSE_NOTIFY: [u8; 2] = [1, 0];
++
++const EXPLICIT_NONCE_LEN: usize = 8;
++const TAG_LEN: usize = 16;
++
++/// The TLS 1.2 traffic keys.
++#[derive(Clone)]
++pub struct TrafficKeys {
++    /// Client write key.
++    pub client_write_key: [u8; 16],
++    /// Client write IV (implicit nonce part).
++    pub client_write_iv: [u8; 4],
++    /// Server write key.
++    pub server_write_key: [u8; 16],
++    /// Server write IV (implicit nonce part).
++    pub server_write_iv: [u8; 4],
++}
++
++impl std::fmt::Debug for TrafficKeys {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("TrafficKeys").finish_non_exhaustive()
++    }
++}
++
++/// The additional data AES-GCM authenticates for a TLS 1.2 record.
++pub fn tls12_aad(seq: u64, typ: u8, len: usize) -> [u8; 13] {
++    let mut aad = [0u8; 13];
++    aad[..8].copy_from_slice(&seq.to_be_bytes());
++    aad[8] = typ;
++    aad[9] = 0x03;
++    aad[10] = 0x03;
++    aad[11..].copy_from_slice(&(len as u16).to_be_bytes());
++    aad
++}
++
++/// Both directions of the record layer.
++pub struct LocalRecordLayer {
++    keys: TrafficKeys,
++    writer: LocalRecordWriter,
++    reader: LocalRecordReader,
++}
++
++impl LocalRecordLayer {
++    /// Creates a record layer continuing from the given sequence numbers.
++    pub fn new(keys: &TrafficKeys, write_seq: u64, read_seq: u64) -> Self {
++        Self {
++            keys: keys.clone(),
++            writer: LocalRecordWriter::new(keys, write_seq),
++            reader: LocalRecordReader::new(keys, read_seq),
++        }
++    }
++
++    pub fn keys(&self) -> &TrafficKeys {
++        &self.keys
++    }
++
++    /// Encrypts one record and returns it encoded, ready for the wire.
++    pub fn encrypt(&mut self, typ: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
++        self.writer.encrypt(typ, plaintext)
++    }
++
++    /// Decrypts one encoded record received from the server.
++    pub fn decrypt(&mut self, record: &[u8]) -> Result<(u8, Vec<u8>)> {
++        self.reader.decrypt(record)
++    }
++
++    /// Splits into the sending and the receiving half.
++    pub fn split(self) -> (LocalRecordWriter, LocalRecordReader) {
++        (self.writer, self.reader)
++    }
++}
++
++/// Encrypts records to the server under the client write key.
++pub struct LocalRecordWriter {
++    cipher: Aes128Gcm,
++    iv: [u8; 4],
++    seq: u64,
++}
++
++impl LocalRecordWriter {
++    fn new(keys: &TrafficKeys, seq: u64) -> Self {
++        Self {
++            cipher: Aes128Gcm::new((&keys.client_write_key).into()),
++            iv: keys.client_write_iv,
++            seq,
++        }
++    }
++
++    /// Encrypts one record and returns it encoded, ready for the wire. The
++    /// explicit nonce is the sequence number, as rustls does it.
++    pub fn encrypt(&mut self, typ: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
++        ensure!(
++            plaintext.len() <= MAX_RECORD_PLAINTEXT,
++            "record plaintext too long: {} > {MAX_RECORD_PLAINTEXT}",
++            plaintext.len()
++        );
++        let seq = self.seq;
++        self.seq += 1;
++
++        let explicit_nonce = seq.to_be_bytes();
++        let mut nonce = [0u8; 12];
++        nonce[..4].copy_from_slice(&self.iv);
++        nonce[4..].copy_from_slice(&explicit_nonce);
++        let aad = tls12_aad(seq, typ, plaintext.len());
++
++        let mut body = plaintext.to_vec();
++        let tag = self
++            .cipher
++            .encrypt_in_place_detached((&nonce).into(), &aad, &mut body)
++            .map_err(|_| anyhow::anyhow!("encryption failed"))?;
++
++        let len = EXPLICIT_NONCE_LEN + body.len() + TAG_LEN;
++        let mut record = Vec::with_capacity(5 + len);
++        record.extend_from_slice(&[typ, 0x03, 0x03]);
++        record.extend_from_slice(&(len as u16).to_be_bytes());
++        record.extend_from_slice(&explicit_nonce);
++        record.extend_from_slice(&body);
++        record.extend_from_slice(&tag);
++        Ok(record)
++    }
++}
++
++/// Decrypts records from the server under the server write key.
++pub struct LocalRecordReader {
++    cipher: Aes128Gcm,
++    iv: [u8; 4],
++    seq: u64,
++}
++
++impl LocalRecordReader {
++    fn new(keys: &TrafficKeys, seq: u64) -> Self {
++        Self {
++            cipher: Aes128Gcm::new((&keys.server_write_key).into()),
++            iv: keys.server_write_iv,
++            seq,
++        }
++    }
++
++    /// Decrypts one whole encoded record (5-byte header included).
++    pub fn decrypt(&mut self, record: &[u8]) -> Result<(u8, Vec<u8>)> {
++        ensure!(record.len() >= 5, "record too short");
++        let typ = record[0];
++        ensure!(record[1] == 0x03, "not a TLS record");
++        let len = u16::from_be_bytes([record[3], record[4]]) as usize;
++        ensure!(record.len() == 5 + len, "record length mismatch");
++        let payload = &record[5..];
++        if payload.len() < EXPLICIT_NONCE_LEN + TAG_LEN {
++            bail!("ciphertext record is too short");
++        }
++        let (explicit_nonce, rest) = payload.split_at(EXPLICIT_NONCE_LEN);
++        let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
++
++        let seq = self.seq;
++        self.seq += 1;
++
++        let mut nonce = [0u8; 12];
++        nonce[..4].copy_from_slice(&self.iv);
++        nonce[4..].copy_from_slice(explicit_nonce);
++        let aad = tls12_aad(seq, typ, ciphertext.len());
++
++        let mut plaintext = ciphertext.to_vec();
++        self.cipher
++            .decrypt_in_place_detached((&nonce).into(), &aad, &mut plaintext, tag.into())
++            .map_err(|_| anyhow::anyhow!("tag verification failed"))?;
++        Ok((typ, plaintext))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn round_trip_through_both_halves() {
++        let keys = TrafficKeys {
++            client_write_key: [1; 16],
++            client_write_iv: [2; 4],
++            server_write_key: [1; 16],
++            server_write_iv: [2; 4],
++        };
++        // The server's reader is the client's writer with the keys swapped,
++        // so with identical keys a writer at seq n decrypts with a reader at n.
++        let mut writer = LocalRecordLayer::new(&keys, 7, 0);
++        let mut reader = LocalRecordLayer::new(&keys, 0, 7);
++        let record = writer.encrypt(APPLICATION_DATA, b"hello").unwrap();
++        assert_eq!(record[0], APPLICATION_DATA);
++        assert_eq!(record.len(), 5 + 8 + 5 + 16);
++        assert_eq!(reader.decrypt(&record).unwrap(), (APPLICATION_DATA, b"hello".to_vec()));
++        // Wrong sequence number: the tag fails.
++        let record = writer.encrypt(ALERT, &CLOSE_NOTIFY).unwrap();
++        let mut skipped = LocalRecordLayer::new(&keys, 0, 9);
++        assert!(skipped.decrypt(&record).is_err());
++        assert_eq!(reader.decrypt(&record).unwrap(), (ALERT, CLOSE_NOTIFY.to_vec()));
++    }
++}
+diff --git a/crates/lembas-mpc/src/splice.rs b/crates/lembas-mpc/src/splice.rs
+new file mode 100644
+index 0000000..7d31aa6
+--- /dev/null
++++ b/crates/lembas-mpc/src/splice.rs
+@@ -0,0 +1,1148 @@
++//! The spliced token record: the borrower owns the TLS session, the pool
++//! inserts one record.
++//!
++//! The borrower runs an ordinary TLS 1.2 client (rustls) over a byte relay
++//! through the pool, verifies the server's certificate itself and holds the
++//! traffic keys alone from the start. The pool opens the TCP connection, so it
++//! decides which server the token goes to, and it writes exactly one record:
++//! the request line, `Host`, `Content-Length` and the `Authorization` line.
++//! For that record it needs keystream and a tag.
++//!
++//! - Keystream: AES on the borrower's client key, proven in zero knowledge
++//!   (mpz's QuickSilver VM). The borrower is the prover, so its key stays
++//!   private against a malicious pool; the pool is the verifier and receives
++//!   the keystream with a soundness guarantee against a borrower that would
++//!   try to pass off a keystream of its choosing (say zeros, which would put
++//!   the token on the pool's uplink in the clear). Nothing is garbled: the
++//!   pool has no private input, so a proof is all it needs.
++//! - Tag: the borrower knows `H` and `E_K(J0)` and computes the GHASH terms
++//!   for every block it knows; the token span's blocks go through one
++//!   multiplicative-to-additive conversion each, with the pool's ciphertext
++//!   block as its input. The pool learns only the finished tag.
++//!
++//! The pool refuses to splice unless the first application-data record on the
++//! connection is its own, so the token cannot become the body or a header
++//! continuation of a request the borrower wrote. Then the borrower continues
++//! with its own records, sequence number +1, and the pool relays bytes it can
++//! neither read nor forge.
++//!
++//! The link carries three channels, opened in the same order by both sides:
++//! `mpc` for the two-party computation, `up` for everything the borrower
++//! sends (its header, then [`Frame`]s), `down` for everything the pool sends
++//! (its [`Hello`], then [`Frame`]s).
++
++use std::{
++    sync::Arc,
++    time::{Duration, Instant},
++};
++
++use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
++use anyhow::{Context as _, Result, bail, ensure};
++use mpz_circuits::{AES128_KS, AES128_POST_KS};
++use mpz_common::{Context, Flush, future::Output as _};
++use mpz_core::{Block, bitvec::BitVec};
++use mpz_fields::{Field, gf2_128::Gf2_128};
++use mpz_garble_core::Delta;
++use mpz_memory_core::DecodeFutureTyped;
++use mpz_ole::{Receiver as OleReceiver, Sender as OleSender};
++use mpz_ot::{
++    chou_orlandi as co, ferret, kos,
++    rcot::shared::{SharedRCOTReceiver, SharedRCOTSender},
++    rot::{
++        any::{AnyReceiver, AnySender},
++        randomize::{RandomizeRCOTReceiver, RandomizeRCOTSender},
++    },
++};
++use mpz_share_conversion::{
++    MultiplicativeToAdditive, ShareConversionReceiver, ShareConversionSender,
++};
++use mpz_vm_core::{
++    Call, Execute, Vm,
++    memory::{Array, binary::U8},
++    prelude::*,
++};
++use mpz_zk::{Prover, Verifier};
++use rustls::crypto::{CryptoProvider, ring};
++use serde::{Deserialize, Serialize};
++use serio::{SinkExt, stream::IoStreamExt};
++use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
++use tracing::{debug, info};
++
++use crate::{
++    Hello, MAX_PENDING_BYTES, MAX_SENT_BYTES, PROTOCOL_VERSION, RELAY_IDLE_TIMEOUT,
++    RELAY_MAX_DURATION, RequestHeader, SETUP_TIMEOUT, TOKEN_LEN, Tamper, check_template,
++    fill_template,
++    record::{ALERT, APPLICATION_DATA, CLOSE_NOTIFY, LocalRecordLayer, MAX_RECORD_PLAINTEXT, TrafficKeys, tls12_aad},
++    split_template,
++};
++
++/// Most handshake bytes the pool relays from the borrower before the splice.
++pub const MAX_HANDSHAKE_BYTES: usize = 64 << 10;
++/// Largest frame either side accepts on the relay channels.
++pub const MAX_FRAME_BYTES: usize = 256 << 10;
++/// Frame size the borrower batches its records into.
++const FRAME_TARGET: usize = 64 << 10;
++/// Largest TLS record payload on the wire (plaintext plus AEAD expansion).
++const MAX_RECORD_WIRE: usize = (1 << 14) + 2048;
++
++/// Everything that crosses the relay channels after the opening messages.
++#[derive(Debug, Serialize, Deserialize)]
++pub enum Frame {
++    /// TLS bytes to relay: borrower → server on `up`, server → borrower on
++    /// `down`.
++    Bytes(Vec<u8>),
++    /// The borrower's handshake is done; the pool's record takes this
++    /// sequence number and nonce.
++    Splice { seq: u64, nonce: [u8; 12] },
++    /// The borrower's share of the token record's tag.
++    TagShare([u8; 16]),
++    /// The pool wrote the token record; the borrower may continue.
++    Spliced,
++    /// The server closed its side.
++    ServerClosed,
++    /// The borrower is finished with the connection.
++    Done,
++}
++
++impl std::fmt::Display for Frame {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Frame::Bytes(b) => write!(f, "Bytes({})", b.len()),
++            Frame::Splice { seq, .. } => write!(f, "Splice(seq {seq})"),
++            Frame::TagShare(_) => f.write_str("TagShare"),
++            Frame::Spliced => f.write_str("Spliced"),
++            Frame::ServerClosed => f.write_str("ServerClosed"),
++            Frame::Done => f.write_str("Done"),
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// TLS record framing
++
++/// Cuts a byte stream into whole TLS records (5-byte header included).
++#[derive(Default)]
++pub struct Deframer {
++    buf: Vec<u8>,
++}
++
++impl Deframer {
++    pub fn push(&mut self, bytes: &[u8]) {
++        self.buf.extend_from_slice(bytes);
++    }
++
++    /// The next complete record, if the buffer holds one.
++    pub fn next_record(&mut self) -> Result<Option<Vec<u8>>> {
++        if self.buf.len() < 5 {
++            return Ok(None);
++        }
++        ensure!(
++            (20..=23).contains(&self.buf[0]) && self.buf[1] == 3,
++            "not a TLS record (type {}, version {}.{})",
++            self.buf[0],
++            self.buf[1],
++            self.buf[2]
++        );
++        let len = u16::from_be_bytes([self.buf[3], self.buf[4]]) as usize;
++        ensure!(len <= MAX_RECORD_WIRE, "TLS record of {len} bytes is too long");
++        if self.buf.len() < 5 + len {
++            return Ok(None);
++        }
++        let record = self.buf.drain(..5 + len).collect();
++        Ok(Some(record))
++    }
++
++    /// True when no partial record is pending.
++    pub fn is_empty(&self) -> bool {
++        self.buf.is_empty()
++    }
++}
++
++/// Encodes a TLS 1.2 AES-GCM record from its parts.
++fn encode_record(nonce: &[u8; 12], ciphertext: &[u8], tag: [u8; 16]) -> Vec<u8> {
++    let len = 8 + ciphertext.len() + 16;
++    let mut record = Vec::with_capacity(5 + len);
++    record.extend_from_slice(&[0x17, 0x03, 0x03]);
++    record.extend_from_slice(&(len as u16).to_be_bytes());
++    record.extend_from_slice(&nonce[4..]);
++    record.extend_from_slice(ciphertext);
++    record.extend_from_slice(&tag);
++    record
++}
++
++// ---------------------------------------------------------------------------
++// GHASH helpers, with tlsn's bit conventions.
++
++fn gf(block: [u8; 16]) -> Gf2_128 {
++    Gf2_128::from(Block::from(block).reverse_bits())
++}
++
++fn un_gf(x: Gf2_128) -> [u8; 16] {
++    Block::from(x).reverse_bits().to_bytes()
++}
++
++/// The blocks GHASH runs over: AAD (padded), ciphertext (padded), lengths.
++fn ghash_blocks(aad: &[u8], ciphertext: &[u8]) -> Vec<[u8; 16]> {
++    let mut data = aad.to_vec();
++    data.resize(aad.len().div_ceil(16) * 16, 0);
++    let ct_start = data.len();
++    data.extend_from_slice(ciphertext);
++    data.resize(ct_start + ciphertext.len().div_ceil(16) * 16, 0);
++    let len_block =
++        (((aad.len() as u64) * 8) as u128) << 64 | ((ciphertext.len() as u64) * 8) as u128;
++    data.extend_from_slice(&len_block.to_be_bytes());
++    data.chunks_exact(16)
++        .map(|c| {
++            let mut b = [0u8; 16];
++            b.copy_from_slice(c);
++            b
++        })
++        .collect()
++}
++
++/// Powers of H for each GHASH block: block `j` of `m` is multiplied by H^(m-j).
++fn h_powers(h: Gf2_128, m: usize) -> Vec<Gf2_128> {
++    let mut powers = vec![Gf2_128::zero(); m];
++    let mut acc = Gf2_128::one();
++    for j in (0..m).rev() {
++        acc = acc * h;
++        powers[j] = acc;
++    }
++    powers
++}
++
++fn counter_block(nonce: &[u8; 12], ctr: u32) -> [u8; 16] {
++    let mut b = [0u8; 16];
++    b[..12].copy_from_slice(nonce);
++    b[12..].copy_from_slice(&ctr.to_be_bytes());
++    b
++}
++
++/// Which GHASH block indices hold the token span. Ciphertext block `k` is
++/// data block `1 + k`, after the single AAD block; the span is block aligned
++/// (`check_template`), so these blocks hold nothing but the span.
++fn span_blocks(header: &RequestHeader) -> Vec<usize> {
++    (header.token.start / 16..header.token.end.div_ceil(16))
++        .map(|k| 1 + k)
++        .collect()
++}
++
++fn aes_block(key: &[u8; 16], block: [u8; 16]) -> [u8; 16] {
++    let cipher = aes::Aes128::new(GenericArray::from_slice(key));
++    let mut b = GenericArray::from(block);
++    cipher.encrypt_block(&mut b);
++    b.into()
++}
++
++fn xor_keystream(plaintext: &[u8], keystream: &[[u8; 16]]) -> Vec<u8> {
++    plaintext
++        .iter()
++        .enumerate()
++        .map(|(i, p)| p ^ keystream[i / 16][i % 16])
++        .collect()
++}
++
++// ---------------------------------------------------------------------------
++// MPC plumbing
++
++/// KOS correlated OT, for the share conversion.
++type CotSender = SharedRCOTSender<kos::Sender<co::Receiver>, Block>;
++type CotReceiver = SharedRCOTReceiver<kos::Receiver<co::Sender>, bool, Block>;
++
++/// Correlated OT for the proof: ferret (LPN-based extension) over KOS, as
++/// tlsn does it. KOS alone costs the receiver, here the borrower, 16 bytes per
++/// correlation; ferret amortizes that to a fraction of a bit.
++type ProofCotSender = SharedRCOTSender<ferret::Sender<kos::Sender<co::Receiver>>, Block>;
++type ProofCotReceiver =
++    SharedRCOTReceiver<ferret::Receiver<kos::Receiver<co::Sender>>, bool, Block>;
++/// The pool verifies the keystream proof; its correlated-OT sender carries
++/// the VOLE correlations the proof runs on.
++type PoolVm = Verifier<ProofCotSender>;
++/// The borrower proves the keystream.
++type BorrowerVm = Prover<ProofCotReceiver>;
++
++fn ferret_config() -> ferret::FerretConfig {
++    ferret::FerretConfig::builder()
++        .lpn_type(ferret::LpnType::Regular)
++        .build()
++        .expect("ferret config is valid")
++}
++
++/// The pool's share converter: OLE sender on its correlated-OT sender.
++type PoolConverter =
++    ShareConversionSender<OleSender<AnySender<RandomizeRCOTSender<CotSender>>, Gf2_128>, Gf2_128>;
++/// The borrower's share converter: OLE receiver on its correlated-OT receiver.
++type BorrowerConverter = ShareConversionReceiver<
++    OleReceiver<AnyReceiver<RandomizeRCOTReceiver<CotReceiver>>, Gf2_128>,
++    Gf2_128,
++>;
++
++/// One KOS sender (with its delta) and one KOS receiver for a party.
++fn cot_pair() -> (Delta, CotSender, CotReceiver) {
++    let mut rng = rand::rng();
++    let delta = Delta::random(&mut rng);
++    let cot_send = SharedRCOTSender::new(kos::Sender::new(
++        kos::SenderConfig::default(),
++        delta.into_inner(),
++        co::Receiver::default(),
++    ));
++    let cot_recv = SharedRCOTReceiver::new(kos::Receiver::new(
++        kos::ReceiverConfig::default(),
++        co::Sender::default(),
++    ));
++    (delta, cot_send, cot_recv)
++}
++
++/// The pool's VM: the zero-knowledge verifier. It has no private input and
++/// learns the keystream, which the borrower knows anyway.
++///
++/// The share converter gets a correlated-OT instance of its own rather than a
++/// clone of the VM's: a shared instance's `flush` is a barrier across every
++/// handle with allocations, and the two are flushed at different times. The
++/// extra base OT costs about a millisecond.
++fn pool_vm() -> (PoolVm, PoolConverter) {
++    let mut rng = rand::rng();
++    let delta = Delta::random(&mut rng);
++    let kos = kos::Sender::new(
++        kos::SenderConfig::default(),
++        delta.into_inner(),
++        co::Receiver::default(),
++    );
++    let cot_send = SharedRCOTSender::new(ferret::Sender::new(
++        ferret_config(),
++        Block::random(&mut rng),
++        kos,
++    ));
++    let vm = Verifier::new(Default::default(), delta, cot_send);
++    let (_, ole_cot, _) = cot_pair();
++    let converter = ShareConversionSender::new(OleSender::new(
++        Block::random(&mut rand::rng()),
++        AnySender::new(RandomizeRCOTSender::new(ole_cot)),
++    ));
++    (vm, converter)
++}
++
++/// The borrower's VM: the zero-knowledge prover. Its key is a witness,
++/// private against a malicious pool. The roles are fixed in code: the key
++/// holder proves, and no message from the peer can change that.
++fn borrower_vm() -> (BorrowerVm, BorrowerConverter) {
++    let mut rng = rand::rng();
++    let kos = kos::Receiver::new(kos::ReceiverConfig::default(), co::Sender::default());
++    let cot_recv = SharedRCOTReceiver::new(ferret::Receiver::new(
++        ferret_config(),
++        Block::random(&mut rng),
++        kos,
++    ));
++    let vm = Prover::new(Default::default(), cot_recv);
++    let (_, _, ole_cot) = cot_pair();
++    let converter = ShareConversionReceiver::new(OleReceiver::new(AnyReceiver::new(
++        RandomizeRCOTReceiver::new(ole_cot),
++    )));
++    (vm, converter)
++}
++
++/// The keystream circuit: one key schedule, then one AES block per counter.
++struct Keystream {
++    key: Array<U8, 16>,
++    counters: Vec<Array<U8, 16>>,
++    outputs: Vec<DecodeFutureTyped<BitVec, [u8; 16]>>,
++}
++
++/// Declares the circuit so it can be preprocessed before the handshake.
++fn alloc_keystream<V: Vm<mpz_vm_core::memory::binary::Binary>>(
++    vm: &mut V,
++    blocks: usize,
++    holds_key: bool,
++) -> Result<Keystream> {
++    let key: Array<U8, 16> = vm.alloc()?;
++    if holds_key {
++        vm.mark_private(key)?;
++    } else {
++        vm.mark_blind(key)?;
++    }
++    let schedule: Array<U8, 176> =
++        vm.call(Call::builder(AES128_KS.clone()).arg(key).build()?)?;
++    let mut counters = Vec::with_capacity(blocks);
++    let mut outputs = Vec::with_capacity(blocks);
++    for _ in 0..blocks {
++        let ctr: Array<U8, 16> = vm.alloc()?;
++        vm.mark_public(ctr)?;
++        let out: Array<U8, 16> = vm.call(
++            Call::builder(AES128_POST_KS.clone())
++                .arg(schedule)
++                .arg(ctr)
++                .build()?,
++        )?;
++        outputs.push(vm.decode(out)?);
++        counters.push(ctr);
++    }
++    Ok(Keystream {
++        key,
++        counters,
++        outputs,
++    })
++}
++
++/// Runs the keystream circuit and returns the keystream. `key` is `Some` on
++/// the borrower only. On the pool the outputs come out of the verifier, so
++/// they are correct for whatever key the borrower committed to, or the proof
++/// fails and this errors.
++async fn compute_keystream<V: Vm<mpz_vm_core::memory::binary::Binary>>(
++    vm: &mut V,
++    ctx: &mut Context,
++    ks: Keystream,
++    key: Option<[u8; 16]>,
++    nonce: &[u8; 12],
++) -> Result<Vec<[u8; 16]>> {
++    if let Some(key) = key {
++        vm.assign(ks.key, key)?;
++    }
++    vm.commit(ks.key)?;
++    for (i, ctr) in ks.counters.iter().enumerate() {
++        // J0 is counter 1; the keystream starts at counter 2.
++        vm.assign(*ctr, counter_block(nonce, i as u32 + 2))?;
++        vm.commit(*ctr)?;
++    }
++    vm.flush(ctx).await?;
++    vm.execute(ctx).await?;
++    // The verifier's check of the proof happens in this flush; a prover that
++    // cheated is caught before the keystream is used.
++    vm.flush(ctx).await.context("keystream proof")?;
++    ks.outputs
++        .into_iter()
++        .map(|mut out| {
++            out.try_recv()?
++                .context("keystream block was not decoded")
++        })
++        .collect()
++}
++
++/// Additive shares of `my_input * their_input`, one per element.
++async fn to_additive<C>(
++    converter: &mut C,
++    ctx: &mut Context,
++    inputs: &[Gf2_128],
++) -> Result<Vec<Gf2_128>>
++where
++    C: MultiplicativeToAdditive<Gf2_128> + Flush,
++    <C as MultiplicativeToAdditive<Gf2_128>>::Error: std::fmt::Display,
++    <C as Flush>::Error: std::fmt::Display,
++{
++    if inputs.is_empty() {
++        return Ok(Vec::new());
++    }
++    let mut out = converter
++        .queue_to_additive(inputs)
++        .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
++    converter
++        .flush(ctx)
++        .await
++        .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
++    Ok(out
++        .try_recv()
++        .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?
++        .context("shares were not computed")?
++        .shares)
++}
++
++// ---------------------------------------------------------------------------
++// Pool
++
++/// What the pool measured.
++pub struct PoolReport {
++    /// Circuit and OT preprocessing, overlapped with the handshake.
++    pub preprocess: Duration,
++    /// From the borrower's header to its `Splice` request.
++    pub handshake: Duration,
++    /// Keystream, tag and writing the record.
++    pub splice: Duration,
++    /// The token record as sent to the server.
++    pub record: Vec<u8>,
++    /// Its plaintext, with the token in place. Never log it.
++    pub headers: Vec<u8>,
++}
++
++// The report holds the token; a `?report` in a log line must not print it.
++impl std::fmt::Debug for PoolReport {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("PoolReport")
++            .field("preprocess", &self.preprocess)
++            .field("handshake", &self.handshake)
++            .field("splice", &self.splice)
++            .field("record_len", &self.record.len())
++            .finish()
++    }
++}
++
++/// Runs the pool's side of one borrowed request.
++///
++/// `mpc`, `up`, `down` are the three channels, in order. `server` is the
++/// connection to the API server; the pool does not verify it (the borrower
++/// does, and the token record is only written after the borrower's handshake
++/// has completed). `token` goes into the borrower's `Authorization` header.
++/// `tamper` is a test hook for a misbehaving pool.
++pub async fn run_pool<S>(
++    mpc: Context,
++    mut up: Context,
++    mut down: Context,
++    server: S,
++    server_name: &str,
++    token: &str,
++    tamper: Tamper,
++) -> Result<PoolReport>
++where
++    S: AsyncRead + AsyncWrite,
++{
++    ensure!(
++        token.len() == TOKEN_LEN,
++        "refusing to lend a {}-byte credential: only {TOKEN_LEN}-byte ones keep the span tight",
++        token.len()
++    );
++    ensure!(
++        !token.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
++        "credential contains whitespace or control characters"
++    );
++
++    let started = Instant::now();
++    let prelude = async {
++        down.io_mut()
++            .send(Hello {
++                version: PROTOCOL_VERSION,
++                token_len: token.len(),
++                server_name: server_name.to_string(),
++            })
++            .await
++            .context("prelude: greeting the borrower")?;
++        let request: RequestHeader = up
++            .io_mut()
++            .expect_next()
++            .await
++            .context("prelude: waiting for the borrower's header")?;
++        check_template(&request, token.len(), server_name).context("borrower's header rejected")?;
++        Ok::<_, anyhow::Error>(request)
++    };
++    let request = tokio::time::timeout(SETUP_TIMEOUT, prelude)
++        .await
++        .context("prelude timed out")??;
++
++    let mut headers = request.template.clone();
++    let span = &mut headers[request.token.clone()];
++    span.fill(b' ');
++    span[..token.len()].copy_from_slice(token.as_bytes());
++    if let Some(tamper) = tamper {
++        tamper(&mut headers);
++    }
++    let blocks = headers.len().div_ceil(16);
++    let span_idx = span_blocks(&request);
++
++    // Preprocess while the borrower's handshake is relayed.
++    let (mut vm, mut converter) = pool_vm();
++    let mut ks = Some(alloc_keystream(&mut vm, blocks, false)?);
++    MultiplicativeToAdditive::<Gf2_128>::alloc(&mut converter, span_idx.len())
++        .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
++    let pre = async move {
++        let mut mpc = mpc;
++        let t = Instant::now();
++        vm.preprocess(&mut mpc).await.context("preprocessing the circuit")?;
++        vm.flush(&mut mpc).await.context("preparing the keystream proof")?;
++        debug!("pool: circuit preprocessed");
++        converter
++            .flush(&mut mpc)
++            .await
++            .map_err(|e| anyhow::anyhow!("preprocessing the share conversion: {e}"))?;
++        Ok::<_, anyhow::Error>((vm, converter, mpc, t.elapsed()))
++    };
++    tokio::pin!(pre);
++    let mut pre_done = false;
++    let mut parts = None;
++    let mut preprocess = Duration::ZERO;
++
++    // Relay. Reads and writes on the server socket must not block each other,
++    // or the pool stalls writing a large body while the server stalls writing
++    // the response; writes are queued and drained by their own select arm.
++    let (mut rd, mut wr) = tokio::io::split(server);
++    let mut buf = vec![0u8; 64 << 10];
++    let mut out: Vec<u8> = Vec::new();
++    let mut written = 0;
++    let mut server_open = true;
++    let mut spliced = false;
++    let mut handshake_bytes = 0usize;
++    let mut sent = 0usize;
++    let mut deframer = Deframer::default();
++    let mut handshake = Duration::ZERO;
++    let mut splice = Duration::ZERO;
++    let mut record = Vec::new();
++    let setup_deadline = tokio::time::sleep(SETUP_TIMEOUT);
++    tokio::pin!(setup_deadline);
++    let deadline = tokio::time::sleep(RELAY_MAX_DURATION);
++    tokio::pin!(deadline);
++
++    loop {
++        tokio::select! {
++            res = &mut pre, if !pre_done => {
++                pre_done = true;
++                let (vm, converter, mpc, took) = res?;
++                parts = Some((vm, converter, mpc));
++                preprocess = took;
++                info!(?preprocess, "pool: preprocessed");
++            }
++            // Stop taking frames while the server is behind on the bytes queued.
++            frame = tokio::time::timeout(RELAY_IDLE_TIMEOUT, up.io_mut().expect_next::<Frame>()),
++                if out.len() - written < MAX_PENDING_BYTES =>
++            {
++                let frame = match frame.context("no frame from the borrower for 10 min")? {
++                    Ok(frame) => frame,
++                    // The borrower closing its end is also how a borrow ends.
++                    Err(e) => {
++                        debug!("pool: borrower left: {e}");
++                        break;
++                    }
++                };
++                match frame {
++                    Frame::Bytes(bytes) => {
++                        ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
++                        if spliced {
++                            sent += bytes.len();
++                            ensure!(sent <= MAX_SENT_BYTES, "borrower sent more than {MAX_SENT_BYTES} bytes");
++                            if server_open {
++                                out.extend_from_slice(&bytes);
++                            }
++                        } else {
++                            handshake_bytes += bytes.len();
++                            ensure!(
++                                handshake_bytes <= MAX_HANDSHAKE_BYTES,
++                                "more than {MAX_HANDSHAKE_BYTES} bytes of handshake"
++                            );
++                            deframer.push(&bytes);
++                            while let Some(rec) = deframer.next_record()? {
++                                // The token record must be the first
++                                // application data on this connection.
++                                ensure!(
++                                    rec[0] != 0x17,
++                                    "borrower sent application data before the token record"
++                                );
++                                out.extend_from_slice(&rec);
++                            }
++                        }
++                    }
++                    Frame::Splice { seq, nonce } => {
++                        ensure!(!spliced, "borrower asked for a second token record");
++                        ensure!(deframer.is_empty(), "partial record pending at the splice");
++                        ensure!(server_open, "server closed before the token record");
++                        handshake = started.elapsed();
++                        if !pre_done {
++                            let (vm, converter, mpc, took) = (&mut pre).await?;
++                            pre_done = true;
++                            parts = Some((vm, converter, mpc));
++                            preprocess = took;
++                        }
++                        let (vm, converter, mpc) = parts.as_mut().expect("preprocessed");
++                        let t = Instant::now();
++                        record = splice_record(
++                            vm,
++                            converter,
++                            mpc,
++                            &mut up,
++                            ks.take().expect("one splice"),
++                            &headers,
++                            &span_idx,
++                            seq,
++                            &nonce,
++                        )
++                        .await?;
++                        out.extend_from_slice(&record);
++                        down.io_mut()
++                            .send(Frame::Spliced)
++                            .await
++                            .context("telling the borrower the record is written")?;
++                        spliced = true;
++                        splice = t.elapsed();
++                        info!(?handshake, ?splice, "pool: token record written");
++                    }
++                    Frame::Done => break,
++                    other => bail!("unexpected {other} from the borrower"),
++                }
++            }
++            _ = &mut setup_deadline, if !spliced => {
++                bail!("setup timed out");
++            }
++            _ = &mut deadline => {
++                bail!("borrow ran for more than {} s", RELAY_MAX_DURATION.as_secs());
++            }
++            n = wr.write(&out[written..]), if written < out.len() => {
++                written += n.context("writing to the server")?;
++                if written == out.len() {
++                    out.clear();
++                    written = 0;
++                }
++            }
++            n = rd.read(&mut buf), if server_open => {
++                let n = n.context("reading from the server")?;
++                if n == 0 {
++                    server_open = false;
++                    // The borrower may already have left after the server's
++                    // close_notify; then there is nobody to tell.
++                    if down.io_mut().send(Frame::ServerClosed).await.is_err() {
++                        debug!("pool: borrower gone before the server closed");
++                        break;
++                    }
++                } else if let Err(e) = down.io_mut().send(Frame::Bytes(buf[..n].to_vec())).await {
++                    if spliced {
++                        debug!("pool: borrower left: {e}");
++                        break;
++                    }
++                    return Err(anyhow::Error::from(e).context("forwarding the server's bytes"));
++                }
++            }
++        }
++    }
++    if server_open && written < out.len() {
++        wr.write_all(&out[written..]).await.context("writing the rest to the server")?;
++    }
++    let _ = wr.shutdown().await;
++    ensure!(spliced, "the borrower left before the token record was written");
++    info!("pool: done");
++
++    Ok(PoolReport {
++        preprocess,
++        handshake,
++        splice,
++        record,
++        headers,
++    })
++}
++
++/// Computes and encodes the token record on the pool's side.
++#[allow(clippy::too_many_arguments)]
++async fn splice_record(
++    vm: &mut PoolVm,
++    converter: &mut PoolConverter,
++    ctx: &mut Context,
++    up: &mut Context,
++    ks: Keystream,
++    headers: &[u8],
++    span_idx: &[usize],
++    seq: u64,
++    nonce: &[u8; 12],
++) -> Result<Vec<u8>> {
++    let keystream = compute_keystream(vm, ctx, ks, None, nonce).await?;
++    let ciphertext = xor_keystream(headers, &keystream);
++
++    // The tag: the borrower covers every block it knows; for the span's blocks
++    // this side inputs its ciphertext block, the borrower the matching power
++    // of H, and each gets an additive share of the product.
++    let blocks = ghash_blocks(&tls12_aad(seq, APPLICATION_DATA, headers.len()), &ciphertext);
++    let inputs: Vec<Gf2_128> = span_idx.iter().map(|&j| gf(blocks[j])).collect();
++    let shares = to_additive(converter, ctx, &inputs).await?;
++    let mine = shares.into_iter().fold(Gf2_128::zero(), |acc, s| acc + s);
++
++    let share = match up.io_mut().expect_next::<Frame>().await? {
++        Frame::TagShare(share) => share,
++        other => bail!("expected the borrower's tag share, got {other}"),
++    };
++    let tag = un_gf(gf(share) + mine);
++    Ok(encode_record(nonce, &ciphertext, tag))
++}
++
++// ---------------------------------------------------------------------------
++// Borrower
++
++/// What the borrower got.
++#[derive(Debug)]
++pub struct BorrowerReport {
++    /// The whole response, headers included.
++    pub response: Vec<u8>,
++    /// Time from sending the body to the first response byte.
++    pub first_byte: Duration,
++    /// The traffic keys, for diagnostics in tests.
++    pub keys: TrafficKeys,
++    /// Sequence number of the token record.
++    pub splice_seq: u64,
++    /// The header as the borrower asked for it (token span filled with x).
++    pub header: RequestHeader,
++}
++
++/// The borrower's TLS client configuration: TLS 1.2 with AES-128-GCM only,
++/// since that is the record format the pool's spliced record uses.
++fn tls_config(roots: &rustls::RootCertStore) -> Result<Arc<rustls::ClientConfig>> {
++    let provider = CryptoProvider {
++        cipher_suites: vec![
++            ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++            ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++        ],
++        ..ring::default_provider()
++    };
++    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
++        .with_protocol_versions(&[&rustls::version::TLS12])?
++        .with_root_certificates(roots.clone())
++        .with_no_client_auth();
++    config.enable_secret_extraction = true;
++    config.resumption = rustls::client::Resumption::disabled();
++    Ok(Arc::new(config))
++}
++
++/// The session as rustls leaves it after the handshake.
++struct Session {
++    keys: TrafficKeys,
++    /// Next client sequence number: the token record's.
++    write_seq: u64,
++    /// Next server sequence number.
++    read_seq: u64,
++}
++
++/// Runs the TLS handshake over the relay and takes the keys out.
++async fn handshake(
++    up: &mut Context,
++    down: &mut Context,
++    config: Arc<rustls::ClientConfig>,
++    server_name: &str,
++) -> Result<Session> {
++    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())?;
++    let mut conn = rustls::ClientConnection::new(config, name)?;
++    loop {
++        let mut bytes = Vec::new();
++        while conn.wants_write() {
++            conn.write_tls(&mut bytes)?;
++        }
++        if !bytes.is_empty() {
++            up.io_mut().send(Frame::Bytes(bytes)).await?;
++        }
++        if !conn.is_handshaking() {
++            break;
++        }
++        match tokio::time::timeout(SETUP_TIMEOUT, down.io_mut().expect_next::<Frame>())
++            .await
++            .context("no bytes from the server")??
++        {
++            Frame::Bytes(bytes) => {
++                let mut rest = &bytes[..];
++                while !rest.is_empty() {
++                    ensure!(conn.read_tls(&mut rest)? > 0, "TLS client refused the server's bytes");
++                    conn.process_new_packets()
++                        .context("TLS handshake with the server")?;
++                }
++            }
++            Frame::ServerClosed => bail!("server closed the connection during the handshake"),
++            other => bail!("unexpected {other} during the handshake"),
++        }
++    }
++    let secrets = conn
++        .dangerous_extract_secrets()
++        .context("taking the traffic keys out of the TLS client")?;
++    let (write_seq, tx) = secrets.tx;
++    let (read_seq, rx) = secrets.rx;
++    let (client_write_key, client_write_iv) = gcm_parts(tx)?;
++    let (server_write_key, server_write_iv) = gcm_parts(rx)?;
++    Ok(Session {
++        keys: TrafficKeys {
++            client_write_key,
++            client_write_iv,
++            server_write_key,
++            server_write_iv,
++        },
++        write_seq,
++        read_seq,
++    })
++}
++
++/// Key and implicit nonce of an AES-128-GCM direction.
++fn gcm_parts(secrets: rustls::ConnectionTrafficSecrets) -> Result<([u8; 16], [u8; 4])> {
++    match secrets {
++        rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv } => Ok((
++            key.as_ref().try_into().context("key length")?,
++            iv.as_ref()[..4].try_into().context("iv length")?,
++        )),
++        _ => bail!("the negotiated cipher is not AES-128-GCM"),
++    }
++}
++
++/// Runs the borrower's side of one borrowed request.
++///
++/// `template` is the header text with [`TOKEN_MARKER`](crate::TOKEN_MARKER)
++/// and optionally [`BODY_LEN_MARKER`](crate::BODY_LEN_MARKER).
++/// `expected_server` is the name the borrower verifies the server's
++/// certificate for. `token_len` is the length of the credential the borrower
++/// expects; a pool announcing another length is refused. The response is
++/// copied to `out` as it arrives.
++#[allow(clippy::too_many_arguments)]
++pub async fn run_borrower(
++    mpc: Context,
++    mut up: Context,
++    mut down: Context,
++    template: &str,
++    body: Vec<u8>,
++    roots: rustls::RootCertStore,
++    expected_server: &str,
++    token_len: usize,
++    mut out: Box<dyn AsyncWrite + Unpin + Send>,
++) -> Result<BorrowerReport> {
++    let config = tls_config(&roots)?;
++
++    let setup = async {
++        let hello: Hello = down.io_mut().expect_next().await?;
++        info!(?hello, "borrower: pool says hello");
++        ensure!(
++            hello.version == PROTOCOL_VERSION,
++            "pool speaks protocol version {}, this borrower {PROTOCOL_VERSION}",
++            hello.version
++        );
++        ensure!(
++            hello.token_len == token_len,
++            "pool announced a {}-byte token, expected {token_len}",
++            hello.token_len
++        );
++
++        // Only the part through the Authorization line is the pool's record;
++        // the remaining headers go in the borrower's own first record.
++        let (hidden, trailer) = split_template(template)?;
++        let header = fill_template(&hidden, token_len, body.len())?;
++        up.io_mut().send(header.clone()).await?;
++        let blocks = header.template.len().div_ceil(16);
++        let span_idx = span_blocks(&header);
++
++        let (mut vm, mut converter) = borrower_vm();
++        let ks = alloc_keystream(&mut vm, blocks, true)?;
++        MultiplicativeToAdditive::<Gf2_128>::alloc(&mut converter, span_idx.len())
++            .map_err(|e| anyhow::anyhow!("share conversion: {e}"))?;
++
++        // Preprocess and shake hands at the same time.
++        let mut mpc = mpc;
++        let pre = async {
++            let t = Instant::now();
++            vm.preprocess(&mut mpc).await.context("preprocessing the circuit")?;
++            vm.flush(&mut mpc).await.context("preparing the keystream proof")?;
++            debug!("borrower: circuit preprocessed");
++            converter
++                .flush(&mut mpc)
++                .await
++                .map_err(|e| anyhow::anyhow!("preprocessing the share conversion: {e}"))?;
++            info!(took = ?t.elapsed(), "borrower: preprocessed");
++            Ok::<_, anyhow::Error>(())
++        };
++        let hs = handshake(&mut up, &mut down, config, expected_server);
++        let ((), session) = tokio::try_join!(pre, hs)?;
++        info!(
++            write_seq = session.write_seq,
++            read_seq = session.read_seq,
++            "borrower: handshake done, holds the traffic keys"
++        );
++
++        // The token record takes the next client sequence number.
++        let seq = session.write_seq;
++        let mut nonce = [0u8; 12];
++        nonce[..4].copy_from_slice(&session.keys.client_write_iv);
++        nonce[4..].copy_from_slice(&seq.to_be_bytes());
++        up.io_mut().send(Frame::Splice { seq, nonce }).await?;
++
++        let key = session.keys.client_write_key;
++        let keystream = compute_keystream(&mut vm, &mut mpc, ks, Some(key), &nonce).await?;
++
++        // Tag share: every block this side knows, locally; the span's blocks
++        // through the share conversion with the pool's ciphertext.
++        let h = gf(aes_block(&key, [0u8; 16]));
++        let e_j0 = gf(aes_block(&key, counter_block(&nonce, 1)));
++        let ciphertext = xor_keystream(&header.template, &keystream);
++        let blocks = ghash_blocks(&tls12_aad(seq, APPLICATION_DATA, header.template.len()), &ciphertext);
++        let powers = h_powers(h, blocks.len());
++        let local = blocks
++            .iter()
++            .zip(&powers)
++            .enumerate()
++            .filter(|(j, _)| !span_idx.contains(j))
++            .fold(Gf2_128::zero(), |acc, (_, (block, power))| acc + gf(*block) * *power);
++        let inputs: Vec<Gf2_128> = span_idx.iter().map(|&j| powers[j]).collect();
++        let shares = to_additive(&mut converter, &mut mpc, &inputs).await?;
++        let joint = shares.into_iter().fold(Gf2_128::zero(), |acc, s| acc + s);
++        up.io_mut()
++            .send(Frame::TagShare(un_gf(e_j0 + local + joint)))
++            .await?;
++
++        Ok::<_, anyhow::Error>((header, trailer, session))
++    };
++    let (header, trailer, session) = tokio::time::timeout(SETUP_TIMEOUT, setup)
++        .await
++        .context("setup timed out")??;
++    let keys = session.keys.clone();
++    let splice_seq = session.write_seq;
++    let (mut writer, mut reader) =
++        LocalRecordLayer::new(&keys, splice_seq + 1, session.read_seq).split();
++
++    // Read the response while the body is still being sent. The pool's
++    // `Spliced` arrives on the same channel, so the reader relays it.
++    let (spliced_tx, spliced_rx) = tokio::sync::oneshot::channel();
++    let t = Instant::now();
++    let reading = tokio::spawn(async move {
++        let mut spliced_tx = Some(spliced_tx);
++        let mut deframer = Deframer::default();
++        let mut response = Vec::new();
++        let mut first_byte = None;
++        loop {
++            match tokio::time::timeout(RELAY_IDLE_TIMEOUT, down.io_mut().expect_next::<Frame>())
++                .await
++                .context("no frame from the pool for 10 min")??
++            {
++                Frame::Spliced => {
++                    if let Some(tx) = spliced_tx.take() {
++                        let _ = tx.send(());
++                    }
++                }
++                Frame::Bytes(bytes) => {
++                    ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
++                    deframer.push(&bytes);
++                    while let Some(record) = deframer.next_record()? {
++                        let (typ, plaintext) = reader.decrypt(&record)?;
++                        match typ {
++                            APPLICATION_DATA => {
++                                first_byte.get_or_insert_with(|| t.elapsed());
++                                out.write_all(&plaintext).await?;
++                                out.flush().await?;
++                                response.extend_from_slice(&plaintext);
++                            }
++                            ALERT => {
++                                ensure!(
++                                    plaintext == CLOSE_NOTIFY,
++                                    "unexpected alert from the server: {plaintext:?}"
++                                );
++                                debug!("borrower: server sent close_notify");
++                                return Ok((response, first_byte.unwrap_or_default()));
++                            }
++                            typ => bail!("unexpected record type {typ}"),
++                        }
++                    }
++                }
++                Frame::ServerClosed => {
++                    debug!("borrower: server closed the connection");
++                    return Ok((response, first_byte.unwrap_or_default()));
++                }
++                other => bail!("unexpected {other} from the pool"),
++            }
++        }
++    });
++
++    // The body waits for the token record to be on the wire.
++    if spliced_rx.await.is_err() {
++        // The reader ended first: a server alert, most likely.
++        let err = match reading.await? {
++            Ok(_) => anyhow::anyhow!("server closed before the token record was written"),
++            Err(e) => e,
++        };
++        return Err(err);
++    }
++    let payload = [trailer, body].concat();
++    let mut frame = Vec::with_capacity(FRAME_TARGET + MAX_RECORD_PLAINTEXT + 64);
++    for chunk in payload.chunks(MAX_RECORD_PLAINTEXT) {
++        frame.extend_from_slice(&writer.encrypt(APPLICATION_DATA, chunk)?);
++        if frame.len() >= FRAME_TARGET {
++            up.io_mut().send(Frame::Bytes(std::mem::take(&mut frame))).await?;
++        }
++    }
++    if !frame.is_empty() {
++        up.io_mut().send(Frame::Bytes(frame)).await?;
++    }
++    debug!(bytes = payload.len(), "borrower: request sent");
++
++    let (response, first_byte) = tokio::time::timeout(RELAY_MAX_DURATION, reading)
++        .await
++        .context("borrow ran too long")???;
++
++    let close_notify = writer.encrypt(ALERT, &CLOSE_NOTIFY)?;
++    let _ = up.io_mut().send(Frame::Bytes(close_notify)).await;
++    let _ = up.io_mut().send(Frame::Done).await;
++    info!("borrower: done");
++
++    Ok(BorrowerReport {
++        response,
++        first_byte,
++        keys,
++        splice_seq,
++        header,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use aes_gcm::{Aes128Gcm, NewAead, aead::AeadInPlace};
++    use rand::RngExt;
++
++    use super::*;
++
++    /// The tag assembled from the borrower's local terms and simulated
++    /// additive shares for the span must be AES-GCM's tag.
++    #[test]
++    fn split_tag_matches_aes_gcm() {
++        let mut rng = rand::rng();
++        let key: [u8; 16] = rng.random();
++        let nonce: [u8; 12] = rng.random();
++        let seq = 1u64;
++        // 226-byte header with a 112-byte span at offset 112 (seven blocks).
++        let mut plaintext: Vec<u8> = (0..226u32).map(|i| (i % 251) as u8).collect();
++        let span = 112..224;
++        for b in &mut plaintext[span.clone()] {
++            *b = rng.random();
++        }
++        let header = RequestHeader {
++            template: plaintext.clone(),
++            token: span.clone(),
++        };
++        let span_idx = span_blocks(&header);
++        assert_eq!(span_idx, vec![8, 9, 10, 11, 12, 13, 14]);
++
++        // Pool: keystream, ciphertext.
++        let keystream: Vec<[u8; 16]> = (0..plaintext.len().div_ceil(16))
++            .map(|i| aes_block(&key, counter_block(&nonce, i as u32 + 2)))
++            .collect();
++        let ciphertext = xor_keystream(&plaintext, &keystream);
++        let aad = tls12_aad(seq, APPLICATION_DATA, plaintext.len());
++        let blocks = ghash_blocks(&aad, &ciphertext);
++
++        // Borrower: everything but the span.
++        let h = gf(aes_block(&key, [0u8; 16]));
++        let e_j0 = gf(aes_block(&key, counter_block(&nonce, 1)));
++        let powers = h_powers(h, blocks.len());
++        let local = blocks
++            .iter()
++            .zip(&powers)
++            .enumerate()
++            .filter(|(j, _)| !span_idx.contains(j))
++            .fold(Gf2_128::zero(), |acc, (_, (b, p))| acc + gf(*b) * *p);
++
++        // Simulated conversion: random additive shares of block * power.
++        let mut borrower_joint = Gf2_128::zero();
++        let mut pool_joint = Gf2_128::zero();
++        for &j in &span_idx {
++            let product = gf(blocks[j]) * powers[j];
++            let a: Gf2_128 = gf(rng.random());
++            borrower_joint = borrower_joint + a;
++            pool_joint = pool_joint + (product + a);
++        }
++        let share = un_gf(e_j0 + local + borrower_joint);
++        let tag = un_gf(gf(share) + pool_joint);
++
++        let cipher = Aes128Gcm::new(GenericArray::from_slice(&key));
++        let mut reference = plaintext.clone();
++        let expected = cipher
++            .encrypt_in_place_detached(GenericArray::from_slice(&nonce), &aad, &mut reference)
++            .unwrap();
++        assert_eq!(reference, ciphertext);
++        assert_eq!(tag[..], expected[..]);
++        assert_eq!(encode_record(&nonce, &ciphertext, tag).len(), 5 + 8 + 226 + 16);
++    }
++
++    #[test]
++    fn deframer_cuts_records() {
++        let mut d = Deframer::default();
++        let rec1 = [0x16, 3, 3, 0, 2, 0xaa, 0xbb];
++        let rec2 = [0x17, 3, 3, 0, 1, 0xcc];
++        d.push(&rec1[..4]);
++        assert!(d.next_record().unwrap().is_none());
++        assert!(!d.is_empty());
++        d.push(&rec1[4..]);
++        d.push(&rec2);
++        assert_eq!(d.next_record().unwrap().unwrap(), rec1);
++        assert_eq!(d.next_record().unwrap().unwrap(), rec2);
++        assert!(d.next_record().unwrap().is_none());
++        assert!(d.is_empty());
++        d.push(&[0x50, 3, 3, 0, 0]);
++        assert!(d.next_record().is_err());
++    }
++}

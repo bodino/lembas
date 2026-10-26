@@ -15,6 +15,8 @@ struct AgentConfig: Decodable {
   var url: String
   var token: String
   var agentPort: Int?
+  // Borrow over MPC-TLS so the pool can't read the request or the answer (PrivateBorrow.swift).
+  var privateBorrowing: Bool?
 }
 
 let env = ProcessInfo.processInfo.environment
@@ -183,7 +185,8 @@ final class Agent {
       // The native login recently hit a real usage limit: go straight to the pool until
       // the lock expires, then probe direct again. Only inference calls borrow — Claude
       // Code's /api/* account and usage screens always reflect the member's own login.
-      if usePool, await directLock.active, req.path.hasPrefix("/v1/") {
+      let limited = forcePool ? true : await directLock.active
+      if usePool, limited, req.path.hasPrefix("/v1/") {
         if await tryPool(req, out) { return }
       }
 
@@ -276,6 +279,9 @@ final class Agent {
 
   func tryPool(_ req: HTTPRequest, _ out: HTTPResponder) async -> Bool {
     guard let pool else { return false }
+    // With private borrowing on, never fall back to the relay the pool can read: if
+    // the private path fails, Claude Code gets Anthropic's own limit error instead.
+    if currentConfig()?.privateBorrowing == true { return await tryPrivate(req, out) }
     do {
       let (bytes, upstream) = try await open(upstreamRequest(pool, req, poolAuth: true), out)
       await relay(bytes, upstream, out)
@@ -430,6 +436,8 @@ final class UsageTap {
 struct LembasAgent {
   static func main() async {
     setvbuf(stderr, nil, _IOLBF, 0)
+    // A write to a pipe whose reader has gone (a finished MPC helper) must fail, not kill us.
+    signal(SIGPIPE, SIG_IGN)
     // No config (left the pool, or never joined): still serve, direct only, and retire.
     let config = FileManager.default.contents(atPath: configPath)
       .flatMap { try? JSONDecoder().decode(AgentConfig.self, from: $0) }

@@ -1,9 +1,11 @@
 import http from "node:http";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { accessSync, chmodSync, constants as fsConstants, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { Ledger, type LendPolicy, type LendRule } from "./ledger.ts";
 import { costUsd } from "./pricing.ts";
 import { UsageTap } from "./usageTap.ts";
+import { WebSocketConnection } from "./ws.ts";
 
 type User = {
   token: string; // what this person puts in Claude Code to talk to the pool
@@ -29,6 +31,9 @@ type Config = {
   publicUrl?: string;
   // One-time invite codes, redeemed by the menu bar app for that member's pool token.
   invites?: Record<string, { name: string; by?: string; expiresAt: number }>;
+  // Private borrowing (see docs/mpc-tls.md): where the helper built by ./build.sh
+  // lives. `roots` and `serverName` exist for tests against tlsn's fixture server.
+  mpc?: { helper?: string; roots?: "mozilla" | "fixture"; serverName?: string };
   users: Record<string, User>;
 };
 
@@ -41,6 +46,21 @@ const LIMIT_COOLDOWN_MS = (config.limitCooldownMinutes ?? 20) * 60_000;
 // because Anthropic rate-limits the usage endpoint hard.
 const USAGE_CACHE_MS = (config.usageCacheSeconds ?? 60) * 1000;
 const ledger = new Ledger(config.statePath ?? "state.json");
+
+// Private borrowing needs the MPC helper; without it the route says so and the agent
+// pauses borrowing rather than falling back to the relay the pool can read.
+const MPC_HELPER = config.mpc?.helper ?? new URL("../build/lembas-mpc", import.meta.url).pathname;
+// A borrower's share of the handshake plus a body up to the helper's 64 MB limit.
+const MPC_MAX_FROM_BORROWER = 96 << 20;
+const UPSTREAM_URL = new URL(UPSTREAM);
+function mpcAvailable(): boolean {
+  try {
+    accessSync(MPC_HELPER, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // Claude Code's OAuth client. The login flow runs on each member's machine; the pool
 // only ever talks to the token endpoint to refresh what they deposited.
@@ -392,7 +412,7 @@ async function proxy(req: http.IncomingMessage, res: http.ServerResponse, caller
 }
 
 async function status(caller: string): Promise<unknown> {
-  const out: Record<string, unknown> = { you: caller, canInvite: isAdmin(caller) };
+  const out: Record<string, unknown> = { you: caller, canInvite: isAdmin(caller), privateBorrowing: mpcAvailable() };
   const borrowingFrom: Record<string, unknown> = {};
   for (const name of Object.keys(users)) {
     if (name === caller) {
@@ -452,6 +472,131 @@ async function status(caller: string): Promise<unknown> {
   const me = out[caller] as Record<string, unknown> | undefined;
   if (me) me.borrowingFrom = borrowingFrom;
   return out;
+}
+
+// ---------- private borrowing: the spliced token record, over a WebSocket ----------
+//
+// The agent connects here when its "Private borrowing" switch is on. One connection
+// is one attempt on one donor: the pool names the donor in a text frame, then bridges
+// binary frames to `lembas-mpc pool --stdio`, which relays the agent's TLS session to
+// Anthropic and inserts the one record carrying the donor's token; it can read nothing
+// else (docs/mpc-tls.md). Because the pool cannot
+// see Anthropic's answer, the agent ends with a text frame saying what happened:
+// usage to meter, or a usage limit to park the donor. That is a trust the pool
+// extends to the borrower; today's relay reads it off the response instead.
+
+async function borrowPrivately(ws: WebSocketConnection, caller: string, url: URL): Promise<void> {
+  const fail = (code: string, message: string) => {
+    ws.send(JSON.stringify({ type: "error", code, message }));
+    ws.close(1000);
+  };
+  if (!mpcAvailable()) return fail("unsupported", "This pool has no MPC helper, so it can't lend privately.");
+  const exclude = new Set((url.searchParams.get("exclude") ?? "").split(",").filter(Boolean));
+  const order = (await tokenOrder(caller)).filter((name) => name !== caller && !exclude.has(name));
+  if (order.length === 0) return fail("no_capacity", "Nobody in the pool has shared capacity to spare right now.");
+  const owner = order[0];
+  const bearer = await anthropicToken(owner);
+
+  const child = spawn(
+    MPC_HELPER,
+    [
+      "pool", "--stdio",
+      "--server", `${UPSTREAM_URL.hostname}:${UPSTREAM_URL.port || 443}`,
+      "--server-name", config.mpc?.serverName ?? UPSTREAM_URL.hostname,
+      "--roots", config.mpc?.roots ?? "mozilla",
+    ],
+    // The token reaches the helper through its environment and nowhere else.
+    { env: { LEMBAS_TOKEN: bearer, RUST_LOG: process.env.RUST_LOG ?? "warn" }, stdio: ["pipe", "pipe", "pipe"] },
+  );
+  const started = Date.now();
+  let reported = false;
+  let exited = false;
+  let fromBorrower = 0;
+  const finish = () => {
+    if (!ws.closed) ws.close(1000);
+  };
+  child.on("error", (err) => fail("helper", `The pool's MPC helper could not start: ${err.message}`));
+  child.stdin.on("error", () => {}); // EPIPE once the helper has exited
+  child.stderr.on("data", (chunk: Buffer) => {
+    for (const line of chunk.toString().split("\n")) if (line.trim()) console.log(`[mpc ${owner}→${caller}] ${line.trim()}`);
+  });
+  // The bridge, with backpressure both ways: the garbled circuit is a few MB.
+  child.stdout.on("data", (chunk: Buffer) => {
+    if (!ws.send(chunk)) child.stdout.pause();
+  });
+  ws.on("drain", () => child.stdout.resume());
+  ws.on("message", (data: Buffer, isText: boolean) => {
+    if (!isText) {
+      // No backpressure this way: the borrower sends little (its share of the
+      // handshake, the body), and pausing the socket could hold back its close.
+      // The helper enforces the body budget; this only keeps Node's buffer honest.
+      fromBorrower += data.length;
+      if (fromBorrower > MPC_MAX_FROM_BORROWER) return ws.close(1009, "too much data");
+      if (!child.stdin.destroyed && child.stdin.writable) child.stdin.write(data);
+      return;
+    }
+    reported = true;
+    recordPrivateResult(owner, caller, data.toString(), Date.now() - started);
+    if (exited) finish();
+  });
+  ws.on("close", () => {
+    child.stdin.end();
+    // The helper leaves on its own once its stdin ends; make sure of it.
+    setTimeout(() => {
+      if (child.exitCode === null) child.kill();
+    }, 5000).unref();
+    setTimeout(() => {
+      if (child.exitCode === null) {
+        console.log(`[pool] the MPC helper for ${caller} had to be killed`);
+        child.kill("SIGKILL");
+      }
+    }, 10_000).unref();
+  });
+  child.on("exit", (code) => {
+    exited = true;
+    child.stdout.resume();
+    if (code !== 0 && !ws.closed) ws.send(JSON.stringify({ type: "error", code: "helper", message: `The pool's MPC helper failed (exit ${code}).` }));
+    // The agent's report follows the helper's exit by a moment; don't wait forever for it.
+    if (reported || code !== 0) finish();
+    else setTimeout(finish, 10_000).unref();
+  });
+  ws.send(JSON.stringify({ type: "donor", owner }));
+}
+
+// What the borrower says Anthropic answered. Bounds match the direct-usage reports.
+function recordPrivateResult(owner: string, caller: string, text: string, elapsedMs: number): void {
+  let report: { type?: unknown; status?: unknown; model?: unknown; usd?: unknown; forMs?: unknown; message?: unknown };
+  try {
+    report = JSON.parse(text);
+  } catch {
+    return console.log(`[pool] ${caller} sent a malformed report for ${owner}'s token`);
+  }
+  const model = typeof report.model === "string" ? report.model.slice(0, 64) : undefined;
+  switch (report.type) {
+    case "result": {
+      const usd = typeof report.usd === "number" && Number.isFinite(report.usd) && report.usd >= 0 && report.usd <= 10 ? report.usd : 0;
+      if (usd > 0) ledger.record(owner, caller, usd);
+      console.log(`[pool] ${caller} ${model ?? "request"} ~$${usd.toFixed(4)} via ${owner}'s token, privately (${(elapsedMs / 1000).toFixed(1)} s)`);
+      return;
+    }
+    case "limit": {
+      const forMs = typeof report.forMs === "number" && Number.isFinite(report.forMs) && report.forMs > 0
+        ? Math.min(report.forMs, 6 * 60 * 60_000)
+        : LIMIT_COOLDOWN_MS;
+      ledger.park(owner, forMs);
+      console.log(`[pool] ${owner}'s token is at its usage limit (${caller} reports, privately); parked for ${Math.round(forMs / 60_000)} min`);
+      return;
+    }
+    case "dead":
+      ledger.park(owner, 24 * 60 * 60_000);
+      console.log(`[pool] ${owner}'s token is dead (${caller} got a 401, privately); parked for 24 h`);
+      return;
+    case "failed":
+      console.log(`[pool] ${caller}'s private borrow on ${owner}'s token failed: ${String(report.message ?? "").slice(0, 200)}`);
+      return;
+    default:
+      console.log(`[pool] ${caller} sent an unknown report type for ${owner}'s token`);
+  }
 }
 
 function round(usd: number): number {
@@ -911,11 +1056,34 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Private borrowing arrives as a WebSocket upgrade on /pool/borrow, with the same token.
+server.on("upgrade", (req, socket, head) => {
+  const refuse = (status: string) => {
+    socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
+    socket.destroy();
+  };
+  const caller = authenticate(req);
+  if (!caller) {
+    const client = clientId(req);
+    if (!isBlocked(client)) recordFailure(client);
+    return refuse("401 Unauthorized");
+  }
+  if (req.url?.split("?")[0] !== "/pool/borrow") return refuse("404 Not Found");
+  const ws = WebSocketConnection.accept(req, socket, head);
+  if (!ws) return;
+  ws.on("error", (err) => console.log(`[pool] ${caller}'s borrow socket: ${err.message}`));
+  borrowPrivately(ws, caller, new URL(req.url ?? "/", "http://pool")).catch((err) => {
+    console.error(err);
+    ws.close(1011);
+  });
+});
+
 const port = config.port ?? 8787;
 const host = config.host ?? "127.0.0.1";
-server.listen(port, host, () => console.log(`[pool] listening on http://${host}:${port} for ${Object.keys(users).join(", ")}`));
+server.listen(port, host, () => console.log(`[pool] listening on http://${host}:${port} for ${Object.keys(users).join(", ")}${mpcAvailable() ? ", private borrowing available" : ""}`));
 // Tailscale Funnel can only forward to localhost, so listen there too when it's in use.
 if (config.publicUrl && host !== "127.0.0.1" && host !== "0.0.0.0") {
   http.createServer(server.listeners("request")[0] as http.RequestListener)
+    .on("upgrade", server.listeners("upgrade")[0] as (...args: unknown[]) => void)
     .listen(port, "127.0.0.1", () => console.log(`[pool] also on http://127.0.0.1:${port} for ${config.publicUrl}`));
 }

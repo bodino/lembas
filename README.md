@@ -25,6 +25,16 @@ day, your unused capacity can help them.
   read, nobody borrows. Turn people off or adjust the limits in the app.
 - **Prompts stay home.** In the normal path only `{model, estimated USD}` leaves your
   Mac. Only borrowed requests pass through the pool.
+- **Private borrowing** (optional, ⚙ menu). With it on, a borrowed request goes through
+  a [spliced token record](docs/mpc-tls.md): your Mac runs the TLS session to Anthropic
+  and holds its keys alone, and the pool inserts the one record that carries the
+  lender's token, computed between the two so that the pool never sees the keys and
+  your Mac never sees the token. The pool can't read or change the request or the
+  answer. The switch is strict: if the pool can't lend privately, borrowing pauses
+  instead of falling back to the relay the pool can read. In return the pool has to
+  take your agent's word for what the request cost and whether it hit a limit, since
+  it can no longer see Anthropic's answer. About 0.1 s of overhead per request and
+  half a megabyte each way between your Mac and the pool.
 
 The pieces:
 
@@ -33,6 +43,7 @@ The pieces:
 | **lembas.app** | every member's Mac | Menu bar app: join with an invite code, connect your subscription, set who you lend to. |
 | **lembas-agent** | every member's Mac (a launchd job, run from `~/Library/Application Support/lembas`) | Local proxy on `127.0.0.1:8788` that Claude Code talks to: direct to Anthropic, pool only on usage limits. |
 | **pool** (`src/server.ts`) | one Mac in the group | Holds members' subscription access, decides who can lend right now, relays borrowed requests. |
+| **lembas-mpc** | inside lembas.app, and in `build/` next to the pool | The helper for private borrowing: one short-lived process per borrowed request on each side (`mpc-tls/`). |
 
 ## Joining a pool
 
@@ -75,8 +86,10 @@ bottom; one click updates and relaunches. Check where a download came from with
 ## Running a pool
 
 One person runs the pool on a Mac that's usually awake. Requirements: Node ≥ 22.18
-(the server has no npm dependencies), Tailscale, and Xcode with the macOS 26 SDK or
-newer to build the app.
+(the server has no npm dependencies), Tailscale, Xcode with the macOS 26 SDK or newer
+to build the app, and Rust via [rustup](https://rustup.rs) for the private-borrowing
+helper (`LEMBAS_SKIP_MPC=1 ./build.sh` builds without it; such a pool can't lend
+privately and members with the switch on see borrowing paused).
 
 1. Clone this repo and build the app (the pool serves it to joiners and offers each new
    build to members as an update):

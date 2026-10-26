@@ -1,0 +1,11 @@
+POST /v1/messages HTTP/1.1
+Host: api.anthropic.com
+Content-Length: {body_len}
+Authorization: Bearer {token}
+Connection: close
+Content-Type: application/json
+anthropic-version: 2023-06-01
+anthropic-beta: claude-code-20250219,oauth-2025-04-20
+user-agent: claude-cli/2.1.0 (external, cli)
+accept-encoding: identity
+

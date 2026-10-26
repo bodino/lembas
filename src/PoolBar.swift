@@ -31,6 +31,9 @@ struct Config: Codable {
   var url: String
   var token: String
   var agentPort: Int? // only set for profiles; the agent defaults to 8788
+  // Borrow over MPC-TLS, so the pool can't read my requests or the answers. The agent
+  // re-reads this per request (src/PrivateBorrow.swift).
+  var privateBorrowing: Bool?
 }
 
 // The pool rejected our token: we were removed, or left from another copy.
@@ -138,6 +141,8 @@ final class Store: ObservableObject {
   @Published var lastApplied: String?
   @Published var subscriptionConnected = false
   @Published var routedThroughPool = false
+  @Published var privateBorrowing = false
+  @Published var poolSupportsPrivate = false // the pool has the MPC helper
   @Published var connectHint: String?
   @Published private var savedSettings: [String] = []
 
@@ -173,8 +178,18 @@ final class Store: ObservableObject {
     if let data = try? Data(contentsOf: Self.configURL),
        let cfg = try? JSONDecoder().decode(Config.self, from: data) {
       config = cfg
+      privateBorrowing = cfg.privateBorrowing ?? false
       if !AppLocation.isTranslocated { Task { try? await ensureAgentInstalled() } }
     }
+  }
+
+  // Private borrowing is a strict switch: with it on, the agent never falls back to the
+  // relay the pool can read, so a pool without the helper means borrowing is paused.
+  func setPrivateBorrowing(_ on: Bool) {
+    guard var cfg = config else { return }
+    cfg.privateBorrowing = on
+    saveConfig(cfg)
+    privateBorrowing = on
   }
 
   private func number(_ value: Any?) -> Double {
@@ -353,6 +368,7 @@ final class Store: ObservableObject {
       let obj = try await request("GET", "/pool")
       me = obj["you"] as? String
       canInvite = obj["canInvite"] as? Bool ?? false
+      poolSupportsPrivate = obj["privateBorrowing"] as? Bool ?? false
       online = true
       loaded = true
       notAMemberStreak = 0
@@ -561,6 +577,8 @@ final class Store: ObservableObject {
   static let agentLabel = Profile.agentLabel
   static let agentPlist = Profile.agentPlist
   private var bundledAgent: String { Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/lembas-agent").path }
+  // The MPC-TLS helper for private borrowing, built by ./build.sh; a build without Rust has none.
+  private var bundledHelper: String { Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/lembas-mpc").path }
   // The agent runs from its own copy outside the app, so deleting lembas.app can't take
   // Claude Code down with it: the agent notices, retires safely, and removes this copy.
   private static let installedAgent = FileManager.default.homeDirectoryForCurrentUser
@@ -590,6 +608,14 @@ final class Store: ObservableObject {
       removexattr(installed.path, "com.apple.quarantine", 0)
       agentChanged = true
     }
+    // The helper sits next to the agent, where the agent looks for it by default.
+    let installedHelper = installed.deletingLastPathComponent().appendingPathComponent("lembas-mpc")
+    if FileManager.default.isExecutableFile(atPath: bundledHelper),
+       FileManager.default.contents(atPath: installedHelper.path) != FileManager.default.contents(atPath: bundledHelper) {
+      try? FileManager.default.removeItem(at: installedHelper)
+      try FileManager.default.copyItem(atPath: bundledHelper, toPath: installedHelper.path)
+      removexattr(installedHelper.path, "com.apple.quarantine", 0)
+    }
 
     let plist: [String: Any] = [
       "Label": Self.agentLabel,
@@ -601,6 +627,7 @@ final class Store: ObservableObject {
         "LEMBAS_CLAUDE_SETTINGS": Self.claudeSettings.path,
         "LEMBAS_AGENT_LABEL": Self.agentLabel,
         "LEMBAS_AGENT_PLIST": Self.agentPlist.path,
+        "LEMBAS_MPC_HELPER": installedHelper.path,
       ],
       "RunAtLoad": true,
       "KeepAlive": true,
@@ -1857,6 +1884,13 @@ struct MainView: View {
         if let me = store.me { Text("Signed in as \(prettyName(me))") }
         Button(store.subscriptionConnected ? "Reconnect Subscription…" : "Connect Subscription…") { store.runConnect() }
         Divider()
+        // Borrowed requests go through MPC-TLS: the pool lends the token but can't read
+        // the request or the answer. Strict: no fallback to the readable relay.
+        Toggle("Private Borrowing", isOn: Binding(get: { store.privateBorrowing }, set: { store.setPrivateBorrowing($0) }))
+        if store.privateBorrowing && store.online && !store.poolSupportsPrivate {
+          Text("Your pool can't lend privately yet, so borrowing is paused.")
+        }
+        Divider()
         Button("Check for Updates…") { Task { await store.checkForUpdate(force: true) } }
         Text("Version \(Store.currentVersion) (\(Store.currentBuild))")
         Divider()
@@ -1876,7 +1910,8 @@ struct MainView: View {
 
   private var subtitle: String {
     let who = store.me.map { prettyName($0) + " · " } ?? ""
-    return who + (store.routedThroughPool ? "Fallback on" : "Fallback off")
+    let mode = store.routedThroughPool ? (store.privateBorrowing ? "Fallback on · private" : "Fallback on") : "Fallback off"
+    return who + mode
   }
 }
 
