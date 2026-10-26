@@ -487,6 +487,45 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
    bounded at 90 s and ends the session, which the agent replaces. The control channel
    already gave up after 30 s, so the lease could not wedge in lembas, only the proof.
 
+37. **A task group is not a deadline.** (Third external review of lembas.) The agent's
+   `withTimeout` raced the operation against a sleep in a task group, and a group
+   returns only when every child has: the sleep could throw, but the caller still
+   waited for the operation to notice its cancellation. `URLSessionWebSocketTask.receive`
+   never does, so a pool that accepted the session and said nothing held the agent (and
+   the one session every borrow waits on) forever. The helper is now a plain race, two
+   tasks and a continuation, resolved at the deadline whatever the operation is doing,
+   with an `onTimeout` that closes the socket or cancels the WebSocket so the orphan
+   ends too. The response-head path was in fact fine (the stream reader honours
+   cancellation), but it gets the same treatment: the socket is shut at the deadline.
+
+38. **The build job had credentials.** The job that runs the tag's `build.sh` held an
+   OIDC token and `attestations: write`, and the checkout left the job token on disk,
+   so a malicious tag could attest an arbitrary artifact as this workflow's. The key was
+   never at risk (it lives in the approved job), but provenance was only as good as the
+   tag. The build job now runs with `persist-credentials: false` and nothing but
+   `contents: read`; the approved job attests what it downloaded, then signs.
+
+39. **Status fanned out to Anthropic.** Every `GET /pool` probed every member's usage
+   with no coalescing, so a burst of reads missed the cache together and became a
+   burst at an endpoint that rate-limits hard; one 429 cached as "unknown" for a minute
+   and nobody borrowed. Probes are single-flight per member, a probe whose login
+   changed meanwhile is discarded rather than cached against the new one, and reads
+   are limited per member (the app reads every 30 s). Verified with a counting fake
+   upstream: 25 concurrent reads, 2 probes.
+
+40. **A limiter that remembers the flood is part of it.** The write limiter appended
+   every attempt, denied ones included, and filtered the array each time; and the body
+   was read before the check. Fixed one-minute windows, one small record per key,
+   checked before the body; the same for the public pages per visitor (cached in
+   memory) and 1000 requests per kept-alive socket.
+
+41. **Small residues.** A fresh login is unparked; the token fallback re-reads the
+   current login instead of the one captured before the refresh; a dead session is
+   shut down before it is replaced; presence comes from a kept mark, not a log scan,
+   and the logs are capped per owner so one member's flood evicts only their own
+   history; the request line is checked for control bytes on both sides of the helper
+   and before it enters the pool's record.
+
 ## Open
 
 - **Memory.** About 165 MB per helper at steady state, mostly allocator high-water
