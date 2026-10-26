@@ -174,7 +174,8 @@ enum SubscriptionLogin {
 
   private static func randomBytes(_ count: Int) -> Data {
     var bytes = [UInt8](repeating: 0, count: count)
-    _ = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
+    // A PKCE verifier of zeros would be worse than no login at all.
+    precondition(SecRandomCopyBytes(kSecRandomDefault, count, &bytes) == errSecSuccess, "the system's random generator failed")
     return Data(bytes)
   }
 

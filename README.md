@@ -83,9 +83,10 @@ The **fallback** switch in the app header turns this off (direct only, no borrow
 **Updates** come only from this repository's GitHub releases, built by GitHub Actions
 from the public source, never from a pool, so whoever runs your pool can't ship code to
 your Mac. The app installs a release only if its `version.json` is signed by the lembas
-release key (Ed25519; the public half is pinned in the app, the private half is a
-secret of the release workflow), so neither can anyone who merely gets to publish a
-release. When a new release is out, lembas shows **Install latest build…** at the
+release key (Ed25519; the public half is pinned in the app, the private half lives in
+the workflow's `release` environment, which signs only after a reviewer approves and
+runs nothing from the tag's checkout), so neither can anyone who merely gets to
+publish a release or push a tag. When a new release is out, lembas shows **Install latest build…** at the
 bottom; one click updates and relaunches. Check where a download came from with
 `gh attestation verify lembas.zip --repo bodino/lembas`.
 

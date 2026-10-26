@@ -1,6 +1,6 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { accessSync, chmodSync, constants as fsConstants, fchmodSync, readFileSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants as fsConstants, fchmodSync, fstatSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { Ledger, type LendPolicy, type LendRule } from "./ledger.ts";
 import { WebSocketConnection } from "./ws.ts";
@@ -49,6 +49,8 @@ const LIMIT_COOLDOWN_MS = (config.limitCooldownMinutes ?? 20) * 60_000;
 // because Anthropic rate-limits the usage endpoint hard.
 const USAGE_CACHE_MS = (config.usageCacheSeconds ?? 60) * 1000;
 const BORROW_AT_PERCENT = config.borrowAtPercent ?? 90;
+// One usage fetch; lenders are probed in parallel, and the helper waits 30 s in all.
+const USAGE_TIMEOUT_MS = 6_000;
 // Members' requests to the pool carry JSON settings and reports, never model calls.
 const MAX_BODY = 64 * 1024;
 // A private session is closed after this long; the agent opens a fresh one, so the
@@ -81,13 +83,26 @@ const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 
 const refreshInFlight = new Map<string, Promise<string | null>>();
 
+// Which login a member's name currently stands for. Bumped when they deposit a new
+// login and when they are removed, so a refresh that started under the old one can't
+// write its result over the new one (or resurrect a removed member's tokens for a
+// newcomer with the same name).
+const oauthGeneration = new Map<string, number>();
+const generationOf = (name: string) => oauthGeneration.get(name) ?? 0;
+const newGeneration = (name: string) => oauthGeneration.set(name, generationOf(name) + 1);
+
 // Refresh a member's stored OAuth token (rotation: store the new refresh token).
 async function refreshOAuth(name: string): Promise<string | null> {
-  const existing = refreshInFlight.get(name);
+  const generation = generationOf(name);
+  const key = `${name}#${generation}`;
+  const existing = refreshInFlight.get(key);
   if (existing) return existing;
   const task = (async () => {
     const tokens = ledger.oauth(name);
     if (!tokens) return null;
+    // Still the same member and the same login once the network answers?
+    const unchanged = () => generationOf(name) === generation && Object.hasOwn(users, name)
+      && ledger.oauth(name)?.refreshToken === tokens.refreshToken;
     try {
       const res = await fetch(OAUTH_TOKEN_URL, {
         method: "POST",
@@ -100,6 +115,7 @@ async function refreshOAuth(name: string): Promise<string | null> {
         }),
         signal: AbortSignal.timeout(15_000),
       });
+      if (!unchanged()) return null; // someone else's result now; theirs is the one that counts
       if (res.status === 400 || res.status === 401) {
         // The refresh token itself was rejected (revoked, rotated elsewhere): this
         // login is gone and the member has to connect again.
@@ -112,6 +128,7 @@ async function refreshOAuth(name: string): Promise<string | null> {
       if (!body.access_token || !body.refresh_token) throw new Error("refresh response missing tokens");
       let expiresAt = body.expires_at ?? Date.now() + (body.expires_in ?? 3600) * 1000;
       if (expiresAt < 1e12) expiresAt *= 1000; // seconds -> ms
+      if (!unchanged()) return null;
       ledger.setOAuth(name, { accessToken: body.access_token, refreshToken: body.refresh_token, expiresAt });
       return body.access_token;
     } catch (err) {
@@ -119,10 +136,10 @@ async function refreshOAuth(name: string): Promise<string | null> {
       console.log(`[pool] ${name}'s OAuth refresh failed (${(err as Error).message}); keeping their login for now`);
       return null;
     } finally {
-      refreshInFlight.delete(name);
+      refreshInFlight.delete(key);
     }
   })();
-  refreshInFlight.set(name, task);
+  refreshInFlight.set(key, task);
   return task;
 }
 
@@ -179,26 +196,37 @@ async function probeUsage(name: string, maxAgeMs = USAGE_CACHE_MS): Promise<Usag
         "anthropic-beta": "oauth-2025-04-20",
         "content-type": "application/json",
       },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
     });
     status = res.status;
     if (res.ok) {
-      const body = (await res.json()) as Record<string, { utilization?: unknown; resets_at?: string; locked_reason?: unknown } | null>;
+      const body = (await res.json()) as Record<string, { utilization?: unknown; resets_at?: unknown; locked_reason?: unknown } | null>;
       const windows: Record<string, number> = {};
       let locked = false;
       for (const [key, value] of Object.entries(body)) {
         if (key === "extra_usage" || typeof value !== "object" || value === null) continue;
-        if (typeof value.utilization === "number" && Number.isFinite(value.utilization)) windows[key] = value.utilization;
+        if (typeof value.utilization === "number" && Number.isFinite(value.utilization)) {
+          windows[key] = Math.min(100, Math.max(0, value.utilization));
+        }
         if (value.locked_reason) locked = true;
       }
-      usage = {
-        fiveHour: windows.five_hour ?? 0,
-        sevenDay: windows.seven_day ?? 0,
-        resetsAt: body.five_hour?.resets_at ? Date.parse(body.five_hour.resets_at) : null,
-        sevenDayResetsAt: body.seven_day?.resets_at ? Date.parse(body.seven_day.resets_at) : null,
-        windows,
-        locked,
+      const when = (v: unknown) => {
+        const t = typeof v === "string" ? Date.parse(v) : NaN;
+        return Number.isFinite(t) ? t : null;
       };
+      // The two windows lending is measured against must be there as numbers; an
+      // answer of another shape (a changed API, a proxy page) is "unknown", not
+      // "idle", so nobody lends on it.
+      if ("five_hour" in windows && "seven_day" in windows) {
+        usage = {
+          fiveHour: windows.five_hour,
+          sevenDay: windows.seven_day,
+          resetsAt: when(body.five_hour?.resets_at),
+          sevenDayResetsAt: when(body.seven_day?.resets_at),
+          windows,
+          locked,
+        };
+      }
     }
   } catch {
     // Network or parse failure, or no credential; fall through with null.
@@ -270,6 +298,7 @@ async function availability(owner: string, consumer: string): Promise<Availabili
   if (ceiling5h <= 0) return { headroom: 0, reason: "off" };
   const usage = await fetchUtilization(owner);
   if (!usage) return { headroom: 0, reason: "unknown" };
+  if (usage.locked) return { headroom: 0, reason: "full" }; // Anthropic says no, whatever the numbers
   // What they allow minus what's used, per window. Room in both is required.
   const left5h = ceiling5h - usage.fiveHour;
   const leftWeek = policy.week - usage.sevenDay;
@@ -281,14 +310,9 @@ async function availability(owner: string, consumer: string): Promise<Availabili
 
 // Whoever is lending to `caller` right now, most headroom first.
 async function lenderOrder(caller: string): Promise<string[]> {
-  const donors: Array<[string, number]> = [];
-  for (const name of Object.keys(users)) {
-    if (name === caller) continue;
-    const { headroom } = await availability(name, caller);
-    if (headroom > 0) donors.push([name, headroom]);
-  }
-  donors.sort((a, b) => b[1] - a[1]);
-  return donors.map(([name]) => name);
+  const others = Object.keys(users).filter((name) => name !== caller);
+  const probed = await Promise.all(others.map(async (name): Promise<[string, number]> => [name, (await availability(name, caller)).headroom]));
+  return probed.filter(([, headroom]) => headroom > 0).sort((a, b) => b[1] - a[1]).map(([name]) => name);
 }
 
 // ---------- HTTP plumbing ----------
@@ -404,6 +428,13 @@ let nextLease = 1;
 // keeps one, and a restart may overlap the old one briefly), not a fleet.
 const MAX_SESSIONS_PER_MEMBER = 2;
 const AVOID_MS = 3 * 60_000;
+const MAX_REPORT = 4096;
+const MAX_REPORTS_PER_MINUTE = 300; // five Claude Code windows with background calls stay well under
+
+// For the log: a member-supplied string with nothing that could pass for another line.
+function safe(value: unknown, max = 200): string {
+  return String(value ?? "").replace(/[^\x20-\x7e]/g, "?").slice(0, max);
+}
 type PrivateSession = {
   caller: string;
   leases: Map<number, { owner: string; at: number }>;
@@ -418,7 +449,7 @@ function closeSessions(name: string, reason: string): void {
   for (const session of privateSessions.get(name) ?? []) {
     if (!session.ws.closed) {
       session.ws.send(JSON.stringify({ type: "error", code: "closed", message: reason }));
-      session.ws.close(1000);
+      session.ws.terminate(); // now, not after a close handshake an in-flight request could ride out
     }
   }
 }
@@ -484,12 +515,25 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
       const now = Date.now();
       const order = (await lenderOrder(caller)).filter((name) => (session.avoid.get(name) ?? 0) < now);
       if (order.length === 0) return controlSend({ type: "refuse", id, reason: "no_capacity" });
-      const owner = order[0];
-      const token = await anthropicToken(owner);
-      const req = nextLease++;
-      session.leases.set(req, { owner, at: now });
-      requests++;
-      controlSend({ type: "token", id, token, req });
+      for (const owner of order) {
+        let token: string;
+        try {
+          token = await anthropicToken(owner);
+        } catch (err) {
+          console.log(`[pool] ${owner} can't lend right now (${(err as Error).message}); trying the next lender`);
+          continue;
+        }
+        // The awaits above may have outlived the membership.
+        if (!Object.hasOwn(users, caller) || users[caller].token !== poolToken) {
+          controlSend({ type: "refuse", id, reason: "not_a_member" });
+          return fail("closed", "You are no longer a member of this pool.");
+        }
+        const req = nextLease++;
+        session.leases.set(req, { owner, at: now });
+        requests++;
+        return controlSend({ type: "token", id, token, req });
+      }
+      controlSend({ type: "refuse", id, reason: "no_capacity" });
     } catch (err) {
       controlSend({ type: "refuse", id, reason: `lender lookup failed: ${(err as Error).message}` });
     }
@@ -523,16 +567,28 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
   });
   ws.on("drain", () => child.stdout.resume());
   child.stdin.on("drain", () => ws.resume());
+  let reportsThisMinute = 0;
+  let reportMinute = 0;
   ws.on("message", (data: Buffer, isText: boolean) => {
-    if (!isText) {
+    if (isText) {
+      // A report is a line of JSON; anything bigger, or a flood of them, is not the agent.
+      if (data.length > MAX_REPORT) return ws.close(1009, "report too large");
+      const minute = Math.floor(Date.now() / 60_000);
+      if (minute !== reportMinute) {
+        reportMinute = minute;
+        reportsThisMinute = 0;
+      }
+      if (++reportsThisMinute > MAX_REPORTS_PER_MINUTE) return ws.close(1008, "too many reports");
+      void recordPrivateResult(session, data.toString());
+      return;
+    }
+    {
       // The helper bounds each request; this only keeps Node's buffer honest over a
       // long session.
       fromBorrower += data.length;
       if (fromBorrower > MPC_MAX_FROM_BORROWER) return ws.close(1009, "too much data");
       if (!child.stdin.destroyed && child.stdin.writable && !child.stdin.write(data)) ws.pause();
-      return;
     }
-    void recordPrivateResult(session, data.toString());
   });
   ws.on("close", () => {
     clearTimeout(lifetime);
@@ -583,7 +639,7 @@ async function recordPrivateResult(session: PrivateSession, text: string): Promi
   leases.delete(report.req as number);
   const owner = lease.owner;
   const elapsedMs = Date.now() - lease.at;
-  const model = typeof report.model === "string" ? report.model.slice(0, 64) : undefined;
+  const model = typeof report.model === "string" ? safe(report.model, 64) : undefined;
   switch (report.type) {
     case "result": {
       const usd = typeof report.usd === "number" && Number.isFinite(report.usd) && report.usd >= 0 && report.usd <= 10 ? report.usd : 0;
@@ -619,7 +675,7 @@ async function recordPrivateResult(session: PrivateSession, text: string): Promi
       return;
     }
     case "failed":
-      console.log(`[pool] ${caller}'s private request on ${owner}'s token failed: ${String(report.message ?? "").slice(0, 200)}`);
+      console.log(`[pool] ${caller}'s private request on ${owner}'s token failed: ${safe(report.message)}`);
       return;
     default:
       console.log(`[pool] ${caller} sent an unknown report type for ${owner}'s token`);
@@ -642,12 +698,11 @@ const isPercent = (value: unknown): value is number =>
 // Either part may be sent alone. lendTo is merged into the stored rules: members named
 // are set, members omitted keep their rule, so a partial update can't switch anyone on.
 // Send {"away": false, "working5h": 0} to turn someone off.
-async function setShare(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
+async function setShare(raw: Buffer, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { policy?: unknown; lendTo?: unknown };
   try {
-    body = JSON.parse((await readSmallBody(req, MAX_BODY)).toString());
+    body = JSON.parse(raw.toString());
 } catch (err) {
-    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", 'Send JSON like {"lendTo":{"max":{"away":true,"working5h":0}}}.');
   }
   const { policy, lendTo } = body;
@@ -695,12 +750,11 @@ async function setShare(req: http.IncomingMessage, res: http.ServerResponse, cal
 }
 
 // PUT /pool/presence {"away": true} — "I'm done for today"; {"away": false} — "I'm back".
-async function setPresence(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
+async function setPresence(raw: Buffer, res: http.ServerResponse, caller: string): Promise<void> {
   let away: unknown;
   try {
-    away = JSON.parse((await readSmallBody(req)).toString()).away;
+    away = JSON.parse(raw.toString()).away;
 } catch (err) {
-    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", 'Send {"away": true} or {"away": false}.');
   }
   if (typeof away !== "boolean") return sendError(res, 400, "invalid_request_error", "away must be true or false.");
@@ -712,12 +766,11 @@ async function setPresence(req: http.IncomingMessage, res: http.ServerResponse, 
 // The local fallback agent forwards normal traffic straight to Anthropic. These two
 // endpoints let it keep the pool's accounting in sync without prompts leaving the machine:
 // metered spend for calibration/allowances, and "my own token just hit its usage limit".
-async function reportDirectUsage(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
+async function reportDirectUsage(raw: Buffer, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { usd?: unknown; model?: unknown };
   try {
-    body = JSON.parse((await readSmallBody(req, MAX_BODY)).toString());
+    body = JSON.parse(raw.toString());
 } catch (err) {
-    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send {\"usd\": 0.0123}.");
   }
   const usd = body.usd;
@@ -730,12 +783,11 @@ async function reportDirectUsage(req: http.IncomingMessage, res: http.ServerResp
   sendJson(res, 200, { ok: true });
 }
 
-async function reportDirectLimit(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
+async function reportDirectLimit(raw: Buffer, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { forMs?: unknown };
   try {
-    body = JSON.parse((await readSmallBody(req, MAX_BODY)).toString());
+    body = JSON.parse(raw.toString());
 } catch (err) {
-    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send {\"forMs\": 60000}.");
   }
   const forMs = body.forMs;
@@ -744,6 +796,7 @@ async function reportDirectLimit(req: http.IncomingMessage, res: http.ServerResp
   }
   if (forMs === 0) ledger.unpark(caller);
   else ledger.park(caller, forMs);
+  usageCache.delete(caller); // the borrow gate must see the limit, not a minute-old number
   sendJson(res, 200, { ok: true, parkedUntil: ledger.parkedUntil(caller) });
 }
 
@@ -766,20 +819,22 @@ function serveInstaller(req: http.IncomingMessage, res: http.ServerResponse, fil
   }
 }
 
-async function setTokens(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
+async function setTokens(raw: Buffer, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { accessToken?: unknown; refreshToken?: unknown; expiresAt?: unknown };
   try {
-    body = JSON.parse((await readSmallBody(req, MAX_BODY)).toString());
+    body = JSON.parse(raw.toString());
 } catch (err) {
-    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send accessToken, refreshToken, expiresAt from the login flow.");
   }
   const { accessToken, refreshToken, expiresAt } = body;
-  if (typeof accessToken !== "string" || typeof refreshToken !== "string" || !accessToken || !refreshToken) {
-    return sendError(res, 400, "invalid_request_error", "accessToken and refreshToken must be non-empty strings.");
+  const tokenShape = /^[A-Za-z0-9._~+/=-]{20,4096}$/;
+  if (typeof accessToken !== "string" || typeof refreshToken !== "string" || !tokenShape.test(accessToken) || !tokenShape.test(refreshToken)) {
+    return sendError(res, 400, "invalid_request_error", "accessToken and refreshToken must be OAuth tokens.");
   }
-  let exp = typeof expiresAt === "number" ? expiresAt : Date.now() + 3_600_000;
+  let exp = typeof expiresAt === "number" && Number.isFinite(expiresAt) ? expiresAt : Date.now() + 3_600_000;
   if (exp < 1e12) exp *= 1000; // seconds -> ms
+  if (exp > Date.now() + 366 * 86_400_000) exp = Date.now() + 3_600_000; // nothing lives a year
+  newGeneration(caller);
   ledger.setOAuth(caller, { accessToken, refreshToken, expiresAt: exp });
   if (users[caller].invite || users[caller].claudeToken !== undefined) {
     delete users[caller].invite; // set up for real: their invite is used up
@@ -795,10 +850,8 @@ async function setTokens(req: http.IncomingMessage, res: http.ServerResponse, ca
 
 const FAILURE_WINDOW_MS = 10 * 60_000;
 const MAX_FAILURES_PER_CLIENT = 10;
-const MAX_FAILED_REDEEMS = 100; // across everyone: invite codes are the guessable secret
 const MAX_TRACKED_CLIENTS = 10_000;
 const failures = new Map<string, number[]>();
-let failedRedeems: number[] = [];
 
 // Funnel traffic arrives from tailscaled on loopback with the real client in
 // X-Forwarded-For; anything else is a direct tailnet connection. tailscaled is the
@@ -850,6 +903,16 @@ async function readSmallBody(req: http.IncomingMessage, limit = 4096): Promise<B
   return Buffer.concat(chunks);
 }
 
+const MAX_WRITES_PER_MINUTE = 120;
+const writes = new Map<string, number[]>();
+function allowWrite(caller: string): boolean {
+  const now = Date.now();
+  const recentWrites = (writes.get(caller) ?? []).filter((t) => t > now - 60_000);
+  recentWrites.push(now);
+  writes.set(caller, recentWrites);
+  return recentWrites.length <= MAX_WRITES_PER_MINUTE;
+}
+
 function isAdmin(name: string): boolean {
   return config.admins?.includes(name) ?? false;
 }
@@ -857,9 +920,13 @@ function isAdmin(name: string): boolean {
 const INVITE_TTL_MS = 7 * 86_400_000;
 const INVITE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"; // no 0/o, 1/l/i lookalikes
 
+// Written whole and renamed into place: a crash mid-write must not leave the one file
+// with every member's token half there. 0600 throughout.
 function saveConfig(): void {
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
-  chmodSync(CONFIG_PATH, 0o600); // holds everyone's tokens
+  const tmp = `${CONFIG_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, CONFIG_PATH);
 }
 
 // 16 characters from a 31-letter alphabet: ~79 bits, so guessing is hopeless even
@@ -876,22 +943,23 @@ function newInviteCode(): string {
 
 // Admins invite from the menu bar app. Nobody is added yet: the person only becomes a
 // member (and gets a pool token) when they redeem the short one-time code.
-async function invite(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
+async function invite(raw: Buffer, res: http.ServerResponse, caller: string): Promise<void> {
   if (!isAdmin(caller)) return sendError(res, 403, "permission_error", "Only pool admins can invite people.");
   let name: unknown;
   try {
-    name = JSON.parse((await readSmallBody(req, MAX_BODY)).toString()).name;
+    name = JSON.parse(raw.toString()).name;
 } catch (err) {
-    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send {\"name\": \"...\"}.");
   }
   if (typeof name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(name)) {
     return sendError(res, 400, "invalid_request_error", "Use a short lowercase name (letters, digits, - or _).");
   }
-  if (users[name]) return sendError(res, 409, "invalid_request_error", `${name} is already in the pool.`);
+  if (Object.hasOwn(users, name)) return sendError(res, 409, "invalid_request_error", `${name} is already in the pool.`);
   const now = Date.now();
-  // Drop expired invites, and any older invite for the same name: the newest code wins.
-  config.invites = Object.fromEntries(Object.entries(config.invites ?? {}).filter(([, i]) => i.expiresAt > now && i.name !== name));
+  // Drop expired or malformed invites, and any older invite for the same name: the
+  // newest code wins.
+  config.invites = Object.fromEntries(Object.entries(config.invites ?? {})
+    .filter(([code, i]) => findInvite(code) !== undefined && i.expiresAt > now && i.name !== name));
   const code = newInviteCode();
   config.invites[code] = { name, by: caller, expiresAt: now + INVITE_TTL_MS };
   saveConfig();
@@ -920,6 +988,7 @@ function findInvite(code: string): { name: string; by?: string; expiresAt: numbe
   if (typeof invite !== "object" || invite === null) return undefined;
   if (typeof invite.name !== "string" || !MEMBER_NAME.test(invite.name)) return undefined;
   if (typeof invite.expiresAt !== "number" || !Number.isFinite(invite.expiresAt)) return undefined;
+  if (invite.by !== undefined && (typeof invite.by !== "string" || !MEMBER_NAME.test(invite.by))) return undefined;
   return invite;
 }
 
@@ -1011,11 +1080,10 @@ function invitePage(req: http.IncomingMessage, res: http.ServerResponse, code: s
 
 // Unauthenticated by design: the invite code is the credential. It works once.
 async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  // Per client only: the codes have 79 bits, and a shared counter would let a few
+  // addresses lock everyone out of joining.
   const client = clientId(req);
-  failedRedeems = recent(failedRedeems);
-  if (isBlocked(client) || failedRedeems.length >= MAX_FAILED_REDEEMS) {
-    return sendError(res, 429, "rate_limit_error", "Too many attempts. Try again in a few minutes.");
-  }
+  if (isBlocked(client)) return sendError(res, 429, "rate_limit_error", "Too many attempts. Try again in a few minutes.");
   let code: unknown;
   try {
     code = JSON.parse((await readSmallBody(req)).toString()).code;
@@ -1027,7 +1095,6 @@ async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const invite = findInvite(key);
   if (!invite || invite.expiresAt < Date.now() || Object.hasOwn(users, invite.name)) {
     recordFailure(client);
-    failedRedeems.push(Date.now());
     return sendError(res, 404, "not_found_error", "This invite code is not valid. Ask for a new one.");
   }
   const token = `pool-${randomBytes(24).toString("hex")}`;
@@ -1045,6 +1112,7 @@ async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Prom
 // their subscription access (OAuth tokens), lending settings and presence are deleted.
 function forgetMember(name: string): void {
   closeSessions(name, "You are no longer a member of this pool.");
+  newGeneration(name);
   delete users[name];
   if (config.admins) config.admins = config.admins.filter((admin) => admin !== name);
   saveConfig();
@@ -1055,7 +1123,7 @@ function forgetMember(name: string): void {
 async function removeMember(res: http.ServerResponse, caller: string, name: string): Promise<void> {
   if (!isAdmin(caller)) return sendError(res, 403, "permission_error", "Only pool admins can remove people.");
   if (name === caller) return sendError(res, 400, "invalid_request_error", "You can't remove yourself.");
-  if (!users[name]) return sendError(res, 404, "not_found_error", `${name} is not in the pool.`);
+  if (!Object.hasOwn(users, name)) return sendError(res, 404, "not_found_error", `${name} is not in the pool.`);
   forgetMember(name);
   console.log(`[pool] ${caller} removed ${name}`);
   sendJson(res, 200, { ok: true });
@@ -1064,16 +1132,16 @@ async function removeMember(res: http.ServerResponse, caller: string, name: stri
 // POST /pool/leave — a member leaves on their own. The last admin can't, so a pool
 // always keeps someone who can invite and remove people.
 async function leavePool(res: http.ServerResponse, caller: string): Promise<void> {
-  const otherAdmins = (config.admins ?? []).filter((admin) => admin !== caller && users[admin]);
+  const otherAdmins = (config.admins ?? []).filter((admin) => admin !== caller && Object.hasOwn(users, admin));
   if (isAdmin(caller) && otherAdmins.length === 0) {
     return sendError(res, 400, "invalid_request_error", "You're this pool's only admin, so you can't leave it.");
   }
-  // Leaving during setup (never connected) gives the invite back, so the same link works
-  // again; once they've connected, it stays used.
+  // Leaving during setup gives the invite back, so the same link works again. The
+  // invite record is deleted the moment they connect (setTokens), so its presence is
+  // the durable "never set up" flag; a login cleared since then doesn't revive it.
   const pending = users[caller].invite;
-  const connected = Boolean(ledger.oauth(caller));
   forgetMember(caller);
-  if (pending && pending.expiresAt > Date.now() && !connected) {
+  if (pending && pending.expiresAt > Date.now()) {
     (config.invites ??= {})[pending.code] = { name: caller, by: pending.by, expiresAt: pending.expiresAt };
     saveConfig();
     console.log(`[pool] ${caller} went back during setup; their invite works again`);
@@ -1102,13 +1170,24 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.url === "/pool" && req.method === "GET") return sendJson(res, 200, await status(caller));
-    if (req.url === "/pool/tokens" && req.method === "PUT") return await setTokens(req, res, caller);
-    if (req.url === "/pool/share" && req.method === "PUT") return await setShare(req, res, caller);
-    if (req.url === "/pool/presence" && req.method === "PUT") return await setPresence(req, res, caller);
-    if (req.url === "/pool/report" && req.method === "PUT") return await reportDirectUsage(req, res, caller);
-    if (req.url === "/pool/limit" && req.method === "PUT") return await reportDirectLimit(req, res, caller);
-    if (req.url === "/pool/invite" && req.method === "POST") return await invite(req, res, caller);
-    if (req.url === "/pool/leave" && req.method === "POST") return await leavePool(res, caller);
+    // Everything that writes: the body first (bounded), then once more "still a
+    // member, same token?", since a removal may have landed while it uploaded. Writes
+    // are also rate-limited per member; the app and agent send a few a minute.
+    if (req.method === "PUT" || req.method === "POST") {
+      const token = users[caller].token;
+      const raw = await readSmallBody(req, MAX_BODY);
+      if (!Object.hasOwn(users, caller) || users[caller].token !== token) {
+        return sendError(res, 401, "authentication_error", "You are no longer a member of this pool.");
+      }
+      if (!allowWrite(caller)) return sendError(res, 429, "rate_limit_error", "Too many requests to the pool; slow down.");
+      if (req.url === "/pool/tokens" && req.method === "PUT") return await setTokens(raw, res, caller);
+      if (req.url === "/pool/share" && req.method === "PUT") return await setShare(raw, res, caller);
+      if (req.url === "/pool/presence" && req.method === "PUT") return await setPresence(raw, res, caller);
+      if (req.url === "/pool/report" && req.method === "PUT") return await reportDirectUsage(raw, res, caller);
+      if (req.url === "/pool/limit" && req.method === "PUT") return await reportDirectLimit(raw, res, caller);
+      if (req.url === "/pool/invite" && req.method === "POST") return await invite(raw, res, caller);
+      if (req.url === "/pool/leave" && req.method === "POST") return await leavePool(res, caller);
+    }
     const member = req.url?.match(/^\/pool\/members\/([a-z][a-z0-9_-]{0,31})$/);
     if (member && req.method === "DELETE") return await removeMember(res, caller, member[1]);
     // Model calls used to be relayed here with a lender's token, readable by the pool.
@@ -1158,17 +1237,32 @@ server.on("upgrade", (req, socket, head) => {
 
 const port = config.port ?? 8787;
 const host = config.host ?? "127.0.0.1";
-// The log names members and what they borrow; when it is a file, keep it to this user.
+// The log names members and what they borrow; when stdout is a regular file (launchd's
+// StandardOutPath), keep it to this user. A terminal, pipe or device is left alone.
 try {
-  fchmodSync(1, 0o600);
+  if (fstatSync(1).isFile()) fchmodSync(1, 0o600);
 } catch {
-  // A terminal or a pipe: nothing to protect.
+  // Nothing to protect.
 }
+// Slow clients on the public listener can't hold connections open for free.
+server.headersTimeout = 15_000;
+server.requestTimeout = 30_000;
+server.maxConnections = 512;
+server.on("error", (err) => {
+  console.log(`[pool] cannot listen on ${host}:${port}: ${err.message}`);
+  process.exit(1);
+});
 if (!mpcAvailable()) console.log(`[pool] WARNING: no MPC helper at ${MPC_HELPER}; this pool cannot lend until ./build.sh has built it`);
 server.listen(port, host, () => console.log(`[pool] listening on http://${host}:${port} for ${Object.keys(users).join(", ")}; borrowing needs a member's own login at ${BORROW_AT_PERCENT}%`));
-// Tailscale Funnel can only forward to localhost, so listen there too when it's in use.
-if (config.publicUrl && host !== "127.0.0.1" && host !== "0.0.0.0") {
-  http.createServer(server.listeners("request")[0] as http.RequestListener)
-    .on("upgrade", server.listeners("upgrade")[0] as (...args: unknown[]) => void)
-    .listen(port, "127.0.0.1", () => console.log(`[pool] also on http://127.0.0.1:${port} for ${config.publicUrl}`));
+// Tailscale Funnel can only forward to localhost, so listen there too when it's in use
+// and the main listener doesn't already cover loopback.
+const coversLoopback = ["127.0.0.1", "0.0.0.0", "::", "localhost", "::1"].includes(host);
+if (config.publicUrl && !coversLoopback) {
+  const local = http.createServer(server.listeners("request")[0] as http.RequestListener);
+  local.headersTimeout = server.headersTimeout;
+  local.requestTimeout = server.requestTimeout;
+  local.maxConnections = server.maxConnections;
+  local.on("upgrade", server.listeners("upgrade")[0] as (...args: unknown[]) => void);
+  local.on("error", (err) => console.log(`[pool] cannot also listen on 127.0.0.1:${port} for ${config.publicUrl}: ${err.message}`));
+  local.listen(port, "127.0.0.1", () => console.log(`[pool] also on http://127.0.0.1:${port} for ${config.publicUrl}`));
 }

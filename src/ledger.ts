@@ -57,6 +57,9 @@ export class Ledger {
       }
     }
     this.pruneLog();
+    // Pruning is periodic, not per record, so a member looping reports can't make
+    // every write scan both logs; the logs are also capped outright.
+    setInterval(() => this.pruneLog(), 60_000).unref();
   }
 
   lendRule(owner: string, consumer: string): LendRule {
@@ -147,10 +150,12 @@ export class Ledger {
       .map((e) => e.usd));
   }
 
+  private static readonly MAX_LOG = 200_000;
+
   private pruneLog(now = Date.now()): void {
     const cutoff = now - 8 * 86_400_000; // weekly caps need at most 7 days of history
-    this.state.borrowLog = this.state.borrowLog.filter((e) => e.t >= cutoff);
-    this.state.usageLog = this.state.usageLog.filter((e) => e.t >= cutoff);
+    this.state.borrowLog = this.state.borrowLog.filter((e) => e.t >= cutoff).slice(-Ledger.MAX_LOG);
+    this.state.usageLog = this.state.usageLog.filter((e) => e.t >= cutoff).slice(-Ledger.MAX_LOG);
   }
 
   // Forget everything tied to a member who left the pool. Spend history and logs stay,
@@ -205,7 +210,7 @@ export class Ledger {
     const t = Date.now();
     this.state.usageLog.push({ t, owner, consumer, usd });
     if (consumer !== owner) this.state.borrowLog.push({ t, owner, consumer, usd });
-    this.pruneLog();
+    if (this.state.usageLog.length > Ledger.MAX_LOG || this.state.borrowLog.length > Ledger.MAX_LOG) this.pruneLog();
     this.save();
   }
 
@@ -230,8 +235,13 @@ export class Ledger {
   private saveNow(): void {
     clearTimeout(this.saveTimer);
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
-    renameSync(tmp, this.path);
+    try {
+      writeFileSync(tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
+      renameSync(tmp, this.path);
+    } catch (err) {
+      // A full disk must not take the pool down from a timer; the next write retries.
+      console.log(`[pool] could not save ${this.path}: ${(err as Error).message}`);
+    }
   }
 }
 

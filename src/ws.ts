@@ -82,6 +82,14 @@ export class WebSocketConnection extends EventEmitter {
     this.socket.once("close", () => clearTimeout(timer));
   }
 
+  // Drops the connection now, no close handshake: for a peer who is no longer a member.
+  terminate(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.socket.destroy();
+    this.emit("close", 1006);
+  }
+
   pause(): void { this.socket.pause(); }
   resume(): void { this.socket.resume(); }
 

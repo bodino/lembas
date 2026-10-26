@@ -159,12 +159,17 @@ enum Cmd {
     /// stdin/stdout, a local HTTP/1.1 port where each request becomes a
     /// borrowed request.
     Proxy {
-        /// Local address to serve HTTP on; port 0 picks a free one.
-        #[arg(long, default_value = "127.0.0.1:0")]
+        /// Local TCP address to serve HTTP on; port 0 picks a free one. For tests:
+        /// every process on the machine can reach a loopback port.
+        #[arg(long, default_value = "127.0.0.1:0", conflicts_with = "socket")]
         listen: String,
         /// Where to write the port actually bound, for the parent.
         #[arg(long)]
         port_file: Option<PathBuf>,
+        /// Serve on a Unix socket at this path instead (created 0600; put it in a
+        /// directory only this user can enter).
+        #[arg(long)]
+        socket: Option<PathBuf>,
         /// Name to verify the server's certificate for.
         #[arg(long, default_value = "api.anthropic.com")]
         server_name: String,
@@ -294,23 +299,36 @@ async fn run() -> Result<()> {
         Cmd::Proxy {
             listen,
             port_file,
+            socket,
             server_name,
             roots,
             token_len,
             stdio: _,
         } => {
-            let listener = TcpListener::bind(&listen).await?;
-            let port = listener.local_addr()?.port();
-            if let Some(path) = port_file {
-                std::fs::write(&path, format!("{port}\n")).with_context(|| format!("writing {}", path.display()))?;
-            }
+            let listener = match &socket {
+                Some(path) => {
+                    let _ = std::fs::remove_file(path);
+                    let listener = tokio::net::UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+                    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                    lembas_mpc::local::LocalListener::Unix(listener)
+                }
+                None => {
+                    let listener = TcpListener::bind(&listen).await?;
+                    if let Some(path) = &port_file {
+                        let port = listener.local_addr()?.port();
+                        std::fs::write(path, format!("{port}\n")).with_context(|| format!("writing {}", path.display()))?;
+                    }
+                    lembas_mpc::local::LocalListener::Tcp(listener)
+                }
+            };
+            let where_ = listener.describe();
             let io = stdio_link();
             let link = link(io.compat())?;
             let driver = tokio::spawn(link.driver);
             let session = Arc::new(
                 Session::start(link.mpc, link.up, link.down, &roots.store()?, &server_name, token_len).await?,
             );
-            info!("proxy: session ready, serving on 127.0.0.1:{port}");
+            info!("proxy: session ready, serving on {where_}");
             tokio::select! {
                 r = serve_local(session.clone(), listener) => r?,
                 r = driver => {

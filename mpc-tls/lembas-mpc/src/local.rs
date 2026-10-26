@@ -9,15 +9,21 @@ use std::sync::{
 
 use anyhow::{Context as _, Result, bail, ensure};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{TcpListener, UnixListener},
+    sync::Semaphore,
 };
 use tracing::{debug, info, warn};
 
-use crate::{MAX_BODY_LEN, session::{Refused, Session}};
+use crate::{MAX_BODY_LEN, is_header_name, session::{Refused, Session}};
 
 /// Largest request head the local proxy accepts.
 const MAX_HEAD: usize = 64 << 10;
+/// Clients served at once; the rest wait in the accept queue. The session has
+/// at most 16 connections to the server anyway.
+const MAX_CLIENTS: usize = 32;
+/// Body bytes read per step: a declared 64 MB body is not allocated up front.
+const BODY_CHUNK: usize = 64 << 10;
 /// How long a client may take between bytes of its request before the proxy
 /// drops it. The client is the agent on this machine; a stall means it died
 /// mid-upload.
@@ -239,13 +245,57 @@ fn take_line(line: &mut Vec<u8>, bytes: &[u8]) -> (usize, bool) {
 /// (`x-lembas-request`, the pool's number for the request, so the client can
 /// report its outcome to the pool), and the connection is closed after it, so
 /// a client reading to the end of the stream needs no framing of its own.
-pub async fn serve_local(session: Arc<Session>, listener: TcpListener) -> Result<()> {
-    info!("proxy: listening on {}", listener.local_addr()?);
+///
+/// Where it listens matters: a TCP port on loopback is reachable by every
+/// process of every user on the machine, and the session spends a lender's
+/// quota. In lembas the agent gives it a Unix socket in a directory only this
+/// user can enter; the TCP form is for tests and the chat.
+pub enum LocalListener {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+/// A client connection of either kind.
+pub type LocalStream = Box<dyn AsyncReadWrite + Send + Unpin>;
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
+
+impl LocalListener {
+    async fn accept(&self) -> Result<(LocalStream, String)> {
+        match self {
+            LocalListener::Tcp(l) => {
+                let (stream, peer) = l.accept().await?;
+                stream.set_nodelay(true)?;
+                Ok((Box::new(stream), peer.to_string()))
+            }
+            LocalListener::Unix(l) => {
+                let (stream, _) = l.accept().await?;
+                Ok((Box::new(stream), "local".into()))
+            }
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            LocalListener::Tcp(l) => l.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+            LocalListener::Unix(l) => l
+                .local_addr()
+                .ok()
+                .and_then(|a| a.as_pathname().map(|p| p.display().to_string()))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+pub async fn serve_local(session: Arc<Session>, listener: LocalListener) -> Result<()> {
+    info!("proxy: listening on {}", listener.describe());
+    let clients = Arc::new(Semaphore::new(MAX_CLIENTS));
     loop {
+        let permit = clients.clone().acquire_owned().await?;
         let (stream, peer) = listener.accept().await?;
-        stream.set_nodelay(true)?;
         let session = session.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = serve_client(session, stream).await {
                 debug!("proxy: client {peer}: {e:#}");
             }
@@ -253,14 +303,15 @@ pub async fn serve_local(session: Arc<Session>, listener: TcpListener) -> Result
     }
 }
 
-async fn serve_client(session: Arc<Session>, stream: TcpStream) -> Result<()> {
-    let (rd, mut wr) = stream.into_split();
+async fn serve_client(session: Arc<Session>, stream: LocalStream) -> Result<()> {
+    let (rd, mut wr) = tokio::io::split(stream);
     let mut rd = BufReader::new(rd);
     let result = async {
-        // The head.
+        // The head, never more than MAX_HEAD bytes in memory however long a line is.
         let mut head = Vec::new();
         loop {
-            let n = tokio::time::timeout(CLIENT_IDLE_TIMEOUT, rd.read_until(b'\n', &mut head))
+            let room = (MAX_HEAD + 1 - head.len()) as u64;
+            let n = tokio::time::timeout(CLIENT_IDLE_TIMEOUT, (&mut rd).take(room).read_until(b'\n', &mut head))
                 .await
                 .context("client stalled sending its request head")??;
             if n == 0 {
@@ -278,15 +329,16 @@ async fn serve_client(session: Arc<Session>, stream: TcpStream) -> Result<()> {
                 return Ok(());
             }
         };
-        let mut body = vec![0u8; body_len];
-        let mut filled = 0;
-        while filled < body_len {
-            let n = tokio::time::timeout(CLIENT_IDLE_TIMEOUT, rd.read(&mut body[filled..]))
+        let mut body = Vec::with_capacity(body_len.min(BODY_CHUNK));
+        let mut buf = vec![0u8; BODY_CHUNK];
+        while body.len() < body_len {
+            let want = (body_len - body.len()).min(BODY_CHUNK);
+            let n = tokio::time::timeout(CLIENT_IDLE_TIMEOUT, rd.read(&mut buf[..want]))
                 .await
                 .context("client stalled sending its request body")?
                 .context("reading the request body")?;
             ensure!(n > 0, "client closed with the body incomplete");
-            filled += n;
+            body.extend_from_slice(&buf[..n]);
         }
 
         let req = Arc::new(AtomicU64::new(0));
@@ -349,10 +401,14 @@ fn parse_request(head: &[u8]) -> Result<(String, usize)> {
     let mut body_len = None;
     let mut rest = String::new();
     for line in lines {
+        // One field per line, the name a bare token: no folded continuation lines,
+        // no stray CR or LF, nothing a server could read as a different header.
+        ensure!(!line.contains(['\r', '\n']), "header line with a stray CR or LF");
+        ensure!(!line.starts_with([' ', '\t']), "header line starts with whitespace");
         let (name, value) = line.split_once(':').context("malformed header line")?;
-        let lname = name.trim().to_ascii_lowercase();
+        ensure!(is_header_name(name), "malformed header name");
+        let lname = name.to_ascii_lowercase();
         let value = value.trim();
-        ensure!(!value.contains(['\r', '\n']), "header value with a line break");
         if lname == "content-length" {
             body_len = Some(crate::parse_length(value)?);
         }
@@ -362,7 +418,7 @@ fn parse_request(head: &[u8]) -> Result<(String, usize)> {
         if DROPPED.contains(&lname.as_str()) || DROPPED_PREFIXES.iter().any(|p| lname.starts_with(p)) {
             continue;
         }
-        rest.push_str(name.trim());
+        rest.push_str(name);
         rest.push_str(": ");
         rest.push_str(value);
         rest.push_str("\r\n");

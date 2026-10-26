@@ -167,8 +167,11 @@ pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &st
             ensure!(line.matches(' ').count() == 2, "malformed request line");
             continue;
         }
+        ensure!(!line.contains(['\r', '\n']), "header line with a stray CR or LF");
+        ensure!(!line.starts_with([' ', '\t']), "header line starts with whitespace");
         let (name, value) = line.split_once(':').context("malformed header line")?;
-        let name = name.trim().to_ascii_lowercase();
+        ensure!(is_header_name(name), "malformed header name");
+        let name = name.to_ascii_lowercase();
         ensure!(names.insert(name.clone()), "header {name} appears twice");
         let value = value.trim_start();
         let value_start = line_range.start + (line.len() - value.len());
@@ -215,6 +218,15 @@ pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &st
 /// A `Content-Length` value: decimal digits and nothing else. Rust's integer
 /// parser would also take a leading `+`, which is the kind of thing two HTTP
 /// parsers disagree on.
+/// An HTTP header field name as RFC 9110 defines it: a non-empty token, no
+/// whitespace anywhere, so nothing can be read as two names or hide a colon.
+pub fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 pub fn parse_length(value: &str) -> Result<usize> {
     ensure!(
         !value.is_empty() && value.len() <= 18 && value.bytes().all(|b| b.is_ascii_digit()),

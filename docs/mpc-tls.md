@@ -268,9 +268,10 @@ one helper per borrowing member.
 - **Helpers.** The pool spawns `pool --stdio --control-fd 3` per member session,
   pipes the WebSocket to its stdin/stdout, and answers its `need_token` lines on fd 3
   with a lender's freshly refreshed token and a request number (or `refuse`). The agent
-  spawns `proxy --stdio --listen 127.0.0.1:0 --port-file …` once, bridges its
-  stdin/stdout to the WebSocket, and sends each Claude Code request to the local port
-  as plain HTTP (Claude Code's headers minus the per-hop ones, the two beta flags, a
+  spawns `proxy --stdio --socket <dir>/sock` once (a Unix socket in a 0700 directory:
+  a loopback port would be open to every process of every user on the Mac, and the
+  session spends a lender's quota), bridges its stdin/stdout to the WebSocket, and
+  sends each Claude Code request to the socket as plain HTTP (Claude Code's headers minus the per-hop ones, the two beta flags, a
   Claude Code user agent); the helper puts the request line, `Host`, `Content-Length`
   and the Authorization line in the pool's record and sends the rest itself. The
   response comes back as the server sent it, one connection per request, and the agent

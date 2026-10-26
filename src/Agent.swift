@@ -184,6 +184,8 @@ final class Agent {
   // this loopback port; model calls are JSON.
   func fromClaudeCode(_ req: HTTPRequest) -> Bool {
     if req.header("origin") != nil || req.header("referer") != nil { return false }
+    // Browsers mark every request they make, even a GET with no referrer; Claude Code never does.
+    if req.header("sec-fetch-site") != nil || req.header("sec-fetch-mode") != nil { return false }
     let hosts: Set<String> = ["127.0.0.1:\(port)", "localhost:\(port)", "[::1]:\(port)"]
     guard let host = req.header("host"), hosts.contains(host.lowercased()) else { return false }
     if req.method == "POST", !(req.header("content-type") ?? "").lowercased().hasPrefix("application/json") { return false }

@@ -122,7 +122,7 @@ actor PrivateSessions {
 }
 
 final class PrivateSession {
-  let port: UInt16
+  let socketPath: String
   private let ws: URLSessionWebSocketTask
   private let helper: Process
   private let dir: URL
@@ -132,9 +132,9 @@ final class PrivateSession {
 
   var alive: Bool { liveness.alive && helper.isRunning }
 
-  private init(port: UInt16, ws: URLSessionWebSocketTask, helper: Process, dir: URL,
+  private init(socketPath: String, ws: URLSessionWebSocketTask, helper: Process, dir: URL,
                inbound: Task<Void, Error>, outbound: Task<Void, Error>, liveness: Liveness) {
-    self.port = port
+    self.socketPath = socketPath
     self.ws = ws
     self.helper = helper
     self.dir = dir
@@ -159,7 +159,7 @@ final class PrivateSession {
     let ws = session.webSocketTask(with: wsRequest)
     ws.maximumMessageSize = 64 << 20
     ws.resume()
-    guard case .string(let first) = try await ws.receive(),
+    guard case .string(let first) = try await withTimeout(sessionStartTimeout, "the pool's session greeting", { try await ws.receive() }),
           let hello = try? JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any] else {
       ws.cancel(with: .protocolError, reason: nil)
       throw PrivateBorrowError.pool("expected a session greeting first")
@@ -171,15 +171,19 @@ final class PrivateSession {
     }
 
     // 2. The helper. Its stdin/stdout are the link to the pool; it serves requests on
-    //    a local port it writes to a file; its logs join ours.
+    //    a Unix socket in a directory only this user can enter (a loopback TCP port
+    //    would be open to every process of every user on the Mac, and the session
+    //    spends a lender's quota); its logs join ours.
     let fm = FileManager.default
-    let dir = fm.temporaryDirectory.appendingPathComponent("lembas-session-\(UUID().uuidString)")
+    // Short names: a Unix socket path must fit in 104 bytes, and the per-user temporary
+    // directory already takes about half of that.
+    let dir = fm.temporaryDirectory.appendingPathComponent("lembas-\(UUID().uuidString.prefix(8))")
     try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-    let portFile = dir.appendingPathComponent("port")
+    let socketPath = dir.appendingPathComponent("s").path
+    guard socketPath.utf8.count < 100 else { throw PrivateBorrowError.helper("temporary directory path too long for a socket: \(socketPath)") }
     let helper = Process()
     helper.executableURL = URL(fileURLWithPath: mpcHelperPath)
-    helper.arguments = ["proxy", "--stdio", "--listen", "127.0.0.1:0", "--port-file", portFile.path,
-                        "--server-name", anthropicHost]
+    helper.arguments = ["proxy", "--stdio", "--socket", socketPath, "--server-name", anthropicHost]
     helper.environment = ["RUST_LOG": env["LEMBAS_MPC_LOG"] ?? "warn"]
     let toHelper = Pipe(), fromHelper = Pipe()
     helper.standardInput = toHelper
@@ -210,21 +214,29 @@ final class PrivateSession {
       }
     }
     let outbound = Task {
-      for await chunk in chunks(of: fromHelper.fileHandleForReading) { try await ws.send(.data(chunk)) }
+      do {
+        for await chunk in chunks(of: fromHelper.fileHandleForReading) { try await ws.send(.data(chunk)) }
+      } catch {
+        // The pool can't hear us any more: the session is over, not merely quiet.
+        log("private borrow: link to the pool failed: \(error.localizedDescription)")
+        liveness.end()
+        ws.cancel(with: .goingAway, reason: nil)
+        throw error
+      }
     }
 
-    // 4. The port, once the helper has set up with the pool.
+    // 4. The socket, once the helper has set up with the pool.
     let deadline = Date().addingTimeInterval(sessionStartTimeout)
-    var port: UInt16?
-    while port == nil {
-      if let text = try? String(contentsOf: portFile, encoding: .utf8), let p = UInt16(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
-        port = p
+    var ready = false
+    while !ready {
+      if fm.fileExists(atPath: socketPath) {
+        ready = true
         break
       }
       guard helper.isRunning, liveness.alive, Date() < deadline else { break }
       try await Task.sleep(nanoseconds: 50_000_000)
     }
-    guard let port else {
+    guard ready else {
       inbound.cancel()
       outbound.cancel()
       if helper.isRunning { helper.terminate() }
@@ -232,8 +244,8 @@ final class PrivateSession {
       try? fm.removeItem(at: dir)
       throw PrivateBorrowError.helper("session did not come up")
     }
-    log("private borrow: session ready on 127.0.0.1:\(port)")
-    return PrivateSession(port: port, ws: ws, helper: helper, dir: dir, inbound: inbound, outbound: outbound, liveness: liveness)
+    log("private borrow: session ready on \(socketPath)")
+    return PrivateSession(socketPath: socketPath, ws: ws, helper: helper, dir: dir, inbound: inbound, outbound: outbound, liveness: liveness)
   }
 
   // One request through the helper's local port.
@@ -242,7 +254,7 @@ final class PrivateSession {
     var bytes = Data(try PrivateSession.requestHead(for: request).utf8)
     bytes.append(request.body)
 
-    let fd = try connectLocal(port)
+    let fd = try connectLocal(socketPath)
     // Owns the descriptor; the reader task below keeps it until EOF or we return.
     let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     let writer = Task.detached {
@@ -251,7 +263,11 @@ final class PrivateSession {
     var response = HTTPResponseReader(chunks(of: handle))
     let head: HTTPURLResponse
     do {
-      head = try await response.head(url: URL(string: "https://\(anthropicHost)\(request.path)")!)
+      // The helper answers within its own limits (90 s to splice, 10 min idle on a
+      // response); past that the session is wedged, and the request must not hang.
+      head = try await withTimeout(responseHeadTimeout, "the response head", {
+        try await response.head(url: URL(string: "https://\(anthropicHost)\(request.path)")!)
+      })
     } catch {
       writer.cancel()
       if !alive { throw PrivateBorrowError.helper("session ended: \(error)") }
@@ -301,8 +317,9 @@ final class PrivateSession {
           pending.append(chunk)
           if pending.last == 0x0A || pending.count >= 16 << 10 {
             tap.push(pending)
-            guard await out.chunk(pending) else { break }
-            pending.removeAll(keepingCapacity: true)
+            let delivered = await out.chunk(pending)
+            pending.removeAll(keepingCapacity: true) // metered once, whether or not it was delivered
+            guard delivered else { break }
           }
         }
       } catch {
@@ -364,24 +381,52 @@ final class PrivateSession {
 }
 
 // A TCP connection to the helper's local port.
-func connectLocal(_ port: UInt16) throws -> Int32 {
-  let fd = socket(AF_INET, SOCK_STREAM, 0)
+// How long a borrowed request may take to produce its response head: the helper's own
+// splice and response limits, with a margin.
+let responseHeadTimeout: TimeInterval = 700
+
+struct TimedOut: Error, CustomStringConvertible {
+  let what: String
+  var description: String { "timed out waiting for \(what)" }
+}
+
+func withTimeout<T: Sendable>(_ seconds: TimeInterval, _ what: String, _ op: @escaping @Sendable () async throws -> T) async throws -> T {
+  try await withThrowingTaskGroup(of: T.self) { group in
+    group.addTask { try await op() }
+    group.addTask {
+      try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+      throw TimedOut(what: what)
+    }
+    let first = try await group.next()!
+    group.cancelAll()
+    return first
+  }
+}
+
+// The helper's Unix socket in the session directory (0700, this user only).
+func connectLocal(_ path: String) throws -> Int32 {
+  let fd = socket(AF_UNIX, SOCK_STREAM, 0)
   guard fd >= 0 else { throw PrivateBorrowError.helper("socket: \(String(cString: strerror(errno)))") }
-  var addr = sockaddr_in()
-  addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-  addr.sin_family = sa_family_t(AF_INET)
-  addr.sin_port = port.bigEndian
-  addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+  var addr = sockaddr_un()
+  addr.sun_family = sa_family_t(AF_UNIX)
+  let bytes = Array(path.utf8)
+  guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else {
+    close(fd)
+    throw PrivateBorrowError.helper("session socket path too long")
+  }
+  withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+    raw.copyBytes(from: bytes)
+    raw[bytes.count] = 0
+  }
+  addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
   let rc = withUnsafePointer(to: &addr) {
-    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
   }
   guard rc == 0 else {
     let message = String(cString: strerror(errno))
     close(fd)
     throw PrivateBorrowError.helper("connecting to the session: \(message)")
   }
-  var one: Int32 = 1
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
   return fd
 }
 
