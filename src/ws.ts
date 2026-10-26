@@ -41,6 +41,8 @@ export class WebSocketConnection extends EventEmitter {
 
   // Answers the upgrade; returns undefined (socket closed) if it isn't a WebSocket request.
   static accept(req: IncomingMessage, socket: Duplex, head: Buffer): WebSocketConnection | undefined {
+    // Ours from here on: an error on a peer that already left must not go unhandled.
+    socket.on("error", () => {});
     const key = req.headers["sec-websocket-key"];
     // The key is 16 random bytes in base64: 22 characters and two pads.
     if (req.headers.upgrade?.toLowerCase() !== "websocket" || typeof key !== "string" || !/^[A-Za-z0-9+/]{22}==$/.test(key) ||

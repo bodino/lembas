@@ -281,8 +281,10 @@ final class PrivateSession {
     do {
       // The helper answers within its own limits (90 s to splice, 10 min idle on a
       // response); past that the session is wedged, and the request must not hang.
+      // The path was checked when the request head was built, so this URL exists.
+      let url = URL(string: "https://\(anthropicHost)\(request.path)") ?? URL(string: "https://\(anthropicHost)/")!
       head = try await withTimeout(responseHeadTimeout, "the response head", onTimeout: { _ = Darwin.shutdown(fd, SHUT_RDWR) }, {
-        try await response.head(url: URL(string: "https://\(anthropicHost)\(request.path)")!)
+        try await response.head(url: url)
       })
     } catch {
       writer.cancel()
@@ -360,9 +362,11 @@ final class PrivateSession {
     // Both come from Claude Code's request line, but they go into the pool's record as
     // text: a method that is a token and a path of visible ASCII, or nothing.
     guard !request.method.isEmpty, request.method.utf8.allSatisfy({ $0 >= 0x41 && $0 <= 0x5a }),
-          request.path.hasPrefix("/"), request.path.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7f }) else {
+          request.path.hasPrefix("/"), request.path.utf8.allSatisfy(urlPathByte),
+          let url = URL(string: "https://\(anthropicHost)\(request.path)") else {
       throw PrivateBorrowError.template("bad request line")
     }
+    _ = url
     let line = "\(request.method) \(request.path) HTTP/1.1\r\n"
     guard line.utf8.count <= maxRequestLine else {
       throw PrivateBorrowError.template("request line too long for private borrowing (\(line.utf8.count) bytes)")
@@ -488,6 +492,13 @@ func sweepStaleSessionDirectories() {
     }
     try? fm.removeItem(at: dir)
   }
+}
+
+// A byte a URL path or query may carry (RFC 3986 unreserved, reserved and %): what
+// Claude Code sends, and nothing a URL parser or the pool's record would read otherwise.
+func urlPathByte(_ b: UInt8) -> Bool {
+  if (0x30...0x39).contains(b) || (0x41...0x5a).contains(b) || (0x61...0x7a).contains(b) { return true }
+  return "-._~:/?#[]@!$&'()*+,;=%".utf8.contains(b)
 }
 
 // The helper's Unix socket in the session directory (0700, this user only).
@@ -633,7 +644,7 @@ struct ChunkedDecoder {
         guard let eol = pending.range(of: Data("\r\n".utf8)) else { return out }
         let line = String(decoding: pending[pending.startIndex..<eol.lowerBound], as: UTF8.self)
         pending = pending.subdata(in: eol.upperBound..<pending.endIndex)
-        guard let size = Int(line.split(separator: ";").first.map(String.init) ?? "", radix: 16) else {
+        guard let size = Int(line.split(separator: ";").first.map(String.init) ?? "", radix: 16), size >= 0 else {
           throw PrivateBorrowError.helper("bad chunk size")
         }
         state = size == 0 ? .trailer : .data(size)

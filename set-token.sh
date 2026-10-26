@@ -22,3 +22,11 @@ c.users[process.argv[1]].claudeToken = process.argv[2];
 fs.writeFileSync('config.json', JSON.stringify(c, null, 2) + '\n', { mode: 0o600 });
 console.log('saved.');
 " "$1" "$TOKEN"
+
+# The running pool keeps config.json in memory and writes it back whenever a member
+# changes something, which would drop this edit: restart it so it reads the new file.
+if launchctl print "gui/$(id -u)/com.lembas.pool" >/dev/null 2>&1; then
+  launchctl kickstart -k "gui/$(id -u)/com.lembas.pool" && echo "restarted the pool"
+else
+  echo "restart the pool now, or this change is overwritten the next time it saves its config." >&2
+fi

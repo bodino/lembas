@@ -731,9 +731,13 @@ final class Store: ObservableObject {
       guard Bundle(url: fresh)?.bundleIdentifier == Bundle.main.bundleIdentifier else {
         throw LoginError("the download isn't a lembas app")
       }
+      // The old app is moved aside, not deleted, until the new one is in place: a move
+      // that fails halfway must leave a working lembas, not none.
       let script = """
         while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
-        rm -rf "$2" && mv "$3" "$2" || exit 1
+        rm -rf "$5/previous.app"
+        mv "$2" "$5/previous.app" || exit 1
+        if ! mv "$3" "$2"; then mv "$5/previous.app" "$2"; exit 1; fi
         launchctl kickstart -k "gui/$(id -u)/$4" 2>/dev/null
         # -n: start a fresh copy even if another profile of lembas is running from this bundle.
         if [ -n "$6" ]; then open -n "$2" --env "LEMBAS_PROFILE=$6"; else open -n "$2"; fi

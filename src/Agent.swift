@@ -218,7 +218,10 @@ final class Agent {
         if await tryPool(req, out) { return }
       }
 
-      let (bytes, upstream) = try await open(upstreamRequest(anthropic, req), out)
+      guard let request = upstreamRequest(anthropic, req) else {
+        return await out.sendJSON(status: 400, ["type": "error", "error": ["type": "invalid_request_error", "message": "Bad request path."]])
+      }
+      let (bytes, upstream) = try await open(request, out)
 
       if upstream.statusCode != 429 {
         let tap = UsageTap(contentType: upstream.value(forHTTPHeaderField: "content-type"))
@@ -252,8 +255,9 @@ final class Agent {
 
   // ---------- forwarding ----------
 
-  func upstreamRequest(_ base: String, _ req: HTTPRequest) -> URLRequest {
-    var request = URLRequest(url: URL(string: base + req.path)!)
+  func upstreamRequest(_ base: String, _ req: HTTPRequest) -> URLRequest? {
+    guard req.path.utf8.allSatisfy(urlPathByte), let url = URL(string: base + req.path) else { return nil }
+    var request = URLRequest(url: url)
     request.httpMethod = req.method
     for (name, value) in req.headers where !requestHopHeaders.contains(name) {
       request.addValue(value, forHTTPHeaderField: name)

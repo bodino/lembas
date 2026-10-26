@@ -178,6 +178,9 @@ export class Ledger {
     };
     this.state.borrowLog = prune(this.state.borrowLog);
     this.state.usageLog = prune(this.state.usageLog);
+    // Monthly totals: this month and the last are read; older ones only grow the file.
+    const keep = new Set([currentMonth(), currentMonth(new Date(now - 31 * 86_400_000))]);
+    for (const month of Object.keys(this.state.spend)) if (!keep.has(month)) delete this.state.spend[month];
   }
 
   // Forget everything tied to a member who left the pool. Spend history and logs stay,
@@ -189,7 +192,13 @@ export class Ledger {
     delete this.state.parkedUntil[name];
     delete this.state.policies[name];
     delete this.state.presence[name];
+    delete this.state.lastOwnUse[name];
     this.save();
+  }
+
+  // Writes now whatever a debounced save still holds (the pool is stopping).
+  flush(): void {
+    if (this.saveTimer) this.saveNow();
   }
 
   oauth(name: string): { accessToken: string; refreshToken: string; expiresAt: number } | undefined {
@@ -268,8 +277,8 @@ export class Ledger {
   }
 }
 
-function currentMonth(): string {
-  return new Date().toISOString().slice(0, 7);
+function currentMonth(date = new Date()): string {
+  return date.toISOString().slice(0, 7);
 }
 
 // ISO week start (Monday 00:00 UTC) as a timestamp.

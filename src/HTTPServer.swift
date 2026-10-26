@@ -206,7 +206,8 @@ private final class Reader {
     if request.header("transfer-encoding")?.lowercased().contains("chunked") == true {
       while true {
         let sizeLine = try await line()
-        guard let size = Int(sizeLine.split(separator: ";").first ?? "", radix: 16) else { throw HTTPError.malformed }
+        // Int(_, radix:) also reads a sign; a negative size would be a negative range.
+        guard let size = Int(sizeLine.split(separator: ";").first ?? "", radix: 16), size >= 0 else { throw HTTPError.malformed }
         if size == 0 {
           while try await !line().isEmpty {} // trailers
           break

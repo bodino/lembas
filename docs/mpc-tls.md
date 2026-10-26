@@ -526,6 +526,22 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
    history; the request line is checked for control bytes on both sides of the helper
    and before it enters the pool's record.
 
+42. **A full pass over lembas itself** (2026-10-26, every file). The agent's HTTP
+   parser took a chunk size through `Int(_, radix:)`, which also reads a sign, so a
+   local client sending `-5` as a chunk size crashed the agent on a negative range
+   (reproduced on 1.3.6; the response decoder for borrowed answers had the same hole).
+   A request with no token at all counted as a failed guess, so a browser on the invite
+   page, asking for `/favicon.ico` each time, locked its own guest out after ten loads;
+   only a wrong token counts now. The app's updater deleted the old bundle before moving
+   the new one in, so a failed move left no lembas; it moves the old one aside and puts
+   it back on failure. The pool flushes the ledger on SIGTERM (a `kickstart -k` inside
+   the save debounce lost the last writes), prunes months of totals, forgets a removed
+   member's last-use mark, resolves the helper's path through `fileURLToPath`, and gives
+   every socket it takes over on an upgrade an error listener before writing to it. The
+   agent refuses a path a URL can't carry instead of force-unwrapping it. The two
+   terminal scripts that edit `config.json` restart the pool, which otherwise wrote its
+   in-memory copy back over the edit.
+
 ## Open
 
 - **Memory.** About 165 MB per helper at steady state, mostly allocator high-water

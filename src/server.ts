@@ -2,6 +2,7 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { accessSync, chmodSync, constants as fsConstants, fchmodSync, fstatSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { Ledger, type LendPolicy, type LendRule } from "./ledger.ts";
 import { WebSocketConnection } from "./ws.ts";
 
@@ -60,7 +61,7 @@ const ledger = new Ledger(config.statePath ?? "state.json");
 
 // Borrowing is private, and only private: it needs the MPC helper. Without it this
 // pool cannot lend at all; the route says so and members' agents pause borrowing.
-const MPC_HELPER = config.mpc?.helper ?? new URL("../build/lembas-mpc", import.meta.url).pathname;
+const MPC_HELPER = config.mpc?.helper ?? fileURLToPath(new URL("../build/lembas-mpc", import.meta.url));
 // A borrower's share of the handshake plus a body up to the helper's 64 MB limit.
 // Over a whole session; the helper bounds each request on its own.
 const MPC_MAX_FROM_BORROWER = 8 * 1024 * 1024 * 1024;
@@ -338,10 +339,21 @@ async function lenderOrder(caller: string): Promise<string[]> {
 // ---------- HTTP plumbing ----------
 
 function authenticate(req: http.IncomingMessage): string | undefined {
-  const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
-  const presented = (req.headers["x-api-key"] as string | undefined) ?? bearer;
+  const presented = presentedToken(req);
   if (!presented) return undefined;
   return Object.keys(users).find((name) => safeEqual(presented, users[name].token));
+}
+
+function presentedToken(req: http.IncomingMessage): string | undefined {
+  const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  return (req.headers["x-api-key"] as string | undefined) ?? bearer;
+}
+
+// A request with no token at all is not a guess: a browser on the invite page asks
+// for /favicon.ico, and a probe asks for /. Only a wrong token counts toward the
+// lockout, or a few page loads would lock a guest out of their own invite.
+function recordUnauthenticated(req: http.IncomingMessage): void {
+  if (presentedToken(req)) recordFailure(clientId(req));
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -1231,9 +1243,8 @@ const server = http.createServer(async (req, res) => {
     // share an address (a home network, or this Mac reaching itself over the tailnet).
     const caller = authenticate(req);
     if (!caller) {
-      const client = clientId(req);
-      if (isBlocked(client)) return sendError(res, 429, "rate_limit_error", "Too many failed attempts. Try again in a few minutes.");
-      recordFailure(client);
+      if (isBlocked(clientId(req))) return sendError(res, 429, "rate_limit_error", "Too many failed attempts. Try again in a few minutes.");
+      recordUnauthenticated(req);
       return sendError(res, 401, "authentication_error", "Unknown pool token.");
     }
 
@@ -1288,14 +1299,17 @@ const server = http.createServer(async (req, res) => {
 
 // Private borrowing arrives as a WebSocket upgrade on /pool/borrow, with the same token.
 server.on("upgrade", (req, socket, head) => {
+  // Node hands the socket over without its own error listener; a peer that has
+  // already gone when the refusal is written would otherwise raise an unhandled
+  // error and take the pool down with it.
+  socket.on("error", () => {});
   const refuse = (status: string) => {
     socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
     socket.destroy();
   };
   const caller = authenticate(req);
   if (!caller) {
-    const client = clientId(req);
-    if (!isBlocked(client)) recordFailure(client);
+    if (!isBlocked(clientId(req))) recordUnauthenticated(req);
     return refuse("401 Unauthorized");
   }
   if (req.url?.split("?")[0] !== "/pool/borrow") return refuse("404 Not Found");
@@ -1307,6 +1321,15 @@ server.on("upgrade", (req, socket, head) => {
     ws.close(1011);
   });
 });
+
+// launchd stops the pool with SIGTERM (a restart, a logout): what the ledger has not
+// written yet (a park, a presence change, the last reports) goes to disk first.
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    ledger.flush();
+    process.exit(0);
+  });
+}
 
 const port = config.port ?? 8787;
 const host = config.host ?? "127.0.0.1";
