@@ -71,6 +71,10 @@ pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 /// How long the borrower waits for a response to finish once it has begun
 /// sending, from the last byte received (a model's thinking pause fits).
 pub const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long the pool gives the lender lookup before it refuses the request:
+/// shorter than the borrower's wait for `Accepted` (`SETUP_TIMEOUT`), so the
+/// borrower is still there to hear the answer.
+pub const LEASE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Frame size the borrower batches its records into.
 const FRAME_TARGET: usize = 64 << 10;
 /// Frames buffered per connection between tasks.
@@ -222,7 +226,9 @@ struct Gate {
     spliced_once: bool,
     last_splice_seq: u64,
     records_since_splice: u64,
-    splice_nonces: HashSet<[u8; 8]>,
+    /// Explicit nonces seen on this connection, token records' and the
+    /// borrower's alike.
+    nonces: HashSet<[u8; 8]>,
     /// Bytes of the current request the borrower has yet to send.
     remaining: usize,
 }
@@ -235,7 +241,7 @@ impl Gate {
             spliced_once: false,
             last_splice_seq: 0,
             records_since_splice: 0,
-            splice_nonces: HashSet::new(),
+            nonces: HashSet::new(),
             remaining: 0,
         }
     }
@@ -270,9 +276,11 @@ impl Gate {
                 APPLICATION_DATA => {
                     ensure!(payload.len() >= 24, "application-data record too short");
                     let nonce: [u8; 8] = payload[..8].try_into().unwrap();
+                    // Every nonce on this connection, the pool's and the
+                    // borrower's, is used once.
                     ensure!(
-                        !self.splice_nonces.contains(&nonce),
-                        "borrower record reuses a token record's nonce"
+                        self.nonces.insert(nonce),
+                        "borrower record reuses a nonce"
                     );
                     let plaintext = payload.len() - 24;
                     ensure!(
@@ -320,7 +328,7 @@ impl Gate {
             self.records_since_splice
         );
         let explicit: [u8; 8] = nonce[4..].try_into().unwrap();
-        ensure!(!self.splice_nonces.contains(&explicit), "token record nonce reused");
+        ensure!(!self.nonces.contains(&explicit), "token record nonce reused");
         self.phase = Phase::Splicing;
         Ok(())
     }
@@ -330,7 +338,7 @@ impl Gate {
         self.spliced_once = true;
         self.last_splice_seq = seq;
         self.records_since_splice = 0;
-        self.splice_nonces.insert(nonce[4..].try_into().unwrap());
+        self.nonces.insert(nonce[4..].try_into().unwrap());
         self.remaining = request_len;
         self.phase = if request_len == 0 { Phase::Idle } else { Phase::Sending };
     }
@@ -491,8 +499,13 @@ where
                         info!(took = ?t.elapsed(), "pool: setup renewed");
                     }
                     Job::Splice { conn, header, seq, nonce, request_len, lease, tag_rx, conn_state } => {
-                        // A lender, or not.
-                        let lease = match lease.await {
+                        // A lender, or not. Bounded: the borrower gives up
+                        // waiting at SETUP_TIMEOUT, and an answer after that
+                        // would start a proof nobody joins.
+                        let lease = match tokio::time::timeout(LEASE_TIMEOUT, lease)
+                            .await
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("no lender found in {} s", LEASE_TIMEOUT.as_secs())))
+                        {
                             Ok(Some(lease)) if lease.token.len() == TOKEN_LEN
                                 && !lease.token.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) =>
                             {
@@ -528,10 +541,18 @@ where
                             return Ok(());
                         }
 
-                        // The proof: a failure here is the borrower cheating.
-                        let proven = verifying
-                            .ciphertext_and_tag_share(&mut mpc, &headers, &span_idx, seq, &nonce)
-                            .await;
+                        // The proof: a failure here is the borrower cheating,
+                        // and a borrower that stops proving (it gave up on the
+                        // request) would leave this worker, and every request
+                        // behind it, waiting forever. Bounded like the
+                        // borrower's half; a session that times out here is
+                        // better replaced than left limping.
+                        let proven = tokio::time::timeout(
+                            SETUP_TIMEOUT,
+                            verifying.ciphertext_and_tag_share(&mut mpc, &headers, &span_idx, seq, &nonce),
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("the borrower did not finish its proof in time")));
                         let (ciphertext, mine) = match proven {
                             Ok(x) => x,
                             Err(err) => {
@@ -1152,7 +1173,10 @@ impl Session {
                 // The record is the whole head, so the server may already be
                 // answering it (a rejection, an early response): kept for the
                 // response phase.
-                Down::Bytes { bytes, .. } => conn.deframer.push(&bytes),
+                Down::Bytes { bytes, .. } => {
+                    ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
+                    conn.deframer.push(&bytes);
+                }
                 // The pool could not write the record, so nothing reached the
                 // server and another connection can take the request.
                 Down::Aborted { .. } => return Err(Stale.into()),
@@ -1410,6 +1434,14 @@ mod tests {
         assert!(g.accept_splice(5, &nonce_for(5)).is_err());
         // The first splice is pinned to 1: the client's Finished was record 0.
         assert!(Gate::new().accept_splice(2, &nonce_for(2)).is_err());
+        // A borrower record's nonce is remembered too: a later token record
+        // may not reuse it.
+        let mut g4 = Gate::new();
+        g4.accept_splice(1, &nonce_for(1)).unwrap();
+        g4.spliced(1, &nonce_for(1), 10);
+        g4.accept_record(&app_record(7, 10)).unwrap();
+        assert!(g4.accept_splice(3, &nonce_for(7)).is_err());
+        g4.accept_splice(3, &nonce_for(3)).unwrap();
         // An alert while idle takes a sequence number too.
         let mut g3 = Gate::new();
         g3.accept_splice(1, &nonce_for(1)).unwrap();

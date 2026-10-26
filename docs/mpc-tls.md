@@ -463,6 +463,13 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
    server can respond (a 4xx, or an echo server's status line) before the body is sent.
    The borrower keeps such records for the response phase instead of treating them as
    an error, which the first whole-head build did.
+36. **The proof worker must not wait forever.** (Third review of the sessions.) The pool
+   proves on one task in request order; if the borrower gave up a request (its 90 s
+   wait for `Accepted` ran out) the pool's half of the proof had nobody to talk to and
+   every later request queued behind it, while the session never errored. The lender
+   lookup is bounded at 45 s (under the borrower's wait) and refuses; the proof is
+   bounded at 90 s and ends the session, which the agent replaces. The control channel
+   already gave up after 30 s, so the lease could not wedge in lembas, only the proof.
 
 ## Open
 

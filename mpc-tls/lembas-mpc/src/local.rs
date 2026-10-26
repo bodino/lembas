@@ -18,6 +18,10 @@ use crate::{MAX_BODY_LEN, session::{Refused, Session}};
 
 /// Largest request head the local proxy accepts.
 const MAX_HEAD: usize = 64 << 10;
+/// How long a client may take between bytes of its request before the proxy
+/// drops it. The client is the agent on this machine; a stall means it died
+/// mid-upload.
+const CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Headers the proxy never forwards into the template: the pool's record
 /// supplies the first three, the rest are hop-by-hop or would change the
@@ -256,7 +260,9 @@ async fn serve_client(session: Arc<Session>, stream: TcpStream) -> Result<()> {
         // The head.
         let mut head = Vec::new();
         loop {
-            let n = rd.read_until(b'\n', &mut head).await?;
+            let n = tokio::time::timeout(CLIENT_IDLE_TIMEOUT, rd.read_until(b'\n', &mut head))
+                .await
+                .context("client stalled sending its request head")??;
             if n == 0 {
                 return Ok(());
             }
@@ -273,7 +279,15 @@ async fn serve_client(session: Arc<Session>, stream: TcpStream) -> Result<()> {
             }
         };
         let mut body = vec![0u8; body_len];
-        rd.read_exact(&mut body).await.context("reading the request body")?;
+        let mut filled = 0;
+        while filled < body_len {
+            let n = tokio::time::timeout(CLIENT_IDLE_TIMEOUT, rd.read(&mut body[filled..]))
+                .await
+                .context("client stalled sending its request body")?
+                .context("reading the request body")?;
+            ensure!(n > 0, "client closed with the body incomplete");
+            filled += n;
+        }
 
         let req = Arc::new(AtomicU64::new(0));
         let mut out = HeaderInsert::new(&mut wr, req.clone());
