@@ -697,7 +697,7 @@ async function setShare(req: http.IncomingMessage, res: http.ServerResponse, cal
     }
     rules = {};
     for (const [consumer, raw] of Object.entries(lendTo as Record<string, unknown>)) {
-      if (!(consumer in users)) return sendError(res, 400, "invalid_request_error", `Unknown pool member: ${consumer}.`);
+      if (!Object.hasOwn(users, consumer)) return sendError(res, 400, "invalid_request_error", `Unknown pool member: ${consumer}.`);
       if (consumer === caller) return sendError(res, 400, "invalid_request_error", "You cannot lend to yourself.");
       const rule = raw as { away?: unknown; working5h?: unknown } | null;
       if (typeof rule !== "object" || rule === null || typeof rule.away !== "boolean" || !isPercent(rule.working5h)) {
@@ -911,14 +911,29 @@ function poolBase(): string {
 const PROJECT_URL = "https://github.com/bodino/lembas";
 
 const INVITE_PATH = /^\/([a-z0-9]{4}(?:-[a-z0-9]{4}){3})$/;
+const INVITE_CODE = /^[a-z0-9]{4}(?:-[a-z0-9]{4}){3}$/;
+const MEMBER_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+
+// An invite by its code, or nothing. `config.invites` is a plain object, so a bare
+// index would also find `__proto__` and `constructor` (Object.prototype's members,
+// truthy, with no expiry); only own keys of the right shape count, and the record is
+// checked before anything trusts it.
+function findInvite(code: string): { name: string; by?: string; expiresAt: number } | undefined {
+  if (!INVITE_CODE.test(code) || !config.invites || !Object.hasOwn(config.invites, code)) return undefined;
+  const invite = config.invites[code];
+  if (typeof invite !== "object" || invite === null) return undefined;
+  if (typeof invite.name !== "string" || !MEMBER_NAME.test(invite.name)) return undefined;
+  if (typeof invite.expiresAt !== "number" || !Number.isFinite(invite.expiresAt)) return undefined;
+  return invite;
+}
 
 // GET /<invite code>: the link people receive. A read-only landing page — download
 // the app, then hand the code to it. Nothing is redeemed here; looking up wrong codes
 // counts toward the same lockout as guessing them.
 function invitePage(req: http.IncomingMessage, res: http.ServerResponse, code: string): void {
   const client = clientId(req);
-  const invite = config.invites?.[code];
-  const valid = !isBlocked(client) && invite && invite.expiresAt > Date.now() && !users[invite.name];
+  const invite = findInvite(code);
+  const valid = !isBlocked(client) && invite && invite.expiresAt > Date.now() && !Object.hasOwn(users, invite.name);
   if (!valid) recordFailure(client);
   const pretty = (name: string) => name.charAt(0).toUpperCase() + name.slice(1);
   const link = `${poolBase()}/${code}`;
@@ -1012,8 +1027,8 @@ async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return sendError(res, 400, "invalid_request_error", "Send {\"code\": \"...\"}.");
   }
   const key = typeof code === "string" ? code.trim().toLowerCase() : "";
-  const invite = config.invites?.[key];
-  if (!invite || invite.expiresAt < Date.now() || users[invite.name]) {
+  const invite = findInvite(key);
+  if (!invite || invite.expiresAt < Date.now() || Object.hasOwn(users, invite.name)) {
     recordFailure(client);
     failedRedeems.push(Date.now());
     return sendError(res, 404, "not_found_error", "This invite code is not valid. Ask for a new one.");
