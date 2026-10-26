@@ -32,14 +32,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const TOKEN: &str = "sk-ant-api03-THIS-IS-THE-POOLS-SECRET-TOKEN-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-A";
 
 const TEMPLATE: &str = "POST /echo HTTP/1.1\r\nHost: {host}\r\n\
-    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
-    Content-Type: application/json\r\n\r\n";
+    Content-Length: {body_len}\r\nContent-Type: application/json\r\n\
+    Authorization: Bearer {token}\r\n\r\n";
 
 /// The same, asking the server to close afterwards: forces a new connection
 /// for the next request.
 const TEMPLATE_CLOSE: &str = "POST /echo HTTP/1.1\r\nHost: {host}\r\n\
-    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
-    Content-Type: application/json\r\nConnection: close\r\n\r\n";
+    Content-Length: {body_len}\r\nContent-Type: application/json\r\n\
+    Connection: close\r\nAuthorization: Bearer {token}\r\n\r\n";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -311,7 +311,7 @@ async fn bench(n: usize, batch: &str) -> Result<()> {
     let (mut up0, mut down0) = (counters.received.load(Ordering::Relaxed), counters.sent.load(Ordering::Relaxed));
     println!("after setup: {} MB, {} KB up, {} KB down", rss_mb(), up0 / 1024, down0 / 1024);
     let header = lembas_mpc::fill_template(
-        "POST /v1/messages HTTP/1.1\r\nHost: api.example\r\nContent-Length: 1000\r\nAuthorization: Bearer {token}\r\n",
+        "POST /v1/messages HTTP/1.1\r\nHost: api.example\r\nContent-Length: 1000\r\nAuthorization: Bearer {token}\r\n\r\n",
         TOKEN_LEN,
         1000,
     )?;

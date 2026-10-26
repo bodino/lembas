@@ -15,6 +15,7 @@ const MAX_MESSAGE = 64 << 20;
 export class WebSocketConnection extends EventEmitter {
   private pending = Buffer.alloc(0);
   private fragments: Buffer[] = [];
+  private fragmentBytes = 0;
   private fragmentText = false;
   private closing = false;
   closed = false;
@@ -118,6 +119,10 @@ export class WebSocketConnection extends EventEmitter {
 
       switch (opcode) {
         case 0x0: // continuation
+          // Counted as they come, so a stream of never-final fragments cannot
+          // grow past the message limit before delivery checks it.
+          this.fragmentBytes += payload.length;
+          if (this.fragmentBytes > MAX_MESSAGE) return this.fail("message too large");
           this.fragments.push(payload);
           if (fin) this.deliver(Buffer.concat(this.fragments), this.fragmentText);
           break;
@@ -126,6 +131,7 @@ export class WebSocketConnection extends EventEmitter {
           if (fin) this.deliver(payload, opcode === 0x1);
           else {
             this.fragments = [payload];
+            this.fragmentBytes = payload.length;
             this.fragmentText = opcode === 0x1;
           }
           break;
@@ -150,6 +156,7 @@ export class WebSocketConnection extends EventEmitter {
 
   private deliver(data: Buffer, isText: boolean): void {
     this.fragments = [];
+    this.fragmentBytes = 0;
     if (data.length > MAX_MESSAGE) return this.fail("message too large");
     this.emit("message", data, isText);
   }

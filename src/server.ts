@@ -488,6 +488,10 @@ async function status(caller: string): Promise<unknown> {
 // limit to park that lender. That is a trust the pool extends to the borrower.
 
 let nextLease = 1;
+// Each session is a helper process of some 150 MB; a member gets a couple (the agent
+// keeps one, and a restart may overlap the old one briefly), not a fleet.
+const MAX_SESSIONS_PER_MEMBER = 2;
+const privateSessions = new Map<string, number>();
 
 async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: URL): Promise<void> {
   const fail = (code: string, message: string) => {
@@ -495,6 +499,9 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
     ws.close(1000);
   };
   if (!mpcAvailable()) return fail("unsupported", "This pool has no MPC helper, so it can't lend privately.");
+  const open = privateSessions.get(caller) ?? 0;
+  if (open >= MAX_SESSIONS_PER_MEMBER) return fail("busy", `You already have ${open} private sessions open with this pool.`);
+  privateSessions.set(caller, open + 1);
 
   const child = spawn(
     MPC_HELPER,
@@ -581,6 +588,7 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
     recordPrivateResult(caller, leases, data.toString());
   });
   ws.on("close", () => {
+    privateSessions.set(caller, Math.max(0, (privateSessions.get(caller) ?? 1) - 1));
     child.stdin.end();
     control.end();
     // The helper leaves on its own once its stdin ends; make sure of it.

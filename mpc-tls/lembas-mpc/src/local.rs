@@ -21,7 +21,8 @@ const MAX_HEAD: usize = 64 << 10;
 
 /// Headers the proxy never forwards into the template: the pool's record
 /// supplies the first three, the rest are hop-by-hop or would change the
-/// framing the pool counts on.
+/// framing the pool counts on. Prefixes in `DROPPED_PREFIXES` are client
+/// telemetry the server does not need; every byte of head is a block to prove.
 const DROPPED: &[&str] = &[
     "host",
     "content-length",
@@ -35,6 +36,7 @@ const DROPPED: &[&str] = &[
     "proxy-connection",
     "upgrade",
 ];
+const DROPPED_PREFIXES: &[&str] = &["x-stainless-"];
 
 // ---------------------------------------------------------------------------
 // Response framing
@@ -165,7 +167,7 @@ impl ResponseFramer {
             let name = name.trim().to_ascii_lowercase();
             let value = value.trim();
             match name.as_str() {
-                "content-length" => length = Some(value.parse::<usize>().context("Content-Length")?),
+                "content-length" => length = Some(crate::parse_length(value)?),
                 "transfer-encoding" => chunked = value.to_ascii_lowercase().contains("chunked"),
                 "connection" => close = value.to_ascii_lowercase().contains("close"),
                 _ => {}
@@ -310,9 +312,10 @@ async fn serve_client(session: Arc<Session>, stream: TcpStream) -> Result<()> {
     result
 }
 
-/// Turns a request head into a template for the session: the pool's part
-/// (request line, Host, Content-Length, Authorization) first, then the
-/// client's other headers.
+/// Turns a request head into a template for the session: the whole head is
+/// the pool's record, with the request line, Host and Content-Length first,
+/// the client's other headers next, and the Authorization line last before
+/// the blank line.
 fn parse_request(head: &[u8]) -> Result<(String, usize)> {
     let text = std::str::from_utf8(head).context("request head is not UTF-8")?;
     let mut lines = text.trim_end_matches("\r\n").split("\r\n");
@@ -337,12 +340,12 @@ fn parse_request(head: &[u8]) -> Result<(String, usize)> {
         let value = value.trim();
         ensure!(!value.contains(['\r', '\n']), "header value with a line break");
         if lname == "content-length" {
-            body_len = Some(value.parse::<usize>().context("Content-Length")?);
+            body_len = Some(crate::parse_length(value)?);
         }
         if lname == "transfer-encoding" {
             bail!("chunked requests are not supported; send Content-Length");
         }
-        if DROPPED.contains(&lname.as_str()) {
+        if DROPPED.contains(&lname.as_str()) || DROPPED_PREFIXES.iter().any(|p| lname.starts_with(p)) {
             continue;
         }
         rest.push_str(name.trim());
@@ -354,7 +357,7 @@ fn parse_request(head: &[u8]) -> Result<(String, usize)> {
     ensure!(body_len <= MAX_BODY_LEN, "body of {body_len} bytes is over the limit");
     rest.push_str("accept-encoding: identity\r\n");
     let template = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {{host}}\r\nContent-Length: {{body_len}}\r\nAuthorization: Bearer {{token}}\r\n{rest}\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {{host}}\r\nContent-Length: {{body_len}}\r\n{rest}Authorization: Bearer {{token}}\r\n\r\n"
     );
     Ok((template, body_len))
 }
@@ -526,13 +529,14 @@ mod tests {
 
     #[test]
     fn request_head_becomes_a_template() {
-        let head = b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\nAuthorization: Bearer nope\r\nanthropic-version: 2023-06-01\r\nConnection: keep-alive\r\n\r\n";
+        let head = b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\nAuthorization: Bearer nope\r\nanthropic-version: 2023-06-01\r\nX-Stainless-OS: MacOS\r\nConnection: keep-alive\r\n\r\n";
         let (template, len) = parse_request(head).unwrap();
         assert_eq!(len, 12);
         assert_eq!(
             template,
-            "POST /v1/messages HTTP/1.1\r\nHost: {host}\r\nContent-Length: {body_len}\r\nAuthorization: Bearer {token}\r\nanthropic-version: 2023-06-01\r\naccept-encoding: identity\r\n\r\n"
+            "POST /v1/messages HTTP/1.1\r\nHost: {host}\r\nContent-Length: {body_len}\r\nanthropic-version: 2023-06-01\r\naccept-encoding: identity\r\nAuthorization: Bearer {token}\r\n\r\n"
         );
+        assert!(parse_request(b"POST / HTTP/1.1\r\nContent-Length: +1\r\n\r\n").is_err());
         assert!(parse_request(b"GET / HTTP/1.1\r\n\r\n").is_err());
         assert!(parse_request(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").is_err());
     }

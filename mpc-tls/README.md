@@ -17,8 +17,9 @@ See `../docs/mpc-tls.md` for the design and findings.
   `src/bin/lembas-mpc.rs` the `lembas-mpc` binary (pool, borrower, proxy, chat).
 - `requests/` — the request templates used so far: `echo.*` for tlsn's test server,
   `messages.*` and `stream.json` for `api.anthropic.com` with a subscription token.
-  In a template, `{token}` is where the pool's bearer token goes and `{body_len}`
-  is the body length.
+  A template is the whole request head with the Authorization line last; `{token}` is
+  where the pool's bearer token goes, `{body_len}` the body length, `{host}` the
+  server.
 
 ## Build
 
@@ -96,10 +97,11 @@ LEMBAS_TOKEN=… ./target/release/lembas-mpc pool          # defaults: api.anthr
 The borrower prints the raw HTTP response as it arrives and verifies the server's
 certificate itself (`--roots`, Mozilla's by default). The pool checks the borrower's
 template: the token span must be exactly the value of an `Authorization: Bearer`
-header, the last line of the pool's record, block aligned and sized for the token
-(108 bytes rounded up to 112), and `Host` must be the server the pool connects to; and
-it refuses to write the token record unless it is the first application data on the
-connection. The pool refuses to lend a credential of any length but 108 bytes, and the
+header, the last header line of the whole head, block aligned and sized for the token
+(108 bytes rounded up to 112), `Host` must be the server the pool connects to,
+`Content-Length` is the only framing header; and on each connection a token record
+must begin a fresh request (the first application data, then exactly the body's
+length between records). The pool refuses to lend a credential of any length but 108 bytes, and the
 borrower refuses a pool that announces any other length; see `TOKEN_LEN` in `lib.rs`
 for why. The pool↔borrower stream must run over an authenticated channel in
 production; the TCP port here is for local testing.

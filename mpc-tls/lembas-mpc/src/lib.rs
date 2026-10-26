@@ -30,20 +30,22 @@ pub mod record;
 pub mod session;
 pub mod splice;
 
-/// Largest token record the pool may send: the request line, Host,
-/// Content-Length and the bearer line, about 210 bytes in practice. Each
-/// 16-byte block is one AES block proven in zero knowledge, so this budget is
-/// kept tight; the other headers follow in a record the borrower encrypts
-/// alone.
-pub const MAX_HEADER_LEN: usize = 320;
+/// Largest token record the pool may send: the whole request head, request
+/// line through the blank line, with the Authorization line last. Each 16-byte
+/// block is one AES block proven in zero knowledge, so callers keep the head
+/// lean (Claude Code's essential headers come to about 450 bytes).
+///
+/// The whole head is the pool's so that nothing the server can parse as
+/// framing is written by the borrower: after the token record the borrower
+/// sends exactly `Content-Length` bytes of body, which the pool counts, and a
+/// body cannot smuggle a `Transfer-Encoding` or a second request in front of
+/// the next token record.
+pub const MAX_HEADER_LEN: usize = 1024;
 
 /// Marker in a borrower's template that becomes the token span.
 pub const TOKEN_MARKER: &str = "{token}";
 /// Marker in a borrower's template that becomes the server name.
 pub const HOST_MARKER: &str = "{host}";
-/// Largest trailer (the borrower's own headers after the Authorization line,
-/// blank line included) a request may carry. The pool checks and counts it.
-pub const MAX_TRAILER_LEN: usize = 8 << 10;
 /// Marker in a borrower's template that becomes the body length.
 pub const BODY_LEN_MARKER: &str = "{body_len}";
 
@@ -70,7 +72,7 @@ pub const MAX_SENT_BYTES: usize = MAX_BODY_LEN + (4 << 20);
 pub const MAX_PENDING_BYTES: usize = 4 << 20;
 /// Changes whenever `Hello` or what follows it changes; the wire codec is not
 /// self-describing, so this is what turns an old peer into a clean error.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 /// Threads for the two-party computation (`LEMBAS_MPC_THREADS` overrides).
 pub const MPC_THREADS: usize = 4;
 
@@ -85,10 +87,11 @@ pub struct Hello {
     pub server_name: String,
 }
 
-/// The borrower's request header: the part that becomes the pool's record.
+/// The borrower's request head: the pool's record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestHeader {
-    /// Header text through the Authorization line, with any bytes in `token`.
+    /// The whole head, request line through the blank line, with the
+    /// Authorization line last and any bytes in `token`.
     pub template: Vec<u8>,
     /// Span the pool fills with the token.
     pub token: Range<usize>,
@@ -111,14 +114,15 @@ fn span_len_for(token_len: usize) -> usize {
     token_len.div_ceil(16) * 16
 }
 
-/// Checks a borrower's template on the pool's side.
+/// Checks a borrower's head on the pool's side.
 ///
 /// The span must be exactly the value of an `Authorization: Bearer` header,
-/// so the token can only ever land where a bearer token belongs, never in a
-/// path or a header the server might echo. It must be block aligned and no
-/// more than 15 bytes longer than the token, which with a working token
-/// leaves the pool no room for anything else (see `fill_template`). `Host`
-/// must name the server the pool connects to.
+/// the last header before the blank line, so the token can only ever land
+/// where a bearer token belongs, never in a path or a header the server might
+/// echo. It must be block aligned and no more than 15 bytes longer than the
+/// token, which with a working token leaves the pool no room for anything
+/// else (see `fill_template`). `Host` must name the server the pool connects
+/// to; `Content-Length` is digits only and the only framing header.
 pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &str) -> Result<()> {
     ensure!(
         token_len == TOKEN_LEN,
@@ -131,8 +135,8 @@ pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &st
         text.len()
     );
     ensure!(
-        text.ends_with(b"\r\n") && !text.ends_with(b"\r\n\r\n"),
-        "the token record ends with the Authorization line, not the blank line"
+        text.ends_with(b"\r\n\r\n"),
+        "the token record must end with the blank line"
     );
     let span = header.token.clone();
     ensure!(
@@ -144,10 +148,10 @@ pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &st
         "token span must be the token length rounded up to 16-byte blocks, block aligned"
     );
     ensure!(
-        span.end + 2 == text.len(),
-        "the Authorization line must be the last line of the token record"
+        span.end + 4 == text.len(),
+        "the Authorization line must be the last header line"
     );
-    let head = std::str::from_utf8(&text[..text.len() - 2]).context("header is not UTF-8")?;
+    let head = std::str::from_utf8(&text[..text.len() - 4]).context("header is not UTF-8")?;
     ensure!(!head.contains("\r\n\r\n"), "header contains a blank line");
 
     let mut pos = 0;
@@ -192,10 +196,14 @@ pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &st
                 saw_host = true;
             }
             if name == "content-length" {
-                let len: usize = value.trim_end().parse().context("Content-Length is not a number")?;
+                let len = parse_length(value.trim_end())?;
                 ensure!(len <= MAX_BODY_LEN, "Content-Length {len} is over the {MAX_BODY_LEN}-byte limit");
                 saw_length = true;
             }
+            ensure!(
+                name != "transfer-encoding",
+                "Transfer-Encoding is not allowed: Content-Length frames the request"
+            );
         }
     }
     ensure!(saw_auth, "no Authorization header");
@@ -204,62 +212,42 @@ pub fn check_template(header: &RequestHeader, token_len: usize, server_name: &st
     Ok(())
 }
 
-/// Checks the borrower's remaining headers against the pool's record, and
-/// returns the body length the record announces: together they are the
-/// request length the pool lets through before the next token record.
-///
-/// The trailer must be whole header lines ending in the blank line, with no
-/// header that would change the framing (`Transfer-Encoding`) or repeat one
-/// the pool's record carries (`Host`, `Content-Length`, `Authorization`).
+/// A `Content-Length` value: decimal digits and nothing else. Rust's integer
+/// parser would also take a leading `+`, which is the kind of thing two HTTP
+/// parsers disagree on.
+pub fn parse_length(value: &str) -> Result<usize> {
+    ensure!(
+        !value.is_empty() && value.len() <= 18 && value.bytes().all(|b| b.is_ascii_digit()),
+        "Content-Length must be a decimal number"
+    );
+    value.parse::<usize>().context("Content-Length")
+}
+
+/// The body length the pool's record announces: the request length the pool
+/// lets through before the next token record. `trailer` is what the borrower
+/// would send between the record and the body, and must be empty: the head is
+/// the pool's, blank line included.
 pub fn check_trailer(header: &RequestHeader, trailer: &[u8]) -> Result<usize> {
     ensure!(
-        trailer.len() <= MAX_TRAILER_LEN,
-        "trailer is {} bytes; at most {MAX_TRAILER_LEN}",
-        trailer.len()
+        trailer.is_empty(),
+        "the borrower sends nothing between the token record and the body"
     );
-    ensure!(
-        trailer == b"\r\n" || trailer.ends_with(b"\r\n\r\n"),
-        "trailer must be header lines ending with the blank line"
-    );
-    let text = std::str::from_utf8(&trailer[..trailer.len() - 2]).context("trailer is not UTF-8")?;
-    let text = text.strip_suffix("\r\n").unwrap_or(text);
-    ensure!(!text.contains("\r\n\r\n"), "trailer contains a blank line");
     let head = std::str::from_utf8(&header.template).context("header is not UTF-8")?;
-    let mut names: std::collections::HashSet<String> = head
-        .split("\r\n")
-        .skip(1)
-        .filter_map(|l| l.split_once(':').map(|(n, _)| n.trim().to_ascii_lowercase()))
-        .collect();
     let mut body_len = None;
     for line in head.split("\r\n").skip(1) {
         if let Some((n, v)) = line.split_once(':')
             && n.trim().eq_ignore_ascii_case("content-length")
         {
-            body_len = v.trim().parse::<usize>().ok();
+            body_len = Some(parse_length(v.trim())?);
         }
     }
-    let body_len = body_len.context("header has no Content-Length")?;
-    if !text.is_empty() {
-        for line in text.split("\r\n") {
-            let (name, value) = line.split_once(':').context("malformed trailer line")?;
-            let name = name.trim().to_ascii_lowercase();
-            ensure!(!name.is_empty() && !name.contains(' '), "malformed header name");
-            ensure!(!value.contains(['\r', '\n']), "header value with a line break");
-            ensure!(
-                !matches!(name.as_str(), "transfer-encoding" | "host" | "content-length" | "authorization"),
-                "trailer may not carry {name}"
-            );
-            ensure!(names.insert(name.clone()), "header {name} appears twice");
-        }
-    }
-    Ok(body_len)
+    body_len.context("header has no Content-Length")
 }
 
-/// Splits a full header template (ending in a blank line) at the line that
-/// carries the token: the first part becomes the pool's record, the rest
-/// (remaining headers plus the blank line) is sent by the borrower alone,
-/// ahead of the body. Fewer bytes in the pool's record means fewer AES blocks
-/// to prove, so callers put Authorization right after Host and Content-Length.
+/// Checks a full header template (ending in a blank line, the token line
+/// last) and returns it as the pool's record plus what the borrower sends
+/// between the record and the body: nothing. Kept as a pair for the callers
+/// that frame the request.
 pub fn split_template(template: &str) -> Result<(String, Vec<u8>)> {
     ensure!(
         template.ends_with("\r\n\r\n"),
@@ -272,8 +260,11 @@ pub fn split_template(template: &str) -> Result<(String, Vec<u8>)> {
         .find("\r\n")
         .map(|i| marker + i + 2)
         .unwrap();
-    let (hidden, rest) = template.split_at(line_end);
-    Ok((hidden.to_string(), rest.as_bytes().to_vec()))
+    ensure!(
+        &template[line_end..] == "\r\n",
+        "the Authorization line must be the last header: the pool's record is the whole head"
+    );
+    Ok((template.to_string(), Vec::new()))
 }
 
 /// Builds the borrower's header from a template with markers.
@@ -303,16 +294,13 @@ pub fn fill_template(template: &str, token_len: usize, body_len: usize) -> Resul
     text.insert_str(line_start, &" ".repeat(pad));
     let start = marker + pad;
     text.replace_range(start..start + TOKEN_MARKER.len(), &"x".repeat(span_len));
-    // The pool's record ends with the Authorization line; the blank line
-    // comes later, in the borrower's own record (see `split_template`).
-    let mut template = text.into_bytes();
+    // The pool's record is the whole head: the Authorization line, then the
+    // blank line.
+    let template = text.into_bytes();
     ensure!(
-        template.ends_with(b"\r\n") && !template.ends_with(b"\r\n\r\n"),
-        "the pool's record must end right after the Authorization line"
+        template.ends_with(b"\r\n\r\n"),
+        "the head must end with the blank line"
     );
-    while template.ends_with(b"\r\n\r\n") {
-        template.truncate(template.len() - 2);
-    }
     Ok(RequestHeader {
         template,
         token: start..start + span_len,
@@ -478,24 +466,28 @@ mod tests {
         );
         assert_eq!(ok.token.start % 16, 0);
         assert_eq!(ok.token.len(), 16);
-        assert_eq!(ok.template.len(), ok.token.end + 2);
+        assert_eq!(ok.template.len(), ok.token.end + 4);
         let text = String::from_utf8(ok.template.clone()).unwrap();
-        assert!(text.ends_with("Bearer xxxxxxxxxxxxxxxx\r\n"));
+        assert!(text.ends_with("Bearer xxxxxxxxxxxxxxxx\r\n\r\n"));
         // Only the real credential length is lent (see TOKEN_LEN).
         assert!(check_template(&ok, 8, "api.example").is_err());
-        let full = "POST /v1/messages HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nAuthorization: Bearer {token}\r\nX-Later: 1\r\n\r\n";
+        // The whole head is the pool's: other headers go before Authorization,
+        // and the borrower sends nothing between the record and the body.
+        let full = "POST /v1/messages HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nX-Later: 1\r\nAuthorization: Bearer {token}\r\n\r\n";
         let (hidden, trailer) = split_template(full).unwrap();
-        assert_eq!(trailer, b"X-Later: 1\r\n\r\n");
+        assert!(trailer.is_empty());
         let real = fill_template(&hidden, TOKEN_LEN, 5).unwrap();
         assert_eq!(real.token.len(), 112);
         check_template(&real, TOKEN_LEN, "api.example").unwrap();
-        // The trailer: counted, and not allowed to change the framing.
-        assert_eq!(check_trailer(&real, &trailer).unwrap(), 5);
-        assert_eq!(check_trailer(&real, b"\r\n").unwrap(), 5);
-        assert!(check_trailer(&real, b"Transfer-Encoding: chunked\r\n\r\n").is_err());
-        assert!(check_trailer(&real, b"Host: other\r\n\r\n").is_err());
-        assert!(check_trailer(&real, b"X-A: 1\r\nx-a: 2\r\n\r\n").is_err());
-        assert!(check_trailer(&real, b"X-A: 1\r\n").is_err());
+        assert_eq!(check_trailer(&real, b"").unwrap(), 5);
+        assert!(check_trailer(&real, b"\r\n").is_err());
+        // A header after Authorization is refused.
+        assert!(split_template("POST / HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nAuthorization: Bearer {token}\r\nX-Later: 1\r\n\r\n").is_err());
+        // So are chunked framing and a Content-Length that is not plain digits.
+        let made = |t: &str| fill_template(&split_template(t).unwrap().0, TOKEN_LEN, 5).unwrap();
+        assert!(check_template(&made("POST / HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nTransfer-Encoding: chunked\r\nAuthorization: Bearer {token}\r\n\r\n"), TOKEN_LEN, "api.example").is_err());
+        assert!(check_template(&made("POST / HTTP/1.1\r\nHost: api.example\r\nContent-Length: +5\r\nAuthorization: Bearer {token}\r\n\r\n"), TOKEN_LEN, "api.example").is_err());
+        assert!(parse_length("+5").is_err() && parse_length("5").unwrap() == 5 && parse_length("").is_err());
         assert!(check_template(&real, TOKEN_LEN, "other.example").is_err());
         // A shorter credential in the same span would leave room to smuggle a
         // header, which is why it is refused.
@@ -534,6 +526,7 @@ mod tests {
             "POST / HTTP/1.1\r\nHost: api.example\r\nContent-Length: {body_len}\r\nX-A: 1\r\nx-a: 2\r\nAuthorization: Bearer {token}\r\n\r\n",
             0,
         );
+        // (X-A before Authorization is the shape now; the duplicate is the error.)
         assert!(check_template(&twice, TOKEN_LEN, "api.example").is_err());
     }
 

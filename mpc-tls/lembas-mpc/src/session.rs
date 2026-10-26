@@ -15,14 +15,16 @@
 //!
 //! - before the first splice only handshake records pass (no application
 //!   data, so the token record cannot continue something the borrower wrote);
-//! - after a splice the borrower may send exactly the announced request
-//!   length (its remaining headers plus `Content-Length` of body), counted
-//!   from the relayed records' plaintext lengths, and no application data
-//!   outside that window: fewer bytes would make the next token record part
-//!   of this body, more would make it the body of a pipelined request;
+//! - the token record is the whole request head, blank line included, so the
+//!   borrower writes nothing the server could parse as framing; after a
+//!   splice the borrower may send exactly `Content-Length` bytes of body,
+//!   counted from the relayed records' plaintext lengths, and no application
+//!   data outside that window: fewer bytes would make the next token record
+//!   part of this body, more would make it the body of a pipelined request;
 //! - a later splice must announce the sequence number the pool expects from
-//!   the records it counted, and no borrower record may reuse a token
-//!   record's explicit nonce.
+//!   the records it counted (the first one is 1: a TLS 1.2 client sends one
+//!   encrypted record, `Finished`, before any application data), and no
+//!   borrower record may reuse a token record's explicit nonce.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -86,13 +88,11 @@ pub enum Up {
     Open { conn: u32 },
     /// TLS bytes for the server.
     Bytes { conn: u32, bytes: Vec<u8> },
-    /// Splice a token record: `header` is the pool's part (through the
-    /// Authorization line), `trailer` the borrower's remaining headers and
-    /// the blank line, which the pool only checks and counts.
+    /// Splice a token record: `header` is the whole request head, which the
+    /// pool checks, fills and writes; the borrower follows with the body.
     Request {
         conn: u32,
         header: RequestHeader,
-        trailer: Vec<u8>,
         seq: u64,
         nonce: [u8; 12],
     },
@@ -122,6 +122,9 @@ pub enum Down {
     /// No token for this request (nobody lending right now, say). The
     /// connection stays usable.
     Refused { conn: u32, reason: String },
+    /// The token record was not written (the connection went away first):
+    /// nothing reached the server, so the request may move to another.
+    Aborted { conn: u32 },
     /// The server closed this connection.
     ServerClosed { conn: u32 },
 }
@@ -149,6 +152,7 @@ impl std::fmt::Display for Down {
             Down::Accepted { conn, req } => write!(f, "Accepted({conn}, req {req})"),
             Down::Spliced { conn, req } => write!(f, "Spliced({conn}, req {req})"),
             Down::Refused { conn, reason } => write!(f, "Refused({conn}, {reason})"),
+            Down::Aborted { conn } => write!(f, "Aborted({conn})"),
             Down::ServerClosed { conn } => write!(f, "ServerClosed({conn})"),
         }
     }
@@ -258,6 +262,8 @@ impl Gate {
                     typ == ALERT,
                     "borrower sent a record of type {typ} outside a request"
                 );
+                // An alert takes a sequence number like any encrypted record.
+                self.records_since_splice += 1;
                 Ok(())
             }
             Phase::Sending => match typ {
@@ -281,7 +287,10 @@ impl Gate {
                     }
                     Ok(())
                 }
-                ALERT => Ok(()),
+                ALERT => {
+                    self.records_since_splice += 1;
+                    Ok(())
+                }
                 HANDSHAKE | CHANGE_CIPHER_SPEC => bail!("borrower sent a handshake record after the splice"),
                 other => bail!("record of unknown type {other}"),
             },
@@ -298,14 +307,18 @@ impl Gate {
                 self.remaining
             ),
         }
-        if self.spliced_once {
-            let expected = self.last_splice_seq + 1 + self.records_since_splice;
-            ensure!(
-                seq == expected,
-                "token record sequence number {seq} does not follow the {} records sent (expected {expected})",
-                self.records_since_splice
-            );
-        }
+        let expected = if self.spliced_once {
+            self.last_splice_seq + 1 + self.records_since_splice
+        } else {
+            // One encrypted record before application data: the client's
+            // Finished.
+            1
+        };
+        ensure!(
+            seq == expected,
+            "token record sequence number {seq} does not follow the {} records sent (expected {expected})",
+            self.records_since_splice
+        );
         let explicit: [u8; 8] = nonce[4..].try_into().unwrap();
         ensure!(!self.splice_nonces.contains(&explicit), "token record nonce reused");
         self.phase = Phase::Splicing;
@@ -331,16 +344,46 @@ impl Gate {
 struct PoolConn {
     gate: Gate,
     deframer: Deframer,
-    to_server: mpsc::Sender<Vec<u8>>,
+    to_server: mpsc::UnboundedSender<Vec<u8>>,
+    /// Bytes queued for the server and not yet written.
+    pending: Arc<std::sync::atomic::AtomicUsize>,
     reader: tokio::task::AbortHandle,
     pending_tag: Option<oneshot::Sender<[u8; 16]>>,
+}
+
+impl PoolConn {
+    /// Queues bytes for the server without waiting on it; a server too far
+    /// behind loses the connection rather than stalling the session.
+    fn queue(&self, bytes: Vec<u8>) -> Result<()> {
+        let pending = self.pending.fetch_add(bytes.len(), Ordering::Relaxed) + bytes.len();
+        ensure!(
+            pending <= crate::MAX_PENDING_BYTES,
+            "server is {pending} bytes behind on this connection"
+        );
+        self.to_server
+            .send(bytes)
+            .map_err(|_| anyhow::anyhow!("server connection closed"))
+    }
 }
 
 enum Event {
     Connected {
         conn: u32,
-        to_server: mpsc::Sender<Vec<u8>>,
+        to_server: mpsc::UnboundedSender<Vec<u8>>,
+        pending: Arc<std::sync::atomic::AtomicUsize>,
         reader: tokio::task::AbortHandle,
+    },
+    /// No lender for this request; the connection stays.
+    Refused {
+        conn: u32,
+        reason: String,
+    },
+    /// The token record could not be written for a reason on the wire (the
+    /// server or the borrower closed the connection meanwhile); the
+    /// connection goes, the session stays.
+    SpliceAborted {
+        conn: u32,
+        err: anyhow::Error,
     },
     ConnectFailed {
         conn: u32,
@@ -367,14 +410,15 @@ enum Event {
 enum Job {
     Splice {
         conn: u32,
-        headers: Vec<u8>,
-        span_idx: Vec<usize>,
+        header: RequestHeader,
         seq: u64,
         nonce: [u8; 12],
-        req: u64,
         request_len: usize,
+        /// The lender lookup, awaited here so that a slow one holds up the
+        /// proofs, which are sequential anyway, and not the relay.
+        lease: Pin<Box<dyn Future<Output = Result<Option<Lease>>> + Send>>,
         tag_rx: oneshot::Receiver<[u8; 16]>,
-        to_server: mpsc::Sender<Vec<u8>>,
+        conn_state: (mpsc::UnboundedSender<Vec<u8>>, Arc<std::sync::atomic::AtomicUsize>),
     },
     Renew,
 }
@@ -428,6 +472,8 @@ where
     let (jobs_tx, mut jobs) = mpsc::channel::<Job>(CONN_QUEUE);
     {
         let events_tx = events_tx.clone();
+        let down_tx = down_tx.clone();
+        let tamper = tamper.clone();
         tasks.spawn(async move {
             while let Some(job) = jobs.recv().await {
                 match job {
@@ -444,26 +490,73 @@ where
                         }
                         info!(took = ?t.elapsed(), "pool: setup renewed");
                     }
-                    Job::Splice { conn, headers, span_idx, seq, nonce, req, request_len, tag_rx, to_server } => {
-                        let outcome = async {
-                            let (ciphertext, mine) = verifying
-                                .ciphertext_and_tag_share(&mut mpc, &headers, &span_idx, seq, &nonce)
-                                .await?;
+                    Job::Splice { conn, header, seq, nonce, request_len, lease, tag_rx, conn_state } => {
+                        // A lender, or not.
+                        let lease = match lease.await {
+                            Ok(Some(lease)) if lease.token.len() == TOKEN_LEN
+                                && !lease.token.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) =>
+                            {
+                                lease
+                            }
+                            Ok(Some(_)) => {
+                                let _ = events_tx
+                                    .send(Event::Refused { conn, reason: "the lent credential is not a token".into() })
+                                    .await;
+                                continue;
+                            }
+                            Ok(None) => {
+                                let _ = events_tx.send(Event::Refused { conn, reason: "no token available".into() }).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                let _ = events_tx.send(Event::Refused { conn, reason: format!("{e:#}") }).await;
+                                continue;
+                            }
+                        };
+                        let req = lease.req;
+                        let mut headers = header.template.clone();
+                        let span = &mut headers[header.token.clone()];
+                        span.fill(b' ');
+                        span[..lease.token.len()].copy_from_slice(lease.token.as_bytes());
+                        drop(lease);
+                        if let Some(tamper) = &tamper {
+                            tamper(&mut headers);
+                        }
+                        let span_idx = span_blocks(&header);
+                        // The borrower proves only once it knows there is a lender.
+                        if down_tx.send(Down::Accepted { conn, req }).await.is_err() {
+                            return Ok(());
+                        }
+
+                        // The proof: a failure here is the borrower cheating.
+                        let proven = verifying
+                            .ciphertext_and_tag_share(&mut mpc, &headers, &span_idx, seq, &nonce)
+                            .await;
+                        let (ciphertext, mine) = match proven {
+                            Ok(x) => x,
+                            Err(err) => {
+                                let _ = events_tx.send(Event::SpliceFailed { conn, err }).await;
+                                return Ok(());
+                            }
+                        };
+                        // The wire: a failure here is a connection gone.
+                        let written = async {
                             let theirs = tokio::time::timeout(SETUP_TIMEOUT, tag_rx)
                                 .await
                                 .context("waiting for the borrower's tag share")?
                                 .context("borrower never sent its tag share")?;
                             let record = Verifying::finish_record(&nonce, &ciphertext, mine, theirs);
+                            let (to_server, pending) = &conn_state;
+                            pending.fetch_add(record.len(), Ordering::Relaxed);
                             to_server
                                 .send(record)
-                                .await
                                 .map_err(|_| anyhow::anyhow!("server connection closed"))?;
                             Ok::<_, anyhow::Error>(())
                         }
                         .await;
-                        let event = match outcome {
+                        let event = match written {
                             Ok(()) => Event::Spliced { conn, req, seq, nonce, request_len },
-                            Err(err) => Event::SpliceFailed { conn, err },
+                            Err(err) => Event::SpliceAborted { conn, err },
                         };
                         if events_tx.send(event).await.is_err() {
                             return Ok(());
@@ -518,11 +611,12 @@ where
                             match tokio::time::timeout(SETUP_TIMEOUT, connect()).await {
                                 Ok(Ok(server)) => {
                                     let (rd, wr) = tokio::io::split(server);
-                                    let (to_server, from_borrower) = mpsc::channel::<Vec<u8>>(CONN_QUEUE);
+                                    let (to_server, from_borrower) = mpsc::unbounded_channel::<Vec<u8>>();
+                                    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                     let reader = tokio::spawn(read_server(conn, rd, down_tx, events_tx.clone()));
-                                    tokio::spawn(write_server(wr, from_borrower));
+                                    tokio::spawn(write_server(conn, wr, from_borrower, pending.clone(), events_tx.clone()));
                                     let _ = events_tx
-                                        .send(Event::Connected { conn, to_server, reader: reader.abort_handle() })
+                                        .send(Event::Connected { conn, to_server, pending, reader: reader.abort_handle() })
                                         .await;
                                 }
                                 Ok(Err(e)) => {
@@ -545,14 +639,23 @@ where
                             continue;
                         };
                         c.deframer.push(&bytes);
+                        let mut gone = None;
                         while let Some(record) = c.deframer.next_record()? {
                             c.gate.accept_record(&record)?;
-                            if c.to_server.send(record).await.is_err() {
-                                debug!("pool: connection {conn}'s server side is gone");
+                            if let Err(e) = c.queue(record) {
+                                gone = Some(e);
+                                break;
                             }
                         }
+                        if let Some(e) = gone {
+                            warn!("pool: dropping connection {conn}: {e:#}");
+                            if let Some(c) = conns.remove(&conn) {
+                                c.reader.abort();
+                            }
+                            let _ = down_tx.send(Down::ServerClosed { conn }).await;
+                        }
                     }
-                    Up::Request { conn, header, trailer, seq, nonce } => {
+                    Up::Request { conn, header, seq, nonce } => {
                         let Some(c) = conns.get_mut(&conn) else {
                             // The server closed it a moment ago; the borrower
                             // will hear so and try another connection.
@@ -562,62 +665,31 @@ where
                         };
                         ensure!(c.deframer.is_empty(), "partial record pending at the splice");
                         check_template(&header, TOKEN_LEN, &server_name).context("borrower's header rejected")?;
-                        let body_len = check_trailer(&header, &trailer).context("borrower's trailer rejected")?;
+                        let body_len = check_trailer(&header, &[]).context("borrower's header rejected")?;
                         c.gate.accept_splice(seq, &nonce)?;
-
-                        let lease = match tokens().await {
-                            Ok(Some(lease)) => lease,
-                            Ok(None) => {
-                                stats.refused += 1;
-                                c.gate.splice_failed();
-                                let _ = down_tx.send(Down::Refused { conn, reason: "no token available".into() }).await;
-                                continue;
-                            }
-                            Err(e) => {
-                                stats.refused += 1;
-                                c.gate.splice_failed();
-                                let _ = down_tx.send(Down::Refused { conn, reason: format!("{e:#}") }).await;
-                                continue;
-                            }
-                        };
-                        ensure!(lease.token.len() == TOKEN_LEN, "lease is not a {TOKEN_LEN}-byte credential");
-                        ensure!(
-                            !lease.token.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()),
-                            "credential contains whitespace or control characters"
-                        );
-                        let mut headers = header.template.clone();
-                        let span = &mut headers[header.token.clone()];
-                        span.fill(b' ');
-                        span[..lease.token.len()].copy_from_slice(lease.token.as_bytes());
-                        if let Some(tamper) = &tamper {
-                            tamper(&mut headers);
-                        }
-                        let span_idx = span_blocks(&header);
                         let (tag_tx, tag_rx) = oneshot::channel();
                         c.pending_tag = Some(tag_tx);
-                        // The borrower proves only once it knows there is a lender.
-                        let _ = down_tx.send(Down::Accepted { conn, req: lease.req }).await;
                         jobs_tx
                             .send(Job::Splice {
                                 conn,
-                                headers,
-                                span_idx,
+                                header,
                                 seq,
                                 nonce,
-                                req: lease.req,
-                                request_len: trailer.len() + body_len,
+                                request_len: body_len,
+                                lease: tokens(),
                                 tag_rx,
-                                to_server: c.to_server.clone(),
+                                conn_state: (c.to_server.clone(), c.pending.clone()),
                             })
                             .await
                             .map_err(|_| anyhow::anyhow!("proof worker is gone"))?;
                     }
                     Up::TagShare { conn, share } => {
-                        let Some(c) = conns.get_mut(&conn) else {
-                            bail!("tag share for a connection that is not open");
-                        };
-                        let tx = c.pending_tag.take().context("tag share without a pending token record")?;
-                        let _ = tx.send(share);
+                        // For a connection the server just closed there is
+                        // nobody waiting; the job notices and aborts.
+                        if let Some(c) = conns.get_mut(&conn) {
+                            let tx = c.pending_tag.take().context("tag share without a pending token record")?;
+                            let _ = tx.send(share);
+                        }
                     }
                     Up::Close { conn } => {
                         if let Some(c) = conns.remove(&conn) {
@@ -635,16 +707,32 @@ where
                 }
             }
             Some(event) = events.recv() => match event {
-                Event::Connected { conn, to_server, reader } => {
+                Event::Connected { conn, to_server, pending, reader } => {
                     connecting.remove(&conn);
                     conns.insert(conn, PoolConn {
                         gate: Gate::new(),
                         deframer: Deframer::default(),
                         to_server,
+                        pending,
                         reader,
                         pending_tag: None,
                     });
                     let _ = down_tx.send(Down::Opened { conn }).await;
+                }
+                Event::Refused { conn, reason } => {
+                    stats.refused += 1;
+                    if let Some(c) = conns.get_mut(&conn) {
+                        c.gate.splice_failed();
+                        c.pending_tag = None;
+                    }
+                    let _ = down_tx.send(Down::Refused { conn, reason }).await;
+                }
+                Event::SpliceAborted { conn, err } => {
+                    debug!("pool: token record for connection {conn} not written: {err:#}");
+                    if let Some(c) = conns.remove(&conn) {
+                        c.reader.abort();
+                    }
+                    let _ = down_tx.send(Down::Aborted { conn }).await;
                 }
                 Event::ConnectFailed { conn, err } => {
                     connecting.remove(&conn);
@@ -714,9 +802,19 @@ async fn read_server<R: AsyncRead + Unpin>(
 }
 
 /// Writes the borrower's records to the server in order.
-async fn write_server<W: AsyncWrite + Unpin>(mut wr: W, mut from_borrower: mpsc::Receiver<Vec<u8>>) {
+async fn write_server<W: AsyncWrite + Unpin>(
+    conn: u32,
+    mut wr: W,
+    mut from_borrower: mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    events_tx: mpsc::Sender<Event>,
+) {
     while let Some(bytes) = from_borrower.recv().await {
-        if wr.write_all(&bytes).await.is_err() {
+        let n = bytes.len();
+        let written = wr.write_all(&bytes).await;
+        pending.fetch_sub(n, Ordering::Relaxed);
+        if written.is_err() {
+            let _ = events_tx.send(Event::ServerGone { conn }).await;
             return;
         }
     }
@@ -863,6 +961,7 @@ impl Session {
                     | Down::Accepted { conn, .. }
                     | Down::Spliced { conn, .. }
                     | Down::Refused { conn, .. }
+                    | Down::Aborted { conn }
                     | Down::ServerClosed { conn } => *conn,
                 };
                 let route = routes.routes.lock().unwrap().get(&conn).cloned();
@@ -901,29 +1000,32 @@ impl Session {
         let on_req: Box<dyn FnOnce(u64) + Send> = Box::new(on_req);
         let inner = &self.inner;
         let template = template.replace(crate::HOST_MARKER, &inner.server_name);
-        let (hidden, trailer) = split_template(&template)?;
-        let header = fill_template(&hidden, inner.token_len, body.len())?;
+        let (head, trailer) = split_template(&template)?;
+        debug_assert!(trailer.is_empty());
+        let header = fill_template(&head, inner.token_len, body.len())?;
         ensure!(body.len() <= MAX_BODY_LEN, "body of {} bytes is over the limit", body.len());
         check_template(&header, inner.token_len, &inner.server_name)?;
         check_trailer(&header, &trailer)?;
         let span_idx = span_blocks(&header);
 
         let (mut conn, mut reused) = inner.take_connection().await?;
-        let mut body = body;
+        let mut retried = false;
         let mut on_req = Some(on_req);
         let result = loop {
             let result = self
-                .request_on(&mut conn, &header, &trailer, &span_idx, &body, out, on_req.take().unwrap())
+                .request_on(&mut conn, &header, &span_idx, &body, out, on_req.take().unwrap())
                 .await;
             match result {
-                // The server dropped an idle connection under us; once more on a fresh one.
-                Err(e) if reused && e.downcast_ref::<Stale>().is_some() => {
-                    debug!("borrower: connection {} was stale, retrying on a new one", conn.id);
+                // The connection went away before the token record was written
+                // (an idle close, a server hiccup): nothing reached the server,
+                // so once more on a fresh connection.
+                Err(e) if !retried && e.downcast_ref::<Stale>().is_some() => {
+                    debug!("borrower: connection {} closed before the request, retrying on a new one", conn.id);
                     inner.drop_connection(conn).await;
                     let (c, _) = inner.take_connection().await?;
                     conn = c;
                     reused = false;
-                    body = std::mem::take(&mut body);
+                    retried = true;
                     on_req = Some(Box::new(|_| {}) as Box<dyn FnOnce(u64) + Send>);
                 }
                 other => break other,
@@ -959,7 +1061,6 @@ impl Session {
         &self,
         conn: &mut Conn,
         header: &RequestHeader,
-        trailer: &[u8],
         span_idx: &[usize],
         body: &[u8],
         out: &mut W,
@@ -994,7 +1095,6 @@ impl Session {
                 .send(Up::Request {
                     conn: conn.id,
                     header: header.clone(),
-                    trailer: trailer.to_vec(),
                     seq,
                     nonce,
                 })
@@ -1009,7 +1109,8 @@ impl Session {
                 {
                     Down::Accepted { .. } => break,
                     Down::Refused { reason, .. } => return Err(Refused(reason).into()),
-                    Down::ServerClosed { .. } => return Err(Stale.into()),
+                    // Nothing has been written yet either way.
+                    Down::ServerClosed { .. } | Down::Aborted { .. } => return Err(Stale.into()),
                     Down::Bytes { bytes, .. } => {
                         conn.deframer.push(&bytes);
                         if let Some(record) = conn.deframer.next_record()? {
@@ -1048,25 +1149,23 @@ impl Session {
             {
                 Down::Spliced { req, .. } => break req,
                 Down::Refused { reason, .. } => return Err(Refused(reason).into()),
-                Down::Bytes { bytes, .. } => {
-                    // The server has nothing to say before the request, unless
-                    // it is rejecting it.
-                    conn.deframer.push(&bytes);
-                    if let Some(record) = conn.deframer.next_record()? {
-                        let (typ, plaintext) = conn.reader.decrypt(&record)?;
-                        bail!("server sent a record of type {typ} before the request: {plaintext:?}");
-                    }
-                }
-                Down::ServerClosed { .. } => bail!("server closed the connection before the request"),
+                // The record is the whole head, so the server may already be
+                // answering it (a rejection, an early response): kept for the
+                // response phase.
+                Down::Bytes { bytes, .. } => conn.deframer.push(&bytes),
+                // The pool could not write the record, so nothing reached the
+                // server and another connection can take the request.
+                Down::Aborted { .. } => return Err(Stale.into()),
+                // Here the record may have reached the server: no retry.
+                Down::ServerClosed { .. } => bail!("server closed the connection on the request"),
                 other => bail!("unexpected {other} while waiting for the token record"),
             }
         };
         on_req(req);
         conn.writer.set_seq(seq + 1);
 
-        let payload = [trailer, body].concat();
         let mut frame = Vec::with_capacity(FRAME_TARGET + MAX_RECORD_PLAINTEXT + 64);
-        for chunk in payload.chunks(MAX_RECORD_PLAINTEXT) {
+        for chunk in body.chunks(MAX_RECORD_PLAINTEXT) {
             frame.extend_from_slice(&conn.writer.encrypt(APPLICATION_DATA, chunk)?);
             if frame.len() >= FRAME_TARGET {
                 inner
@@ -1091,46 +1190,36 @@ impl Session {
         }
         let sent_at = Instant::now();
 
-        // The response, until its framing says it is complete.
+        // The response, until its framing says it is complete. Records the
+        // server sent while the token record was being written are in the
+        // deframer already.
         let mut framer = crate::local::ResponseFramer::default();
         let mut first_byte = None;
         let mut total = 0usize;
         let mut server_closed = false;
         loop {
-            let frame = tokio::time::timeout(RESPONSE_IDLE_TIMEOUT, conn.rx.recv())
-                .await
-                .context("no response bytes for 10 min")?
-                .context("session closed")?;
-            match frame {
-                Down::Bytes { bytes, .. } => {
-                    ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
-                    conn.deframer.push(&bytes);
-                    while let Some(record) = conn.deframer.next_record()? {
-                        let (typ, plaintext) = conn.reader.decrypt(&record)?;
-                        match typ {
-                            APPLICATION_DATA => {
-                                first_byte.get_or_insert_with(|| sent_at.elapsed());
-                                let used = framer.feed(&plaintext)?;
-                                ensure!(
-                                    used == plaintext.len(),
-                                    "server sent {} bytes beyond the response",
-                                    plaintext.len() - used
-                                );
-                                total += plaintext.len();
-                                out.write_all(&plaintext).await?;
-                                out.flush().await?;
-                            }
-                            ALERT => {
-                                ensure!(plaintext == CLOSE_NOTIFY, "unexpected alert from the server: {plaintext:?}");
-                                debug!("borrower: server sent close_notify");
-                                server_closed = true;
-                            }
-                            typ => bail!("unexpected record type {typ}"),
-                        }
+            while let Some(record) = conn.deframer.next_record()? {
+                let (typ, plaintext) = conn.reader.decrypt(&record)?;
+                match typ {
+                    APPLICATION_DATA => {
+                        first_byte.get_or_insert_with(|| sent_at.elapsed());
+                        let used = framer.feed(&plaintext)?;
+                        ensure!(
+                            used == plaintext.len(),
+                            "server sent {} bytes beyond the response",
+                            plaintext.len() - used
+                        );
+                        total += plaintext.len();
+                        out.write_all(&plaintext).await?;
+                        out.flush().await?;
                     }
+                    ALERT => {
+                        ensure!(plaintext == CLOSE_NOTIFY, "unexpected alert from the server: {plaintext:?}");
+                        debug!("borrower: server sent close_notify");
+                        server_closed = true;
+                    }
+                    typ => bail!("unexpected record type {typ}"),
                 }
-                Down::ServerClosed { .. } => server_closed = true,
-                other => bail!("unexpected {other} during the response"),
             }
             if framer.complete() {
                 break;
@@ -1140,6 +1229,18 @@ impl Session {
                     break;
                 }
                 bail!("server closed the connection with the response incomplete");
+            }
+            let frame = tokio::time::timeout(RESPONSE_IDLE_TIMEOUT, conn.rx.recv())
+                .await
+                .context("no response bytes for 10 min")?
+                .context("session closed")?;
+            match frame {
+                Down::Bytes { bytes, .. } => {
+                    ensure!(bytes.len() <= MAX_FRAME_BYTES, "frame of {} bytes", bytes.len());
+                    conn.deframer.push(&bytes);
+                }
+                Down::ServerClosed { .. } => server_closed = true,
+                other => bail!("unexpected {other} during the response"),
             }
         }
         let keep = framer.keep_alive() && !server_closed;
@@ -1307,6 +1408,15 @@ mod tests {
         assert!(g.accept_record(&app_record(4, 1)).is_err());
         // The next splice must take the next sequence number: 1 + 1 + 2 records.
         assert!(g.accept_splice(5, &nonce_for(5)).is_err());
+        // The first splice is pinned to 1: the client's Finished was record 0.
+        assert!(Gate::new().accept_splice(2, &nonce_for(2)).is_err());
+        // An alert while idle takes a sequence number too.
+        let mut g3 = Gate::new();
+        g3.accept_splice(1, &nonce_for(1)).unwrap();
+        g3.spliced(1, &nonce_for(1), 0);
+        g3.accept_record(&[ALERT, 3, 3, 0, 1, 0]).unwrap();
+        assert!(g3.accept_splice(2, &nonce_for(2)).is_err());
+        assert!(g3.accept_splice(3, &nonce_for(3)).is_ok());
         let mut g2 = Gate::new();
         g2.accept_splice(1, &nonce_for(1)).unwrap();
         g2.spliced(1, &nonce_for(1), 100);
@@ -1314,12 +1424,14 @@ mod tests {
         g2.accept_record(&app_record(3, 60)).unwrap();
         g2.accept_splice(4, &nonce_for(4)).unwrap();
         assert_eq!(g2.phase, Phase::Splicing);
-        // While splicing, no application data; alerts pass.
+        // While splicing, no application data; alerts pass and take a
+        // sequence number.
         assert!(g2.accept_record(&app_record(5, 1)).is_err());
         g2.accept_record(&[ALERT, 3, 3, 0, 1, 0]).unwrap();
-        // A refused lease returns to idle, and the same seq is fine again.
+        // A refused lease returns to idle; the next splice follows the alert.
         g2.splice_failed();
         assert_eq!(g2.phase, Phase::Idle);
-        g2.accept_splice(4, &nonce_for(4)).unwrap();
+        assert!(g2.accept_splice(4, &nonce_for(4)).is_err());
+        g2.accept_splice(5, &nonce_for(5)).unwrap();
     }
 }

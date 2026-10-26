@@ -58,10 +58,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Request header for the Messages API with a subscription token, as the
 /// lembas pool sends it.
 const MESSAGES_TEMPLATE: &str = "POST /v1/messages HTTP/1.1\r\nHost: {host}\r\n\
-    Content-Length: {body_len}\r\nAuthorization: Bearer {token}\r\n\
-    Content-Type: application/json\r\nanthropic-version: 2023-06-01\r\n\
+    Content-Length: {body_len}\r\nContent-Type: application/json\r\n\
+    anthropic-version: 2023-06-01\r\n\
     anthropic-beta: claude-code-20250219,oauth-2025-04-20\r\n\
-    user-agent: claude-cli/2.1.0 (external, cli)\r\naccept-encoding: identity\r\n\r\n";
+    user-agent: claude-cli/2.1.0 (external, cli)\r\naccept-encoding: identity\r\n\
+    Authorization: Bearer {token}\r\n\r\n";
 
 /// How long to wait for the peer to acknowledge the end of the link.
 const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);

@@ -32,10 +32,11 @@ The borrower owns the TLS session; the pool is a relay that inserts exactly one 
    handshake is done the borrower takes the traffic keys and both sequence numbers out
    of rustls (`dangerous_extract_secrets`) and runs the record layer itself from then
    on.
-2. **The pool's record.** The borrower sends the pool a template: the request line,
-   `Host`, `Content-Length` and an `Authorization: Bearer` line whose value is a
-   placeholder span. The pool checks the template (see "Policy" below) and asks for the
-   one record that carries the token. It needs two things it cannot compute alone:
+2. **The pool's record.** The borrower sends the pool the whole request head as a
+   template: the request line, `Host`, `Content-Length`, its other headers, and last
+   an `Authorization: Bearer` line whose value is a placeholder span, then the blank
+   line. The pool checks the template (see "Policy" below) and asks for the one record
+   that carries the token. It needs two things it cannot compute alone:
    - **Keystream** for the record's blocks: AES under the borrower's client key. The
      borrower **proves it in zero knowledge** (mpz's QuickSilver VM over ferret
      correlated OT): one key-schedule circuit and one AES block per 16 bytes of the
@@ -53,8 +54,8 @@ The borrower owns the TLS session; the pool is a relay that inserts exactly one 
      the tag.
    The pool XORs the token into the keystream locally, assembles the record and writes
    it to the server itself. Nothing of it goes back to the borrower.
-3. **Everything else.** The borrower continues with its own records (sequence number
-   +1): the remaining headers, the blank line, the body. The pool relays bytes it
+3. **The body.** The borrower continues with its own records (sequence number +1):
+   exactly `Content-Length` bytes of body, nothing else. The pool relays bytes it
    cannot read or forge.
 4. **Response, streamed.** The pool forwards the server's bytes as they arrive and the
    borrower decrypts record by record. The pool can't inject, change, drop or reorder
@@ -72,11 +73,19 @@ The borrower owns the TLS session; the pool is a relay that inserts exactly one 
   costs nothing. (It also means a TLS 1.3 borrower cannot use the splice: its
   `Finished` already looks like application data. The record format of the spliced
   record is TLS 1.2's anyway.)
+- **The whole head is the pool's.** Everything the server can parse as framing is
+  written by the pool and checked: the record runs through the blank line, and after it
+  the borrower sends exactly `Content-Length` bytes of body. A body cannot carry a
+  `Transfer-Encoding` or a second request in front of the next token record, whatever
+  the server's parser prefers. (An earlier version let the borrower send its own
+  headers after the pool's record and only counted their declared length; a borrower
+  could have transmitted different ones, see finding 31.)
 - **The template** (`check_template`): the span is exactly the value of an
-  `Authorization: Bearer` header, which is the last line of the pool's record; `Host`
-  is the server the pool connects to; exactly one `Content-Length`, at most 64 MB; no
-  header twice; the span is block aligned and its length is the token length rounded up
-  to 16 bytes. With the **108-byte credential invariant** (`TOKEN_LEN`: subscription
+  `Authorization: Bearer` header, the last header line; `Host` is the server the pool
+  connects to; exactly one `Content-Length`, decimal digits only, at most 64 MB; no
+  `Transfer-Encoding`; no header twice; the head at most 1 KB (`MAX_HEADER_LEN`; the
+  proxy drops Claude Code's telemetry headers to keep it around 450 bytes); the span is
+  block aligned and its length is the token length rounded up to 16 bytes. With the **108-byte credential invariant** (`TOKEN_LEN`: subscription
   tokens and API keys are both 108 bytes) the pool has 4 bytes of slack inside the span,
   too few to smuggle a header; a pool with a credential of any other length refuses to
   lend, and a borrower refuses a pool that announces any other length.
@@ -112,30 +121,38 @@ proves the records one at a time. Frames carry a connection id; the pool keeps p
 connection the state it needs to enforce, before every token record, that the record
 begins a fresh HTTP request:
 
-- before the first splice on a connection only handshake records pass;
-- after a splice the borrower may send exactly the announced request length (its
-  remaining headers plus `Content-Length` of body; the borrower now sends the pool its
-  whole header, which the pool checks and counts but does not encrypt), measured from
-  the relayed records' plaintext lengths: fewer bytes would make the next token record
+- before the first splice on a connection only handshake records pass, and the first
+  splice takes sequence number 1 (a TLS 1.2 client sends one encrypted record, its
+  `Finished`, before application data);
+- after a splice the borrower may send exactly `Content-Length` bytes of body, measured
+  from the relayed records' plaintext lengths: fewer would make the next token record
   part of this body, more would make it the body of a pipelined request;
 - the next splice must announce the sequence number the pool expects from the records
-  it counted, and no borrower record may reuse a token record's explicit nonce.
+  it counted (alerts included: they take sequence numbers too), and no borrower record
+  may reuse a token record's explicit nonce.
 
 A request's frame, proof and tag share go out under one lock on the borrower, and the
 pool runs its proofs on one task in arrival order, so the two transcripts on the `mpc`
-channel line up whatever the concurrency. The pool answers each request with
-`Accepted` (a lender was found; the proof starts) or `Refused` (nobody lends right now;
-the connection stays usable). A connection the server closed while idle is noticed
-before anything is sent and the request moves to a fresh one. Every 32 requests the
-borrower renews the setup (mpz's VMs keep every wire they ever allocated, about 3 MB
-per request on each side), one more OT setup for bounded memory.
+channel line up whatever the concurrency. The lender lookup rides inside that queued
+job, so a slow one delays proofs, which are sequential anyway, and not the relay. The
+pool answers each request with `Accepted` (a lender was found; the proof starts) or
+`Refused` (nobody lends right now; the connection stays usable), and with `Aborted` if
+the connection went away before the record could be written, in which case nothing
+reached the server and the borrower moves the request to a fresh connection. A proof
+that fails to verify ends the session; a socket that fails ends only that connection.
+Since the record is the whole head, the server may start answering before the body
+(a rejection, an early response); those bytes are kept for the response phase. Writes
+to each server connection are queued per connection with a byte cap, so one slow
+server cannot stall the others. Every 256 requests the borrower renews the setup, a
+safety net for the slow growth of the VMs' memory.
 
 The pool side takes a token per request from its parent over a control descriptor
 (`--control-fd 3`, JSON lines), so lenders are chosen per request and can change
-within a session. The borrower side is a local HTTP/1.1 proxy (`lembas-mpc proxy`):
-the agent sends each request as plain HTTP to a local port and reads the response as
-the server sent it, plus one header, `x-lembas-request`, the pool's number for the
-request, which the agent quotes when it reports the outcome.
+within a session; the pool allows a member two sessions at once. The borrower side is
+a local HTTP/1.1 proxy (`lembas-mpc proxy`): the agent sends each request as plain
+HTTP to a local port and reads the response as the server sent it, one connection per
+request, plus one header, `x-lembas-request`, the pool's number for the request, which
+the agent quotes when it reports the outcome.
 
 ## What each side can do
 
@@ -167,10 +184,10 @@ history under `mpc-tls/`, with their measurements below.
 The link carries three mux channels, opened in the same order on both sides: `mpc` for
 the two-party computation, `up` for everything the borrower sends, `down` for
 everything the pool sends (its `Hello` first). Up: `Open`, `Bytes`, `Request { header,
-trailer, seq, nonce }`, `TagShare`, `Close`, `Renew`, `Done`; down: `Opened`,
-`OpenFailed`, `Bytes`, `Accepted { req }`, `Spliced { req }`, `Refused`,
-`ServerClosed`; all but `Renew`/`Done` carry a connection id. `Hello` starts with
-`PROTOCOL_VERSION`, now 5; an old peer gets a clean refusal.
+seq, nonce }`, `TagShare`, `Close`, `Renew`, `Done`; down: `Opened`, `OpenFailed`,
+`Bytes`, `Accepted { req }`, `Spliced { req }`, `Refused`, `Aborted`, `ServerClosed`;
+all but `Renew`/`Done` carry a connection id. `Hello` starts with `PROTOCOL_VERSION`,
+now 6; an old peer gets a clean refusal.
 
 The demo (`demo`) runs the pool, the borrower and tlsn's echo server in one process
 over in-memory pipes: one session, `--requests` requests `--concurrency` at a time
@@ -421,15 +438,39 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
    TLSNotary is published in its git repositories (the multiplexer in `tlsn-utils`, the
    test server in `tlsn`), and cargo resolves a workspace member from a git dependency
    by name. No fork, no patch, a 45 s incremental build.
+31. **A declared trailer is not a transmitted one.** (From the second external review
+   of the sessions.) The first session design let the borrower send its remaining
+   headers itself and had the pool check a *declared* copy and count bytes. The pool
+   cannot read what is actually sent, so a borrower could transmit `Transfer-Encoding:
+   chunked` and a pipelined request head inside the byte budget and make the next token
+   record the body of its own request, if the server framed by the chunking. The gate's
+   guarantee held only for honest borrowers. Now the record is the whole head and the
+   borrower sends only body bytes; the guarantee no longer depends on the server's
+   parser. Cost: about twice the proof with Claude Code's essential headers (the proxy
+   drops its telemetry ones).
+32. **`parse::<usize>()` accepts `+5`.** Two HTTP parsers disagreeing on a length is
+   how smuggling starts; `Content-Length` is digits only, everywhere it is read.
+33. **A socket failure is not cheating.** The first version ended the session on any
+   error in the splice job, including the server or the borrower closing the connection
+   mid-splice. Only a proof that fails to verify is fatal now; the rest ends one
+   connection, and `Aborted` tells the borrower the record was never written, which is
+   what makes its retry safe.
+34. **Nothing waits in the frame loop.** The lender lookup (a round trip to the parent,
+   possibly with a live usage fetch) and a full write queue to one slow server both
+   used to stall every connection's bytes. The lookup moved into the proof job; writes
+   are queued per connection with a cap.
+35. **The server may answer the head.** With the blank line in the pool's record, a
+   server can respond (a 4xx, or an echo server's status line) before the body is sent.
+   The borrower keeps such records for the response phase instead of treating them as
+   an error, which the first whole-head build did.
 
 ## Open
 
 - **Memory.** About 165 MB per helper at steady state, mostly allocator high-water
   mark from each proof's temporaries. Reusing those buffers across proofs inside mpz
   (or a smaller ferret batch, at twice the download per request) would cut it.
-- **Cheaper circuit.** Fewer blocks (drop `Content-Length` from the pool's record if the
-  byte-count policy moves to counting relayed bytes), or the 4-byte salt as a private
-  input (cosmetic).
+- **Cheaper circuit.** The head is the proof's size; trimming more headers, or the
+  4-byte salt as a private input (cosmetic).
 - **Try it with a real friend over Tailscale Funnel.** The transport is verified: a
   session from this Mac to the live pool through its public Funnel address came up in
   0.3 s (the refusal that followed was the lending policy, nobody had capacity). What
