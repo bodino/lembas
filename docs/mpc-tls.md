@@ -250,8 +250,11 @@ parameters; it needs under a thousand correlations per request.
 
 ## In lembas (2026-10-25)
 
-Wired in behind a **Private Borrowing** switch in the app's ⚙ menu, stored as
-`privateBorrowing` in `~/.config/lembas.json` and re-read by the agent per request.
+**On by default** since 1.3.2 wherever the pool can lend privately. The switch in the
+app's ⚙ menu is stored as `privateBorrowing` in `~/.config/lembas.json` and re-read by
+the agent per request: unset means private, with the readable relay only when the pool
+itself answers that it has no helper; `true` is strict (never the relay); `false` is
+off. Any failure of the private path pauses borrowing rather than go readable.
 Since sessions, the agent keeps one helper and one WebSocket per pool for as long as it
 runs (started on the first borrowed request, replaced if it dies), and the pool keeps
 one helper per borrowing member.

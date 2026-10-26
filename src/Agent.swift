@@ -279,9 +279,19 @@ final class Agent {
 
   func tryPool(_ req: HTTPRequest, _ out: HTTPResponder) async -> Bool {
     guard let pool else { return false }
-    // With private borrowing on, never fall back to the relay the pool can read: if
-    // the private path fails, Claude Code gets Anthropic's own limit error instead.
-    if currentConfig()?.privateBorrowing == true { return await tryPrivate(req, out) }
+    // Private borrowing is the default wherever the pool can lend privately. Unset, the
+    // relay the pool can read is used only when the pool itself says it has no helper;
+    // any failure of the private path pauses borrowing instead (Claude Code gets
+    // Anthropic's own limit error). Set to true it is strict even for such a pool; set
+    // to false it is off.
+    let setting = currentConfig()?.privateBorrowing
+    if setting != false {
+      switch await tryPrivate(req, out) {
+      case .served: return true
+      case .unsupported where setting == nil: break // no helper at the pool: the relay it is
+      case .unsupported, .failed: return false
+      }
+    }
     do {
       let (bytes, upstream) = try await open(upstreamRequest(pool, req, poolAuth: true), out)
       await relay(bytes, upstream, out)

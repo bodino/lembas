@@ -40,13 +40,23 @@ func currentConfig() -> AgentConfig? {
 
 enum PrivateBorrowError: Error, CustomStringConvertible {
   case pool(String), helper(String), template(String)
+  /// The pool has no helper: a statement about the pool, not a failure.
+  case unsupported
   var description: String {
     switch self {
     case .pool(let m): return "pool: \(m)"
     case .helper(let m): return "helper: \(m)"
     case .template(let m): return "request: \(m)"
+    case .unsupported: return "pool: it cannot lend privately (no helper)"
     }
   }
+}
+
+/// How a private attempt ended, for the agent to decide what comes next.
+enum PrivateAttempt {
+  case served // the response reached Claude Code, whatever its status
+  case unsupported // the pool cannot lend privately at all
+  case failed // the private path failed; borrowing pauses rather than go readable
 }
 
 enum PrivateOutcome {
@@ -56,19 +66,23 @@ enum PrivateOutcome {
 
 extension Agent {
   // Up to three lenders: each attempt gets whichever the pool picks next.
-  func tryPrivate(_ req: HTTPRequest, _ out: HTTPResponder) async -> Bool {
-    guard let pool else { return false }
+  func tryPrivate(_ req: HTTPRequest, _ out: HTTPResponder) async -> PrivateAttempt {
+    guard let pool else { return .failed }
     for attempt in 0..<3 {
       let session: PrivateSession
       do {
         session = try await PrivateSessions.shared.session(pool: pool, poolToken: poolToken)
       } catch {
+        if case PrivateBorrowError.unsupported = error {
+          log("private borrow: the pool has no helper")
+          return .unsupported
+        }
         log("private borrow: no session: \(error)")
-        return false
+        return .failed
       }
       do {
         switch try await session.perform(req, out, agent: self) {
-        case .served: return true
+        case .served: return .served
         case .lenderExhausted:
           // Our report parks that lender; give it a moment to land before asking again.
           if attempt < 2 { try? await Task.sleep(nanoseconds: 300_000_000) }
@@ -76,10 +90,10 @@ extension Agent {
       } catch {
         log("private borrow failed: \(error)")
         if !session.alive { await PrivateSessions.shared.discard(session) }
-        return false
+        return .failed
       }
     }
-    return false
+    return .failed
   }
 }
 
@@ -153,6 +167,7 @@ final class PrivateSession {
     }
     guard hello["type"] as? String == "session" else {
       ws.cancel(with: .normalClosure, reason: nil)
+      if hello["code"] as? String == "unsupported" { throw PrivateBorrowError.unsupported }
       throw PrivateBorrowError.pool("\(hello["code"] ?? "error"): \(hello["message"] ?? first)")
     }
 

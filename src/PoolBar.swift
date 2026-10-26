@@ -141,7 +141,8 @@ final class Store: ObservableObject {
   @Published var lastApplied: String?
   @Published var subscriptionConnected = false
   @Published var routedThroughPool = false
-  @Published var privateBorrowing = false
+  @Published var privateBorrowing = true // on unless the config says otherwise
+  @Published var privateStrict = false // set to true explicitly: never the readable relay
   @Published var poolSupportsPrivate = false // the pool has the MPC helper
   @Published var connectHint: String?
   @Published private var savedSettings: [String] = []
@@ -178,18 +179,22 @@ final class Store: ObservableObject {
     if let data = try? Data(contentsOf: Self.configURL),
        let cfg = try? JSONDecoder().decode(Config.self, from: data) {
       config = cfg
-      privateBorrowing = cfg.privateBorrowing ?? false
+      privateBorrowing = cfg.privateBorrowing ?? true
+      privateStrict = cfg.privateBorrowing == true
       if !AppLocation.isTranslocated { Task { try? await ensureAgentInstalled() } }
     }
   }
 
-  // Private borrowing is a strict switch: with it on, the agent never falls back to the
-  // relay the pool can read, so a pool without the helper means borrowing is paused.
+  // Private borrowing is on by default wherever the pool can lend privately. Switched
+  // on by hand it is strict: the agent never falls back to the relay the pool can read,
+  // so a pool without the helper means borrowing is paused. Switched off, borrowed
+  // requests go through the readable relay.
   func setPrivateBorrowing(_ on: Bool) {
     guard var cfg = config else { return }
     cfg.privateBorrowing = on
     saveConfig(cfg)
     privateBorrowing = on
+    privateStrict = on
   }
 
   private func number(_ value: Any?) -> Double {
@@ -1884,11 +1889,13 @@ struct MainView: View {
         if let me = store.me { Text("Signed in as \(prettyName(me))") }
         Button(store.subscriptionConnected ? "Reconnect Subscription…" : "Connect Subscription…") { store.runConnect() }
         Divider()
-        // Borrowed requests go through MPC-TLS: the pool lends the token but can't read
-        // the request or the answer. Strict: no fallback to the readable relay.
+        // Borrowed requests go through the private path: the pool lends the token but
+        // can't read the request or the answer. On by default where the pool can.
         Toggle("Private Borrowing", isOn: Binding(get: { store.privateBorrowing }, set: { store.setPrivateBorrowing($0) }))
         if store.privateBorrowing && store.online && !store.poolSupportsPrivate {
-          Text("Your pool can't lend privately yet, so borrowing is paused.")
+          Text(store.privateStrict
+            ? "Your pool can't lend privately yet, so borrowing is paused."
+            : "Your pool can't lend privately yet, so borrowed requests use its relay.")
         }
         Divider()
         Button("Check for Updates…") { Task { await store.checkForUpdate(force: true) } }
@@ -1910,7 +1917,8 @@ struct MainView: View {
 
   private var subtitle: String {
     let who = store.me.map { prettyName($0) + " · " } ?? ""
-    let mode = store.routedThroughPool ? (store.privateBorrowing ? "Fallback on · private" : "Fallback on") : "Fallback off"
+    let privately = store.privateBorrowing && (store.poolSupportsPrivate || store.privateStrict)
+    let mode = store.routedThroughPool ? (privately ? "Fallback on · private" : "Fallback on") : "Fallback off"
     return who + mode
   }
 }
