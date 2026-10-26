@@ -13,7 +13,10 @@ const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_MESSAGE = 64 << 20;
 
 export class WebSocketConnection extends EventEmitter {
-  private pending = Buffer.alloc(0);
+  // Bytes received and not yet parsed, as they came: joined only when a whole frame is
+  // in, so a large frame arriving in small pieces costs linear, not quadratic, copying.
+  private pending: Buffer[] = [];
+  private pendingBytes = 0;
   private fragments: Buffer[] = [];
   private fragmentBytes = 0;
   private fragmentText = false;
@@ -37,7 +40,9 @@ export class WebSocketConnection extends EventEmitter {
   // Answers the upgrade; returns undefined (socket closed) if it isn't a WebSocket request.
   static accept(req: IncomingMessage, socket: Duplex, head: Buffer): WebSocketConnection | undefined {
     const key = req.headers["sec-websocket-key"];
-    if (req.headers.upgrade?.toLowerCase() !== "websocket" || typeof key !== "string" || req.headers["sec-websocket-version"] !== "13") {
+    // The key is 16 random bytes in base64: 22 characters and two pads.
+    if (req.headers.upgrade?.toLowerCase() !== "websocket" || typeof key !== "string" || !/^[A-Za-z0-9+/]{22}==$/.test(key) ||
+        req.headers["sec-websocket-version"] !== "13") {
       socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return undefined;
@@ -89,33 +94,53 @@ export class WebSocketConnection extends EventEmitter {
     return this.socket.write(Buffer.concat([header, payload]));
   }
 
+  // The first `n` pending bytes, without consuming them.
+  private peek(n: number): Buffer {
+    if (this.pending.length === 1) return this.pending[0].subarray(0, n);
+    return Buffer.concat(this.pending, Math.min(n, this.pendingBytes));
+  }
+
+  private take(n: number): Buffer {
+    const out = this.pending.length === 1 ? this.pending[0].subarray(0, n) : Buffer.concat(this.pending, this.pendingBytes).subarray(0, n);
+    let rest = Buffer.concat(this.pending, this.pendingBytes).subarray(n);
+    if (this.pending.length === 1) rest = this.pending[0].subarray(n);
+    this.pending = rest.length ? [rest] : [];
+    this.pendingBytes = rest.length;
+    return out;
+  }
+
   private feed(chunk: Buffer): void {
-    this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
+    if (chunk.length) {
+      this.pending.push(chunk);
+      this.pendingBytes += chunk.length;
+    }
     for (;;) {
-      const buf = this.pending;
-      if (buf.length < 2) return;
-      const fin = (buf[0] & 0x80) !== 0;
-      const opcode = buf[0] & 0x0f;
-      const masked = (buf[1] & 0x80) !== 0;
-      let length = buf[1] & 0x7f;
+      if (this.pendingBytes < 2) return;
+      const head = this.peek(10);
+      const fin = (head[0] & 0x80) !== 0;
+      const opcode = head[0] & 0x0f;
+      const masked = (head[1] & 0x80) !== 0;
+      let length = head[1] & 0x7f;
       let offset = 2;
       if (length === 126) {
-        if (buf.length < 4) return;
-        length = buf.readUInt16BE(2);
+        if (head.length < 4) return;
+        length = head.readUInt16BE(2);
         offset = 4;
       } else if (length === 127) {
-        if (buf.length < 10) return;
-        const big = buf.readBigUInt64BE(2);
+        if (head.length < 10) return;
+        const big = head.readBigUInt64BE(2);
         if (big > BigInt(MAX_MESSAGE)) return this.fail("message too large");
         length = Number(big);
         offset = 10;
       }
       if (!masked) return this.fail("client frames must be masked");
-      if (buf.length < offset + 4 + length) return;
-      const mask = buf.subarray(offset, offset + 4);
-      const payload = Buffer.from(buf.subarray(offset + 4, offset + 4 + length));
+      // Control frames (close, ping, pong) are short and never fragmented.
+      if (opcode >= 0x8 && (length > 125 || !fin)) return this.fail("bad control frame");
+      if (this.pendingBytes < offset + 4 + length) return;
+      const frame = this.take(offset + 4 + length);
+      const mask = frame.subarray(offset, offset + 4);
+      const payload = Buffer.from(frame.subarray(offset + 4, offset + 4 + length));
       for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
-      this.pending = buf.subarray(offset + 4 + length);
 
       switch (opcode) {
         case 0x0: // continuation

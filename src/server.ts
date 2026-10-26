@@ -1,15 +1,15 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { accessSync, chmodSync, constants as fsConstants, readFileSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants as fsConstants, fchmodSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { Ledger, type LendPolicy, type LendRule } from "./ledger.ts";
-import { costUsd } from "./pricing.ts";
-import { UsageTap } from "./usageTap.ts";
 import { WebSocketConnection } from "./ws.ts";
 
 type User = {
   token: string; // what this person puts in Claude Code to talk to the pool
-  claudeToken: string; // their sk-ant-oat01-... from `claude setup-token`, carries their Pro/Max subscription
+  // Legacy: an sk-ant-oat01-... from `claude setup-token`, from before the login flow.
+  // Dropped the moment the member connects their subscription (OAuth in the ledger).
+  claudeToken?: string;
   // The invite they joined with, kept until they connect a subscription: leaving before
   // that (going back during setup) makes the code valid again.
   invite?: { code: string; by?: string; expiresAt: number };
@@ -24,6 +24,9 @@ type Config = {
   limitCooldownMinutes?: number;
   // How long to trust Anthropic's usage numbers; the endpoint is aggressively rate-limited.
   usageCacheSeconds?: number;
+  // A member may borrow only while one of their own usage windows is at least this full
+  // (percent), as read from Anthropic with their token. Default 90. Lower it for tests.
+  borrowAtPercent?: number;
   // Members allowed to invite and remove people from the menu bar app.
   admins?: string[];
   // Public HTTPS address from Tailscale Funnel, e.g. "https://mac.tail1234.ts.net".
@@ -45,10 +48,16 @@ const LIMIT_COOLDOWN_MS = (config.limitCooldownMinutes ?? 20) * 60_000;
 // Lending checks against this, so keep it fresh; borrowed calls no longer bust it,
 // because Anthropic rate-limits the usage endpoint hard.
 const USAGE_CACHE_MS = (config.usageCacheSeconds ?? 60) * 1000;
+const BORROW_AT_PERCENT = config.borrowAtPercent ?? 90;
+// Members' requests to the pool carry JSON settings and reports, never model calls.
+const MAX_BODY = 64 * 1024;
+// A private session is closed after this long; the agent opens a fresh one, so the
+// pool re-checks membership and the lending policy from scratch at least daily.
+const SESSION_MAX_MS = 24 * 3_600_000;
 const ledger = new Ledger(config.statePath ?? "state.json");
 
-// Private borrowing needs the MPC helper; without it the route says so and the agent
-// pauses borrowing rather than falling back to the relay the pool can read.
+// Borrowing is private, and only private: it needs the MPC helper. Without it this
+// pool cannot lend at all; the route says so and members' agents pause borrowing.
 const MPC_HELPER = config.mpc?.helper ?? new URL("../build/lembas-mpc", import.meta.url).pathname;
 // A borrower's share of the handshake plus a body up to the helper's 64 MB limit.
 // Over a whole session; the helper bounds each request on its own.
@@ -67,10 +76,6 @@ function mpcAvailable(): boolean {
 // only ever talks to the token endpoint to refresh what they deposited.
 const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-
-// Headers that belong to one hop, or that we replace, and must not be copied across.
-const REQUEST_HEADERS_TO_DROP = new Set(["host", "connection", "content-length", "authorization", "x-api-key", "accept-encoding"]);
-const RESPONSE_HEADERS_TO_DROP = new Set(["connection", "content-length", "content-encoding", "transfer-encoding", "keep-alive"]);
 
 // ---------- which credential does this member use upstream? ----------
 
@@ -95,6 +100,13 @@ async function refreshOAuth(name: string): Promise<string | null> {
         }),
         signal: AbortSignal.timeout(15_000),
       });
+      if (res.status === 400 || res.status === 401) {
+        // The refresh token itself was rejected (revoked, rotated elsewhere): this
+        // login is gone and the member has to connect again.
+        console.log(`[pool] ${name}'s login was rejected by Anthropic (HTTP ${res.status}); their subscription is disconnected`);
+        ledger.clearOAuth(name);
+        return null;
+      }
       if (!res.ok) throw new Error(`refresh failed: HTTP ${res.status}`);
       const body = (await res.json()) as { access_token?: string; refresh_token?: string; expires_at?: number; expires_in?: number };
       if (!body.access_token || !body.refresh_token) throw new Error("refresh response missing tokens");
@@ -103,8 +115,8 @@ async function refreshOAuth(name: string): Promise<string | null> {
       ledger.setOAuth(name, { accessToken: body.access_token, refreshToken: body.refresh_token, expiresAt });
       return body.access_token;
     } catch (err) {
-      console.log(`[pool] ${name}'s OAuth refresh failed (${(err as Error).message}); falling back to setup token`);
-      ledger.clearOAuth(name);
+      // Network trouble or an odd answer: keep the login and try again next time.
+      console.log(`[pool] ${name}'s OAuth refresh failed (${(err as Error).message}); keeping their login for now`);
       return null;
     } finally {
       refreshInFlight.delete(name);
@@ -114,16 +126,21 @@ async function refreshOAuth(name: string): Promise<string | null> {
   return task;
 }
 
-// The bearer token to use for `name` upstream: their OAuth token when available
-// (refreshing if within 2 minutes of expiry), otherwise their setup token.
+// The bearer token to use for `name` upstream: their OAuth token (refreshed when within
+// 2 minutes of expiry), or a legacy setup token. Throws when there is none that works,
+// so a lease is refused rather than made with a credential known to be bad.
 async function anthropicToken(name: string): Promise<string> {
   const tokens = ledger.oauth(name);
   if (tokens) {
     if (tokens.expiresAt - 120_000 > Date.now()) return tokens.accessToken;
     const refreshed = await refreshOAuth(name);
     if (refreshed) return refreshed;
+    if (tokens.expiresAt > Date.now() && ledger.oauth(name)) return tokens.accessToken; // refresh hiccup, still valid
+    throw new Error(`${name}'s login could not be refreshed`);
   }
-  return users[name].claudeToken;
+  const legacy = users[name]?.claudeToken;
+  if (legacy && legacy.startsWith("sk-ant-")) return legacy;
+  throw new Error(`${name} has not connected a subscription`);
 }
 
 // ---------- how much of each subscription is left ----------
@@ -133,17 +150,25 @@ type Utilization = {
   sevenDay: number;
   resetsAt: number | null;
   sevenDayResetsAt: number | null;
+  // Every window Anthropic reports for this account (the two above plus any
+  // model-specific ones, e.g. a weekly Opus window), by its name, in percent.
+  windows: Record<string, number>;
+  // Anthropic has locked the account out of some window regardless of the percentage.
+  locked: boolean;
 };
-const usageCache = new Map<string, { at: number; usage: Utilization | null }>();
+type UsageProbe = { usage: Utilization | null; status: number | null };
+const usageCache = new Map<string, { at: number } & UsageProbe>();
 
 // Asks Anthropic the same thing Claude Code's /usage command asks: how full are this
-// person's 5-hour and 7-day windows, as a percentage. Cached because Anthropic rate
-// limits this endpoint hard. Returns null when it can't be measured.
-async function fetchUtilization(name: string): Promise<Utilization | null> {
+// person's usage windows, as a percentage. Cached because Anthropic rate limits this
+// endpoint hard. `status` is the HTTP status of the last real answer (401 means the
+// login is dead), null when nothing came back.
+async function probeUsage(name: string, maxAgeMs = USAGE_CACHE_MS): Promise<UsageProbe> {
   const cached = usageCache.get(name);
-  if (cached && Date.now() - cached.at < USAGE_CACHE_MS) return cached.usage;
+  if (cached && Date.now() - cached.at < maxAgeMs) return cached;
 
   let usage: Utilization | null = null;
+  let status: number | null = null;
   try {
     const token = await anthropicToken(name);
     const res = await fetch(UPSTREAM + "/api/oauth/usage", {
@@ -156,23 +181,52 @@ async function fetchUtilization(name: string): Promise<Utilization | null> {
       },
       signal: AbortSignal.timeout(10_000),
     });
+    status = res.status;
     if (res.ok) {
-      const body = (await res.json()) as {
-        five_hour?: { utilization?: number; resets_at?: string };
-        seven_day?: { utilization?: number; resets_at?: string };
-      };
+      const body = (await res.json()) as Record<string, { utilization?: unknown; resets_at?: string; locked_reason?: unknown } | null>;
+      const windows: Record<string, number> = {};
+      let locked = false;
+      for (const [key, value] of Object.entries(body)) {
+        if (key === "extra_usage" || typeof value !== "object" || value === null) continue;
+        if (typeof value.utilization === "number" && Number.isFinite(value.utilization)) windows[key] = value.utilization;
+        if (value.locked_reason) locked = true;
+      }
       usage = {
-        fiveHour: body.five_hour?.utilization ?? 0,
-        sevenDay: body.seven_day?.utilization ?? 0,
+        fiveHour: windows.five_hour ?? 0,
+        sevenDay: windows.seven_day ?? 0,
         resetsAt: body.five_hour?.resets_at ? Date.parse(body.five_hour.resets_at) : null,
         sevenDayResetsAt: body.seven_day?.resets_at ? Date.parse(body.seven_day.resets_at) : null,
+        windows,
+        locked,
       };
     }
   } catch {
-    // Network or parse failure; fall through with null.
+    // Network or parse failure, or no credential; fall through with null.
   }
-  usageCache.set(name, { at: Date.now(), usage });
-  return usage;
+  const probe = { at: Date.now(), usage, status };
+  usageCache.set(name, probe);
+  return probe;
+}
+
+async function fetchUtilization(name: string): Promise<Utilization | null> {
+  return (await probeUsage(name)).usage;
+}
+
+// Has this member really run out? True when any of their windows is at the threshold
+// or Anthropic has locked one. Read with their own token, so a borrower can't claim a
+// limit they don't have; a model-specific window counts, since the pool can't see
+// which model a private request is for.
+function atLimit(usage: Utilization): boolean {
+  return usage.locked || Object.values(usage.windows).some((pct) => pct >= BORROW_AT_PERCENT);
+}
+
+// Whether `caller` may borrow at all right now, before any lender is considered.
+type BorrowGate = { ok: true } | { ok: false; reason: "unconnected" | "usage_unknown" | "not_at_limit" };
+async function borrowGate(caller: string): Promise<BorrowGate> {
+  if (!ledger.oauth(caller)) return { ok: false, reason: "unconnected" };
+  const usage = await fetchUtilization(caller);
+  if (!usage) return { ok: false, reason: "usage_unknown" };
+  return atLimit(usage) ? { ok: true } : { ok: false, reason: "not_at_limit" };
 }
 
 // ---------- who may borrow from whom, right now ----------
@@ -225,8 +279,8 @@ async function availability(owner: string, consumer: string): Promise<Availabili
   return { headroom: left5h, left5h, leftWeek, reason: away ? "away" : "working" };
 }
 
-// Own token first; then whoever is sharing with the most headroom left.
-async function tokenOrder(caller: string): Promise<string[]> {
+// Whoever is lending to `caller` right now, most headroom first.
+async function lenderOrder(caller: string): Promise<string[]> {
   const donors: Array<[string, number]> = [];
   for (const name of Object.keys(users)) {
     if (name === caller) continue;
@@ -234,8 +288,7 @@ async function tokenOrder(caller: string): Promise<string[]> {
     if (headroom > 0) donors.push([name, headroom]);
   }
   donors.sort((a, b) => b[1] - a[1]);
-  const order = donors.map(([name]) => name);
-  return ledger.isParked(caller) ? order : [caller, ...order];
+  return donors.map(([name]) => name);
 }
 
 // ---------- HTTP plumbing ----------
@@ -253,12 +306,6 @@ function safeEqual(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-async function readBody(req: http.IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks);
-}
-
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
@@ -269,150 +316,11 @@ function sendError(res: http.ServerResponse, status: number, type: string, messa
   sendJson(res, status, { type: "error", error: { type, message } });
 }
 
-function errorSummary(body: string): string {
-  try {
-    const parsed = JSON.parse(body) as { error?: { type?: string; message?: string }; request_id?: string };
-    const type = parsed.error?.type ?? "unknown";
-    const message = parsed.error?.message ?? "";
-    return `${type}${message ? `: ${message.slice(0, 160)}` : ""}${parsed.request_id ? ` (req ${parsed.request_id})` : ""}`;
-  } catch {
-    return body.slice(0, 160) || "empty response";
-  }
-}
-
-function upstreamHeaders(req: http.IncomingMessage, bearer: string): Headers {
-  const headers = new Headers();
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (value === undefined || REQUEST_HEADERS_TO_DROP.has(name)) continue;
-    headers.set(name, Array.isArray(value) ? value.join(", ") : value);
-  }
-  headers.delete("x-api-key");
-  headers.set("authorization", `Bearer ${bearer}`);
-
-  // Subscription tokens are only accepted on requests that look like Claude Code.
-  // Merge (never overwrite) the required beta flags so client betas survive.
-  const betas = new Set(headers.get("anthropic-beta")?.split(",").map((b) => b.trim()).filter(Boolean) ?? []);
-  betas.add("claude-code-20250219");
-  betas.add("oauth-2025-04-20");
-  headers.set("anthropic-beta", [...betas].join(","));
-
-  if (!/^claude-cli\//.test(headers.get("user-agent") ?? "")) {
-    headers.set("user-agent", "claude-cli/2.1.0 (external, cli)");
-  }
-  headers.set("accept-encoding", "identity"); // keep the stream readable so we can count tokens
-  return headers;
-}
-
-// How long to skip this token after an upstream rejection, or null if it isn't one we handle.
-// Anthropic also emits short-lived 429s ("rate_limit_error", no retry-after) that are not
-// usage limits; those must be retried, not parked for 20 minutes.
-function parkDuration(status: number, headers: Headers, body: string): number | null {
-  if (status === 401) return 24 * 60 * 60_000; // dead/expired token: needs `claude setup-token` again
-  if (status === 429) {
-    const retryAfter = headers.get("retry-after");
-    if (retryAfter) {
-      const seconds = Number(retryAfter);
-      const ms = Number.isFinite(seconds) && seconds !== 0
-        ? seconds * 1000
-        : Math.max(0, Date.parse(retryAfter) - Date.now());
-      if (ms > 0) return Math.min(ms, 6 * 60 * 60_000);
-    }
-    // A usage limit (5-hour, weekly, …): the unified status header says so reliably; the
-    // wording varies, so it's only a fallback.
-    const unified = headers.get("anthropic-ratelimit-unified-status")?.toLowerCase() === "rejected";
-    if (unified || /usage limit|limit reached|reached your .{0,20}limit|weekly limit|5-hour limit/i.test(body)) {
-      const reset = Number(headers.get("anthropic-ratelimit-unified-reset"));
-      const untilReset = Number.isFinite(reset) ? reset * 1000 - Date.now() : 0;
-      return untilReset > 0 ? Math.min(untilReset, 6 * 60 * 60_000) : LIMIT_COOLDOWN_MS;
-    }
-    return null; // transient rate limit: let Claude Code retry the same token
-  }
-  if ((status === 400 || status === 402 || status === 403) && /credit balance/i.test(body)) {
-    return LIMIT_COOLDOWN_MS; // prepaid-key style failure, kept just in case
-  }
-  return null;
-}
-
 // ---------- routes ----------
 
-async function proxy(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
-  const body = await readBody(req);
-  let model: string | undefined;
-  try {
-    model = JSON.parse(body.toString()).model;
-  } catch {
-    // GET requests and non-JSON bodies have no model.
-  }
-
-  const order = await tokenOrder(caller);
-  if (order.length === 0) {
-    const until = ledger.parkedUntil(caller);
-    const when = until ? ` until ${new Date(until).toLocaleString()}` : "";
-    return sendError(
-      res,
-      429,
-      "rate_limit_error",
-      `Your token is parked by the pool${when} after a usage-limit response, and nobody in the pool has shared capacity to spare right now.`,
-    );
-  }
-
-  const abort = new AbortController();
-  res.on("close", () => {
-    if (!res.writableFinished) abort.abort();
-  });
-
-  for (const [i, owner] of order.entries()) {
-    const isLastOption = i === order.length - 1;
-    const bearer = await anthropicToken(owner);
-    const upstream = await fetch(UPSTREAM + req.url, {
-      method: req.method,
-      headers: upstreamHeaders(req, bearer),
-      body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
-      signal: abort.signal,
-    });
-
-    if (!upstream.ok) {
-      const text = await upstream.text();
-      if (upstream.status === 429 || upstream.status === 401) {
-        console.log(`[pool] ${owner} got upstream ${upstream.status} — ${errorSummary(text)}`);
-      }
-      const park = parkDuration(upstream.status, upstream.headers, text);
-      if (park !== null) {
-        ledger.park(owner, park);
-        console.log(`[pool] ${owner}'s token is ${upstream.status === 401 ? "dead (expired or revoked)" : "at its usage limit"}; parked for ${Math.round(park / 60_000)} min`);
-        if (!isLastOption) continue;
-      }
-      res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
-      return void res.end(text);
-    }
-
-    upstream.headers.forEach((value, name) => {
-      if (!RESPONSE_HEADERS_TO_DROP.has(name)) res.setHeader(name, value);
-    });
-    res.setHeader("x-pool-key-owner", owner);
-    res.writeHead(upstream.status);
-
-    const tap = new UsageTap(upstream.headers.get("content-type"));
-    try {
-      for await (const chunk of upstream.body ?? []) {
-        tap.push(chunk);
-        res.write(chunk);
-      }
-      res.end();
-    } finally {
-      // Runs on client disconnect too, so partially streamed replies still count.
-      const usd = costUsd(model, tap.finish());
-      if (usd > 0) {
-        ledger.record(owner, caller, usd);
-        const via = owner === caller ? "own token" : `${owner}'s token`;
-        console.log(`[pool] ${caller} ${model ?? req.url} ~$${usd.toFixed(4)} via ${via}`);
-      }
-    }
-    return;
-  }
-}
-
 async function status(caller: string): Promise<unknown> {
+  // `privateBorrowing`: whether this pool can lend at all (it has the helper); the
+  // name is from when the readable relay still existed, and older apps read it.
   const out: Record<string, unknown> = { you: caller, canInvite: isAdmin(caller), privateBorrowing: mpcAvailable() };
   const borrowingFrom: Record<string, unknown> = {};
   for (const name of Object.keys(users)) {
@@ -475,33 +383,58 @@ async function status(caller: string): Promise<unknown> {
   return out;
 }
 
-// ---------- private borrowing: a session of spliced token records, over a WebSocket ----------
+// ---------- borrowing: a session of spliced token records, over a WebSocket ----------
 //
-// The agent connects here when its "Private borrowing" switch is on and keeps the
-// connection for as long as it has requests: one session, many TLS connections to
+// The agent connects here when its member's own login is at a usage limit and keeps
+// the connection for as long as it has requests: one session, many TLS connections to
 // Anthropic, one spliced token record per request. The pool bridges binary frames to
 // `lembas-mpc pool --stdio`, which relays the agent's TLS bytes and writes the token
 // records, and can read nothing else (docs/mpc-tls.md). The helper asks for a token
-// per request over fd 3, and a lender is picked here each time. Because the pool
+// per request over fd 3, and a lender is picked here each time, after checking with
+// Anthropic that the borrower really is out: the pool holds every member's login, so
+// it reads the borrower's own usage rather than take their word. Because the pool
 // cannot see Anthropic's answers, the agent reports each request's outcome in a text
 // frame, naming the request number the helper gave it: usage to meter, or a usage
-// limit to park that lender. That is a trust the pool extends to the borrower.
+// limit on the lender's side. Those reports are checked against Anthropic too before
+// a lender is parked for everyone; an unconfirmed one only steers this session away
+// from that lender for a few minutes.
 
 let nextLease = 1;
 // Each session is a helper process of some 150 MB; a member gets a couple (the agent
 // keeps one, and a restart may overlap the old one briefly), not a fleet.
 const MAX_SESSIONS_PER_MEMBER = 2;
-const privateSessions = new Map<string, number>();
+const AVOID_MS = 3 * 60_000;
+type PrivateSession = {
+  caller: string;
+  leases: Map<number, { owner: string; at: number }>;
+  avoid: Map<string, number>; // lender -> until when this session skips them
+  ws: WebSocketConnection;
+};
+const privateSessions = new Map<string, Set<PrivateSession>>();
+
+// Every live session of a member ends: on removal, their open socket must not keep
+// drawing leases.
+function closeSessions(name: string, reason: string): void {
+  for (const session of privateSessions.get(name) ?? []) {
+    if (!session.ws.closed) {
+      session.ws.send(JSON.stringify({ type: "error", code: "closed", message: reason }));
+      session.ws.close(1000);
+    }
+  }
+}
 
 async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: URL): Promise<void> {
   const fail = (code: string, message: string) => {
     ws.send(JSON.stringify({ type: "error", code, message }));
     ws.close(1000);
   };
-  if (!mpcAvailable()) return fail("unsupported", "This pool has no MPC helper, so it can't lend privately.");
-  const open = privateSessions.get(caller) ?? 0;
-  if (open >= MAX_SESSIONS_PER_MEMBER) return fail("busy", `You already have ${open} private sessions open with this pool.`);
-  privateSessions.set(caller, open + 1);
+  if (!mpcAvailable()) return fail("unsupported", "This pool has no MPC helper, so it can't lend.");
+  const mine = privateSessions.get(caller) ?? new Set<PrivateSession>();
+  if (mine.size >= MAX_SESSIONS_PER_MEMBER) return fail("busy", `You already have ${mine.size} sessions open with this pool.`);
+  const session: PrivateSession = { caller, leases: new Map(), avoid: new Map(), ws };
+  mine.add(session);
+  privateSessions.set(caller, mine);
+  const poolToken = users[caller].token; // a rotated token means a different member
 
   const child = spawn(
     MPC_HELPER,
@@ -517,7 +450,6 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
   );
   const control = child.stdio[3] as import("node:stream").Duplex;
   const started = Date.now();
-  const leases = new Map<number, { owner: string; at: number }>();
   let fromBorrower = 0;
   let requests = 0;
   const finish = () => {
@@ -532,16 +464,30 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
   child.stderr.on("data", (chunk: Buffer) => {
     for (const line of chunk.toString().split("\n")) if (line.trim()) console.log(`[mpc ${caller}] ${line.trim()}`);
   });
+  const lifetime = setTimeout(() => {
+    console.log(`[pool] ${caller}'s session reached its maximum age; closing it`);
+    fail("closed", "This session reached its maximum age; open a new one.");
+  }, SESSION_MAX_MS);
 
   // A lender for each request, as the helper asks.
   const leaseToken = async (id: number) => {
     try {
-      const order = (await tokenOrder(caller)).filter((name) => name !== caller);
+      if (!Object.hasOwn(users, caller) || users[caller].token !== poolToken) {
+        controlSend({ type: "refuse", id, reason: "not_a_member" });
+        return fail("closed", "You are no longer a member of this pool.");
+      }
+      const gate = await borrowGate(caller);
+      if (!gate.ok) {
+        console.log(`[pool] ${caller} asked to borrow but ${describeGate(gate.reason)}`);
+        return controlSend({ type: "refuse", id, reason: gate.reason });
+      }
+      const now = Date.now();
+      const order = (await lenderOrder(caller)).filter((name) => (session.avoid.get(name) ?? 0) < now);
       if (order.length === 0) return controlSend({ type: "refuse", id, reason: "no_capacity" });
       const owner = order[0];
       const token = await anthropicToken(owner);
       const req = nextLease++;
-      leases.set(req, { owner, at: Date.now() });
+      session.leases.set(req, { owner, at: now });
       requests++;
       controlSend({ type: "token", id, token, req });
     } catch (err) {
@@ -565,7 +511,7 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
       }
       if (message.type === "need_token" && typeof message.id === "number") void leaseToken(message.id);
       else if (message.type === "spliced" && typeof message.req === "number") {
-        const lease = leases.get(message.req);
+        const lease = session.leases.get(message.req);
         if (lease) console.log(`[pool] ${caller} borrows ${lease.owner}'s token privately (request ${message.req})`);
       }
     }
@@ -576,19 +522,22 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
     if (!ws.send(chunk)) child.stdout.pause();
   });
   ws.on("drain", () => child.stdout.resume());
+  child.stdin.on("drain", () => ws.resume());
   ws.on("message", (data: Buffer, isText: boolean) => {
     if (!isText) {
       // The helper bounds each request; this only keeps Node's buffer honest over a
       // long session.
       fromBorrower += data.length;
       if (fromBorrower > MPC_MAX_FROM_BORROWER) return ws.close(1009, "too much data");
-      if (!child.stdin.destroyed && child.stdin.writable) child.stdin.write(data);
+      if (!child.stdin.destroyed && child.stdin.writable && !child.stdin.write(data)) ws.pause();
       return;
     }
-    recordPrivateResult(caller, leases, data.toString());
+    void recordPrivateResult(session, data.toString());
   });
   ws.on("close", () => {
-    privateSessions.set(caller, Math.max(0, (privateSessions.get(caller) ?? 1) - 1));
+    clearTimeout(lifetime);
+    mine.delete(session);
+    if (mine.size === 0) privateSessions.delete(caller);
     child.stdin.end();
     control.end();
     // The helper leaves on its own once its stdin ends; make sure of it.
@@ -601,7 +550,7 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
         child.kill("SIGKILL");
       }
     }, 10_000).unref();
-    console.log(`[pool] ${caller}'s private session ended after ${requests} requests (${Math.round((Date.now() - started) / 1000)} s)`);
+    console.log(`[pool] ${caller}'s session ended after ${requests} requests (${Math.round((Date.now() - started) / 1000)} s)`);
   });
   child.on("exit", (code) => {
     child.stdout.resume();
@@ -611,9 +560,18 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
   ws.send(JSON.stringify({ type: "session" }));
 }
 
-// What the borrower says Anthropic answered to one request. Bounds match the
-// direct-usage reports.
-function recordPrivateResult(caller: string, leases: Map<number, { owner: string; at: number }>, text: string): void {
+function describeGate(reason: "unconnected" | "usage_unknown" | "not_at_limit"): string {
+  switch (reason) {
+    case "unconnected": return "they have not connected a subscription";
+    case "usage_unknown": return "their usage can't be read right now";
+    case "not_at_limit": return `their own login is not at a usage limit (under ${BORROW_AT_PERCENT}%)`;
+  }
+}
+
+// What the borrower says Anthropic answered to one request. Usage is taken as
+// reported (bounded); a lender's limit or death is confirmed with Anthropic first.
+async function recordPrivateResult(session: PrivateSession, text: string): Promise<void> {
+  const { caller, leases } = session;
   let report: { type?: unknown; req?: unknown; status?: unknown; model?: unknown; usd?: unknown; forMs?: unknown; message?: unknown };
   try {
     report = JSON.parse(text);
@@ -634,17 +592,32 @@ function recordPrivateResult(caller: string, leases: Map<number, { owner: string
       return;
     }
     case "limit": {
-      const forMs = typeof report.forMs === "number" && Number.isFinite(report.forMs) && report.forMs > 0
-        ? Math.min(report.forMs, 6 * 60 * 60_000)
-        : LIMIT_COOLDOWN_MS;
-      ledger.park(owner, forMs);
-      console.log(`[pool] ${owner}'s token is at its usage limit (${caller} reports, privately); parked for ${Math.round(forMs / 60_000)} min`);
+      // Anthropic's numbers, at most 15 s old, decide; the usage endpoint lags a little
+      // behind a fresh 429, so a window within a few points of the threshold counts.
+      const probe = await probeUsage(owner, 15_000);
+      if (probe.usage && (probe.usage.locked || Object.values(probe.usage.windows).some((pct) => pct >= BORROW_AT_PERCENT - 5))) {
+        const forMs = typeof report.forMs === "number" && Number.isFinite(report.forMs) && report.forMs > 0
+          ? Math.min(report.forMs, 6 * 60 * 60_000)
+          : LIMIT_COOLDOWN_MS;
+        ledger.park(owner, forMs);
+        console.log(`[pool] ${owner}'s token is at its usage limit (${caller} reports, confirmed); parked for ${Math.round(forMs / 60_000)} min`);
+      } else {
+        session.avoid.set(owner, Date.now() + AVOID_MS);
+        console.log(`[pool] ${caller} reports a usage limit on ${owner}'s token that Anthropic doesn't show; skipping that lender for this session for ${AVOID_MS / 60_000} min`);
+      }
       return;
     }
-    case "dead":
-      ledger.park(owner, 24 * 60 * 60_000);
-      console.log(`[pool] ${owner}'s token is dead (${caller} got a 401, privately); parked for 24 h`);
+    case "dead": {
+      const probe = await probeUsage(owner, 15_000);
+      if (probe.status === 401) {
+        ledger.park(owner, 24 * 60 * 60_000);
+        console.log(`[pool] ${owner}'s token is dead (${caller} got a 401, confirmed); parked for 24 h`);
+      } else {
+        session.avoid.set(owner, Date.now() + AVOID_MS);
+        console.log(`[pool] ${caller} reports ${owner}'s token dead but it answers Anthropic; skipping that lender for this session for ${AVOID_MS / 60_000} min`);
+      }
       return;
+    }
     case "failed":
       console.log(`[pool] ${caller}'s private request on ${owner}'s token failed: ${String(report.message ?? "").slice(0, 200)}`);
       return;
@@ -666,13 +639,15 @@ const isPercent = (value: unknown): value is number =>
 
 // PUT /pool/share {"policy": {"away5h": 90, "week": 60, "awayAfterMinutes": 30},
 //                  "lendTo": {"max": {"away": true, "working5h": 40}}}
-// Either part may be sent alone. lendTo replaces the whole map; anyone omitted falls back
-// to the default (may borrow while you're away), so send {"away": false} to turn someone off.
+// Either part may be sent alone. lendTo is merged into the stored rules: members named
+// are set, members omitted keep their rule, so a partial update can't switch anyone on.
+// Send {"away": false, "working5h": 0} to turn someone off.
 async function setShare(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { policy?: unknown; lendTo?: unknown };
   try {
-    body = JSON.parse((await readBody(req)).toString());
-  } catch {
+    body = JSON.parse((await readSmallBody(req, MAX_BODY)).toString());
+} catch (err) {
+    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", 'Send JSON like {"lendTo":{"max":{"away":true,"working5h":0}}}.');
   }
   const { policy, lendTo } = body;
@@ -708,7 +683,7 @@ async function setShare(req: http.IncomingMessage, res: http.ServerResponse, cal
   }
 
   if (newPolicy) ledger.setPolicy(caller, newPolicy);
-  if (rules) ledger.setLendRules(caller, rules);
+  if (rules) ledger.setLendRules(caller, { ...ledger.lendRules(caller), ...rules });
   const who = Object.keys(users).filter((name) => name !== caller)
     .map((name) => [name, ledger.lendRule(caller, name)] as const)
     .filter(([, r]) => r.away || r.working5h > 0)
@@ -724,7 +699,8 @@ async function setPresence(req: http.IncomingMessage, res: http.ServerResponse, 
   let away: unknown;
   try {
     away = JSON.parse((await readSmallBody(req)).toString()).away;
-  } catch {
+} catch (err) {
+    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", 'Send {"away": true} or {"away": false}.');
   }
   if (typeof away !== "boolean") return sendError(res, 400, "invalid_request_error", "away must be true or false.");
@@ -739,8 +715,9 @@ async function setPresence(req: http.IncomingMessage, res: http.ServerResponse, 
 async function reportDirectUsage(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { usd?: unknown; model?: unknown };
   try {
-    body = JSON.parse((await readBody(req)).toString());
-  } catch {
+    body = JSON.parse((await readSmallBody(req, MAX_BODY)).toString());
+} catch (err) {
+    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send {\"usd\": 0.0123}.");
   }
   const usd = body.usd;
@@ -756,8 +733,9 @@ async function reportDirectUsage(req: http.IncomingMessage, res: http.ServerResp
 async function reportDirectLimit(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { forMs?: unknown };
   try {
-    body = JSON.parse((await readBody(req)).toString());
-  } catch {
+    body = JSON.parse((await readSmallBody(req, MAX_BODY)).toString());
+} catch (err) {
+    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send {\"forMs\": 60000}.");
   }
   const forMs = body.forMs;
@@ -769,19 +747,13 @@ async function reportDirectLimit(req: http.IncomingMessage, res: http.ServerResp
   sendJson(res, 200, { ok: true, parkedUntil: ledger.parkedUntil(caller) });
 }
 
-// Installer files live in ./installer next to src/. Served unauthenticated:
-// the pool is only reachable over the tailnet and these contain no secrets.
+// Served unauthenticated from ./installer: the join script and the invite page's logo.
+// The app itself always comes from GitHub releases, never from a pool.
 const INSTALLER_DIR = new URL("../installer/", import.meta.url);
 
 function serveInstaller(req: http.IncomingMessage, res: http.ServerResponse, file: string): void {
   const types: Record<string, string> = {
     "join.sh": "text/x-shellscript; charset=utf-8",
-    "login.mjs": "text/javascript; charset=utf-8",
-    "agent.mjs": "text/javascript; charset=utf-8",
-    // Apps before 1.2 updated from the pool; these two let them reach 1.2, which updates
-    // from GitHub releases instead. Remove once no member runs an older app.
-    "lembas.zip": "application/zip",
-    "version.json": "application/json",
     "logo.png": "image/png", // for the invite page
   };
   if (!types[file]) return sendError(res, 404, "not_found_error", "Not found.");
@@ -797,8 +769,9 @@ function serveInstaller(req: http.IncomingMessage, res: http.ServerResponse, fil
 async function setTokens(req: http.IncomingMessage, res: http.ServerResponse, caller: string): Promise<void> {
   let body: { accessToken?: unknown; refreshToken?: unknown; expiresAt?: unknown };
   try {
-    body = JSON.parse((await readBody(req)).toString());
-  } catch {
+    body = JSON.parse((await readSmallBody(req, MAX_BODY)).toString());
+} catch (err) {
+    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send accessToken, refreshToken, expiresAt from the login flow.");
   }
   const { accessToken, refreshToken, expiresAt } = body;
@@ -808,8 +781,9 @@ async function setTokens(req: http.IncomingMessage, res: http.ServerResponse, ca
   let exp = typeof expiresAt === "number" ? expiresAt : Date.now() + 3_600_000;
   if (exp < 1e12) exp *= 1000; // seconds -> ms
   ledger.setOAuth(caller, { accessToken, refreshToken, expiresAt: exp });
-  if (users[caller].invite) {
+  if (users[caller].invite || users[caller].claudeToken !== undefined) {
     delete users[caller].invite; // set up for real: their invite is used up
+    delete users[caller].claudeToken; // the login replaces any setup token
     saveConfig();
   }
   usageCache.delete(caller);
@@ -821,17 +795,22 @@ async function setTokens(req: http.IncomingMessage, res: http.ServerResponse, ca
 
 const FAILURE_WINDOW_MS = 10 * 60_000;
 const MAX_FAILURES_PER_CLIENT = 10;
-const MAX_FAILED_REDEEMS = 30; // across everyone: invite codes are the guessable secret
+const MAX_FAILED_REDEEMS = 100; // across everyone: invite codes are the guessable secret
+const MAX_TRACKED_CLIENTS = 10_000;
 const failures = new Map<string, number[]>();
 let failedRedeems: number[] = [];
 
 // Funnel traffic arrives from tailscaled on loopback with the real client in
-// X-Forwarded-For; anything else is a direct tailnet connection.
+// X-Forwarded-For; anything else is a direct tailnet connection. tailscaled is the
+// only proxy in front of the pool, so the address it added (the last one) is the
+// client's; anything before it the client wrote itself.
 function clientId(req: http.IncomingMessage): string {
   const socketIp = req.socket.remoteAddress ?? "?";
   const loopback = socketIp === "127.0.0.1" || socketIp === "::1" || socketIp === "::ffff:127.0.0.1";
   const forwarded = req.headers["x-forwarded-for"];
-  return loopback && typeof forwarded === "string" ? forwarded.split(",")[0].trim() : socketIp;
+  if (!loopback || typeof forwarded !== "string") return socketIp;
+  const hops = forwarded.split(",").map((h) => h.trim()).filter(Boolean);
+  return hops.at(-1) ?? socketIp;
 }
 
 function recent(times: number[], now = Date.now()): number[] {
@@ -845,16 +824,27 @@ function isBlocked(client: string): boolean {
 function recordFailure(client: string): void {
   const times = [...recent(failures.get(client) ?? []), Date.now()];
   failures.set(client, times);
+  if (failures.size > MAX_TRACKED_CLIENTS) {
+    // Forget quiet clients first (their windows have passed), then the oldest.
+    for (const [who, when] of failures) if (recent(when).length === 0) failures.delete(who);
+    for (const who of failures.keys()) {
+      if (failures.size <= MAX_TRACKED_CLIENTS / 2) break;
+      failures.delete(who);
+    }
+  }
   if (times.length === MAX_FAILURES_PER_CLIENT) console.log(`[pool] blocking ${client} for 10 min after repeated failures`);
 }
 
-// Unauthenticated endpoints must not buffer arbitrary uploads.
+// No route buffers arbitrary uploads: settings and reports are small JSON.
+class BodyTooLarge extends Error {
+  constructor() { super("body too large"); }
+}
 async function readSmallBody(req: http.IncomingMessage, limit = 4096): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > limit) throw new Error("body too large");
+    if (size > limit) throw new BodyTooLarge();
     chunks.push(chunk as Buffer);
   }
   return Buffer.concat(chunks);
@@ -875,8 +865,13 @@ function saveConfig(): void {
 // 16 characters from a 31-letter alphabet: ~79 bits, so guessing is hopeless even
 // before the redeem rate limit kicks in.
 function newInviteCode(): string {
-  const chars = [...randomBytes(16)].map((b) => INVITE_ALPHABET[b % INVITE_ALPHABET.length]).join("");
-  return chars.match(/.{4}/g)!.join("-");
+  const chars: string[] = [];
+  while (chars.length < 16) {
+    // Rejection sampling: 256 isn't a multiple of 31, so bytes past the last full
+    // multiple are thrown away rather than skew the first letters.
+    for (const b of randomBytes(32)) if (b < 248 && chars.length < 16) chars.push(INVITE_ALPHABET[b % INVITE_ALPHABET.length]);
+  }
+  return chars.join("").match(/.{4}/g)!.join("-");
 }
 
 // Admins invite from the menu bar app. Nobody is added yet: the person only becomes a
@@ -885,8 +880,9 @@ async function invite(req: http.IncomingMessage, res: http.ServerResponse, calle
   if (!isAdmin(caller)) return sendError(res, 403, "permission_error", "Only pool admins can invite people.");
   let name: unknown;
   try {
-    name = JSON.parse((await readBody(req)).toString()).name;
-  } catch {
+    name = JSON.parse((await readSmallBody(req, MAX_BODY)).toString()).name;
+} catch (err) {
+    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send {\"name\": \"...\"}.");
   }
   if (typeof name !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(name)) {
@@ -928,13 +924,13 @@ function findInvite(code: string): { name: string; by?: string; expiresAt: numbe
 }
 
 // GET /<invite code>: the link people receive. A read-only landing page — download
-// the app, then hand the code to it. Nothing is redeemed here; looking up wrong codes
-// counts toward the same lockout as guessing them.
+// the app, then hand the code to it. Nothing is redeemed here, and an old link (used,
+// expired) is an everyday thing, so it doesn't count toward the lockout; the codes
+// have 79 bits, and redeeming is what's rate-limited.
 function invitePage(req: http.IncomingMessage, res: http.ServerResponse, code: string): void {
   const client = clientId(req);
   const invite = findInvite(code);
   const valid = !isBlocked(client) && invite && invite.expiresAt > Date.now() && !Object.hasOwn(users, invite.name);
-  if (!valid) recordFailure(client);
   const pretty = (name: string) => name.charAt(0).toUpperCase() + name.slice(1);
   const link = `${poolBase()}/${code}`;
   // Names are limited to [a-z0-9_-] and the code to [a-z0-9-], so nothing here needs escaping.
@@ -1023,7 +1019,8 @@ async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Prom
   let code: unknown;
   try {
     code = JSON.parse((await readSmallBody(req)).toString()).code;
-  } catch {
+} catch (err) {
+    if (err instanceof BodyTooLarge) throw err;
     return sendError(res, 400, "invalid_request_error", "Send {\"code\": \"...\"}.");
   }
   const key = typeof code === "string" ? code.trim().toLowerCase() : "";
@@ -1036,7 +1033,6 @@ async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Prom
   const token = `pool-${randomBytes(24).toString("hex")}`;
   users[invite.name] = {
     token,
-    claudeToken: `PASTE-${invite.name}-sk-ant-oat01-HERE`,
     invite: { code: key, by: invite.by, expiresAt: invite.expiresAt },
   };
   delete config.invites![key];
@@ -1048,6 +1044,7 @@ async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Prom
 // Takes a member out of the pool: their pool token stops working immediately, and
 // their subscription access (OAuth tokens), lending settings and presence are deleted.
 function forgetMember(name: string): void {
+  closeSessions(name, "You are no longer a member of this pool.");
   delete users[name];
   if (config.admins) config.admins = config.admins.filter((admin) => admin !== name);
   saveConfig();
@@ -1087,23 +1084,23 @@ async function leavePool(res: http.ServerResponse, caller: string): Promise<void
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === "GET" && ["/join.sh", "/lembas.zip", "/version.json", "/logo.png"].includes(req.url ?? "")) {
-    return serveInstaller(req, res, req.url!.slice(1));
-  }
-  if (req.method === "POST" && req.url === "/pool/redeem") return await redeem(req, res);
-  const inviteCode = req.method === "GET" ? req.url?.match(INVITE_PATH)?.[1] : undefined;
-  if (inviteCode) return invitePage(req, res, inviteCode);
-  // Valid tokens always get through: the block only stops guessing, and members often
-  // share an address (a home network, or this Mac reaching itself over the tailnet).
-  const caller = authenticate(req);
-  if (!caller) {
-    const client = clientId(req);
-    if (isBlocked(client)) return sendError(res, 429, "rate_limit_error", "Too many failed attempts. Try again in a few minutes.");
-    recordFailure(client);
-    return sendError(res, 401, "authentication_error", "Unknown pool token.");
-  }
-
   try {
+    if (req.method === "GET" && ["/join.sh", "/logo.png"].includes(req.url ?? "")) {
+      return serveInstaller(req, res, req.url!.slice(1));
+    }
+    if (req.method === "POST" && req.url === "/pool/redeem") return await redeem(req, res);
+    const inviteCode = req.method === "GET" ? req.url?.match(INVITE_PATH)?.[1] : undefined;
+    if (inviteCode) return invitePage(req, res, inviteCode);
+    // Valid tokens always get through: the block only stops guessing, and members often
+    // share an address (a home network, or this Mac reaching itself over the tailnet).
+    const caller = authenticate(req);
+    if (!caller) {
+      const client = clientId(req);
+      if (isBlocked(client)) return sendError(res, 429, "rate_limit_error", "Too many failed attempts. Try again in a few minutes.");
+      recordFailure(client);
+      return sendError(res, 401, "authentication_error", "Unknown pool token.");
+    }
+
     if (req.url === "/pool" && req.method === "GET") return sendJson(res, 200, await status(caller));
     if (req.url === "/pool/tokens" && req.method === "PUT") return await setTokens(req, res, caller);
     if (req.url === "/pool/share" && req.method === "PUT") return await setShare(req, res, caller);
@@ -1114,11 +1111,16 @@ const server = http.createServer(async (req, res) => {
     if (req.url === "/pool/leave" && req.method === "POST") return await leavePool(res, caller);
     const member = req.url?.match(/^\/pool\/members\/([a-z][a-z0-9_-]{0,31})$/);
     if (member && req.method === "DELETE") return await removeMember(res, caller, member[1]);
-    // /v1/* are the model calls; /api/* covers Claude Code's own usage display.
-    if (req.url?.startsWith("/v1/") || req.url?.startsWith("/api/")) return await proxy(req, res, caller);
+    // Model calls used to be relayed here with a lender's token, readable by the pool.
+    // They no longer are: borrowing is private only (the WebSocket below), and an
+    // agent still sending these is an old lembas.
+    if (req.url?.startsWith("/v1/") || req.url?.startsWith("/api/")) {
+      return sendError(res, 410, "permission_error", "This pool only lends privately. Update lembas to borrow.");
+    }
     sendError(res, 404, "not_found_error", "Not found.");
   } catch (err) {
     const e = err as Error & { code?: string };
+    if (e instanceof BodyTooLarge) return sendError(res, 413, "invalid_request_error", "Request body too large.");
     if (e.name === "AbortError") return; // client went away mid-stream
     if (e.code === "ECONNRESET" || e.message === "aborted") {
       // The client dropped the request while we were reading it (Claude Code
@@ -1156,7 +1158,14 @@ server.on("upgrade", (req, socket, head) => {
 
 const port = config.port ?? 8787;
 const host = config.host ?? "127.0.0.1";
-server.listen(port, host, () => console.log(`[pool] listening on http://${host}:${port} for ${Object.keys(users).join(", ")}${mpcAvailable() ? ", private borrowing available" : ""}`));
+// The log names members and what they borrow; when it is a file, keep it to this user.
+try {
+  fchmodSync(1, 0o600);
+} catch {
+  // A terminal or a pipe: nothing to protect.
+}
+if (!mpcAvailable()) console.log(`[pool] WARNING: no MPC helper at ${MPC_HELPER}; this pool cannot lend until ./build.sh has built it`);
+server.listen(port, host, () => console.log(`[pool] listening on http://${host}:${port} for ${Object.keys(users).join(", ")}; borrowing needs a member's own login at ${BORROW_AT_PERCENT}%`));
 // Tailscale Funnel can only forward to localhost, so listen there too when it's in use.
 if (config.publicUrl && host !== "127.0.0.1" && host !== "0.0.0.0") {
   http.createServer(server.listeners("request")[0] as http.RequestListener)

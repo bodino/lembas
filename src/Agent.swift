@@ -15,8 +15,6 @@ struct AgentConfig: Decodable {
   var url: String
   var token: String
   var agentPort: Int?
-  // `false` forces the pool's readable relay; otherwise borrowing is private (PrivateBorrow.swift).
-  var privateBorrowing: Bool?
   // Test hook: act as if the native login were at its usage limit, so every inference
   // request is borrowed. For a second profile that demonstrates borrowing.
   var pretendLimited: Bool?
@@ -168,13 +166,28 @@ final class Agent {
   let poolToken: String
   let directLock = DirectLock()
   let lifecycle: Lifecycle
+  let port: Int
 
   // Without a config the agent still forwards straight to Anthropic, so Claude Code
   // keeps working while it retires.
-  init(config: AgentConfig?, lifecycle: Lifecycle) {
+  init(config: AgentConfig?, lifecycle: Lifecycle, port: Int) {
     pool = config.map { $0.url.hasSuffix("/") ? String($0.url.dropLast()) : $0.url }
     poolToken = config?.token ?? ""
     self.lifecycle = lifecycle
+    self.port = port
+  }
+
+  // Only Claude Code on this Mac may talk to the agent. A browser tab could reach a
+  // loopback port too (a plain POST needs no preflight, and DNS rebinding gets around
+  // the rest), and when the login is at its limit, spend a friend's quota. Browsers
+  // always send Origin on such requests and Claude Code never does; the Host must be
+  // this loopback port; model calls are JSON.
+  func fromClaudeCode(_ req: HTTPRequest) -> Bool {
+    if req.header("origin") != nil || req.header("referer") != nil { return false }
+    let hosts: Set<String> = ["127.0.0.1:\(port)", "localhost:\(port)", "[::1]:\(port)"]
+    guard let host = req.header("host"), hosts.contains(host.lowercased()) else { return false }
+    if req.method == "POST", !(req.header("content-type") ?? "").lowercased().hasPrefix("application/json") { return false }
+    return true
   }
 
   private func usingPool() async -> Bool {
@@ -185,6 +198,10 @@ final class Agent {
   func handle(_ req: HTTPRequest, _ out: HTTPResponder) async {
     guard req.path.hasPrefix("/v1/") || req.path.hasPrefix("/api/") else {
       return await out.sendJSON(status: 404, ["type": "error", "error": ["type": "not_found_error", "message": "Not found."]])
+    }
+    guard fromClaudeCode(req) else {
+      log("refused a request that didn't come from Claude Code (\(req.method) \(req.path), host \(req.header("host") ?? "-"))")
+      return await out.sendJSON(status: 403, ["type": "error", "error": ["type": "permission_error", "message": "lembas agent only serves Claude Code on this Mac."]])
     }
     await lifecycle.touch()
     do {
@@ -199,7 +216,7 @@ final class Agent {
         if await tryPool(req, out) { return }
       }
 
-      let (bytes, upstream) = try await open(upstreamRequest(anthropic, req, poolAuth: false), out)
+      let (bytes, upstream) = try await open(upstreamRequest(anthropic, req), out)
 
       if upstream.statusCode != 429 {
         let tap = UsageTap(contentType: upstream.value(forHTTPHeaderField: "content-type"))
@@ -233,15 +250,13 @@ final class Agent {
 
   // ---------- forwarding ----------
 
-  func upstreamRequest(_ base: String, _ req: HTTPRequest, poolAuth: Bool) -> URLRequest {
+  func upstreamRequest(_ base: String, _ req: HTTPRequest) -> URLRequest {
     var request = URLRequest(url: URL(string: base + req.path)!)
     request.httpMethod = req.method
     for (name, value) in req.headers where !requestHopHeaders.contains(name) {
-      if poolAuth && (name == "authorization" || name == "x-api-key") { continue }
       request.addValue(value, forHTTPHeaderField: name)
     }
     request.setValue("identity", forHTTPHeaderField: "accept-encoding")
-    if poolAuth { request.setValue("Bearer \(poolToken)", forHTTPHeaderField: "authorization") }
     if req.method != "GET" && req.method != "HEAD" { request.httpBody = req.body }
     return request
   }
@@ -286,27 +301,14 @@ final class Agent {
     await out.send(status: response.statusCode, headers: responseHeaders(response), body: body)
   }
 
+  // Borrowing is private, and only private: the request goes through the pool's
+  // helper or not at all. Any failure pauses borrowing, and Claude Code gets
+  // Anthropic's own limit error; a pool without the helper can't lend.
   func tryPool(_ req: HTTPRequest, _ out: HTTPResponder) async -> Bool {
-    guard let pool else { return false }
-    // Borrowing is private wherever the pool can lend privately; the relay the pool
-    // can read is used only when the pool itself says it has no helper. Any failure
-    // of the private path pauses borrowing instead (Claude Code gets Anthropic's own
-    // limit error). `privateBorrowing: false` in the config is an escape hatch, not in
-    // the app's UI, that forces the relay.
-    if currentConfig()?.privateBorrowing != false {
-      switch await tryPrivate(req, out) {
-      case .served: return true
-      case .unsupported: break // no helper at the pool: the relay it is
-      case .failed: return false
-      }
-    }
-    do {
-      let (bytes, upstream) = try await open(upstreamRequest(pool, req, poolAuth: true), out)
-      await relay(bytes, upstream, out)
-      return true
-    } catch {
-      log("pool fallback unavailable: \(error.localizedDescription)")
-      return false
+    guard pool != nil else { return false }
+    switch await tryPrivate(req, out) {
+    case .served: return true
+    case .unsupported, .failed: return false
     }
   }
 
@@ -383,7 +385,7 @@ func retryAfterSeconds(_ response: HTTPURLResponse) -> Double? {
 
 // ---------- local metering: prompts stay here, only USD reaches the pool ----------
 
-// USD per million tokens, most specific prefix first (mirrors src/pricing.ts).
+// USD per million tokens, most specific prefix first.
 let prices: [(prefix: String, input: Double, output: Double, cacheRead: Double)] = [
   ("claude-fable-5-1", 10, 50, 0.25),
   ("claude-mythos-5-1", 10, 50, 0.25),
@@ -462,7 +464,7 @@ struct LembasAgent {
       .flatMap { $0.url.isEmpty || $0.token.isEmpty ? nil : $0 }
     let port = config?.agentPort ?? defaultPort
     let lifecycle = Lifecycle(port: port)
-    let agent = Agent(config: config, lifecycle: lifecycle)
+    let agent = Agent(config: config, lifecycle: lifecycle, port: port)
     do {
       let server = try await HTTPServer(port: UInt16(port)) { req, out in await agent.handle(req, out) }
       log("listening on http://127.0.0.1:\(port); \(config == nil ? "no pool: direct only" : "direct first, pool only on usage limits")")

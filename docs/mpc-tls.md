@@ -250,12 +250,11 @@ parameters; it needs under a thousand correlations per request.
 
 ## In lembas (2026-10-25)
 
-**Simply how borrowing works** since 1.3.3: private wherever the pool can lend
-privately, the readable relay only when the pool itself answers that it has no helper
-(the menu's status line says which). Any failure of the private path pauses borrowing
-rather than go readable. There is no switch in the app; `privateBorrowing: false` in
-`~/.config/lembas.json`, re-read by the agent per request, is an escape hatch that
-forces the relay (a broken private path, a very poor connection).
+**The only way to borrow** since 1.3.4. The readable relay (the pool making the
+request itself with a lender's token) is gone from both ends: the agent has no code
+path for it and the pool answers model calls with 410. A pool without the helper can't
+lend; any failure of the private path pauses borrowing, and Claude Code gets
+Anthropic's own limit error. There is no switch and no escape hatch.
 Since sessions, the agent keeps one helper and one WebSocket per pool for as long as it
 runs (started on the first borrowed request, replaced if it dies), and the pool keeps
 one helper per borrowing member.
@@ -281,12 +280,24 @@ one helper per borrowing member.
   `{type: result, req, status, model, usd}` (metered with the same table the agent uses
   for direct requests), `{type: limit, req, forMs}` on a usage-limit 429 (the pool
   parks that lender; the agent retries, and the pool picks another), `{type: dead,
-  req}` on a 401. The pool trusts these; a dishonest borrower could under-report or
-  park a friend's token. Among friends this is accepted and stated in the README.
-- **Strict.** With the switch on the agent never falls back to the readable relay. If
-  the pool has no helper (`privateBorrowing: false` in `GET /pool`) or a private borrow
-  fails, Claude Code gets Anthropic's own limit error and the app says borrowing is
-  paused.
+  req}` on a 401. Usage is taken as reported (bounded to $10 a request), so a
+  dishonest borrower could under-report cost; among friends this is accepted and
+  stated in the README. Limits and deaths are not taken on trust: the pool holds the
+  lender's login, so it reads the lender's usage from Anthropic (at most 15 s old) and
+  parks them only if a window is within 5 points of the threshold or locked, or the
+  usage endpoint answers 401. An unconfirmed report only makes this session skip that
+  lender for 3 minutes.
+- **Who may borrow.** Before any lender is picked, the pool reads the borrower's own
+  usage with the borrower's login: they borrow only if a window (5-hour, 7-day, or a
+  model-specific one) is at `borrowAtPercent` (default 90) or locked. A member who has
+  not connected a subscription, or whose usage can't be read, is refused
+  (`unconnected`, `usage_unknown`, `not_at_limit` reach the agent as the helper's
+  503). So nobody can borrow without having a subscription to lend in return, and
+  nobody can borrow before they are actually out. Lending stays as it was: the lender's
+  own live utilization against their policy.
+- **Membership is live.** Every lease re-checks that the caller is still a member with
+  the same pool token; removal closes their open sessions at once; a session is closed
+  after 24 h regardless (the agent opens a new one on the next request).
 - **Lifetimes.** Setup, connect and splice steps 90 s each; a response may pause for
   10 min between bytes (`RESPONSE_IDLE_TIMEOUT`, matching the agent's request
   timeout); a session with no frame for 2 h ends; mux close handshake 5 s. The pool
@@ -485,7 +496,7 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
 - **Try it with a real friend over Tailscale Funnel.** The transport is verified: a
   session from this Mac to the live pool through its public Funnel address came up in
   0.3 s (the refusal that followed was the lending policy, nobody had capacity). What
-  remains is a friend on 1.3.0 with the switch on and a lender with headroom.
+  remains is a friend on 1.3.4 at their limit and a lender with headroom.
 - The direct-first flow tries the private path, falls through to a direct request
   that fails again, and tries the private path once more before giving up; the agent
   should remember a failed private borrow for a minute.

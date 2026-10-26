@@ -64,7 +64,18 @@ codesign --force -s - "$APP/MacOS/lembas-agent"
 codesign --force -s - build/lembas.app
 rm -f installer/lembas.zip
 (cd build && zip -qry ../installer/lembas.zip lembas.app)
-# Members' apps read this from the latest GitHub release and offer the update.
+# Members' apps read this from the latest GitHub release and offer the update, but
+# only when it carries a signature by the release key (Ed25519; the app pins the
+# public half in PoolBar.swift). The release workflow has the private key as a secret
+# in LEMBAS_SIGNING_KEY (PEM). A local build without it is unsigned: fine for running
+# here, never offered as an update.
 SHA=$(shasum -a 256 installer/lembas.zip | cut -d' ' -f1)
-printf '{"version": "%s", "build": %s, "sha256": "%s"}\n' "$VERSION" "$BUILD" "$SHA" > installer/version.json
+SIG=""
+if [ -n "$LEMBAS_SIGNING_KEY" ]; then
+  # Node signs (its crypto does Ed25519 directly; macOS's LibreSSL can't from the CLI).
+  SIG=$(node -e 'const { sign } = require("node:crypto"); process.stdout.write(sign(null, Buffer.from(process.argv[1]), process.env.LEMBAS_SIGNING_KEY).toString("base64"))' "$VERSION $BUILD $SHA")
+  [ -n "$SIG" ] || { echo "signing version.json failed" >&2; exit 1; }
+  echo "signed version.json with the release key"
+fi
+printf '{"version": "%s", "build": %s, "sha256": "%s", "signature": "%s"}\n' "$VERSION" "$BUILD" "$SHA" "$SIG" > installer/version.json
 echo "built lembas $VERSION ($BUILD): build/lembas.app, installer/lembas.zip, installer/version.json"

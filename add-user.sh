@@ -14,7 +14,7 @@ node -e "
 const fs = require('fs');
 const c = JSON.parse(fs.readFileSync('config.json', 'utf8'));
 if (c.users[process.argv[1]]) { console.error('user already exists'); process.exit(1); }
-c.users[process.argv[1]] = { token: process.argv[2], claudeToken: 'PASTE-' + process.argv[1] + '-sk-ant-oat01-HERE' };
+c.users[process.argv[1]] = { token: process.argv[2] };
 fs.writeFileSync('config.json', JSON.stringify(c, null, 2) + '\n', { mode: 0o600 });
 " "$NAME" "$TOKEN"
 

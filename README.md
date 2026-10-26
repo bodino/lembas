@@ -30,12 +30,14 @@ day, your unused capacity can help them.
   and holds its keys alone, and the pool inserts the one record that carries the
   lender's token, computed between the two so that the pool never sees the keys and
   your Mac never sees the token. The pool can't read or change the request or the
-  answer. If the private path fails, borrowing pauses rather than fall back to the
-  relay the pool can read; only a pool built without the helper gets the relay, and the
-  menu says so. In return the pool has to take your agent's word for what the request
-  cost and whether it hit a limit, since it can no longer see Anthropic's answer. About a megabyte each way to set up when
-  the agent starts borrowing, then a few tens of KB and some 20 ms per request, with
-  the connections to Anthropic kept open and reused.
+  answer. There is no other way to borrow: if the private path fails, borrowing pauses,
+  and a pool built without the helper can't lend at all (the menu says so). Before
+  lending, the pool checks with Anthropic, using your own login, that you really are at
+  a usage limit; a lender's limit reported by a borrower is checked the same way before
+  the lender is skipped for everyone. What the pool has to take your agent's word for is
+  the metered cost of each request, since it can't see Anthropic's answer. About a
+  megabyte each way to set up when the agent starts borrowing, then a few tens of KB and
+  some 20 ms per request, with the connections to Anthropic kept open and reused.
 
 The pieces:
 
@@ -43,8 +45,8 @@ The pieces:
 |---|---|---|
 | **lembas.app** | every member's Mac | Menu bar app: join with an invite code, connect your subscription, set who you lend to. |
 | **lembas-agent** | every member's Mac (a launchd job, run from `~/Library/Application Support/lembas`) | Local proxy on `127.0.0.1:8788` that Claude Code talks to: direct to Anthropic, pool only on usage limits. |
-| **pool** (`src/server.ts`) | one Mac in the group | Holds members' subscription access, decides who can lend right now, relays borrowed requests. |
-| **lembas-mpc** | inside lembas.app, and in `build/` next to the pool | The helper for private borrowing: one short-lived process per borrowed request on each side (`mpc-tls/`). |
+| **pool** (`src/server.ts`) | one Mac in the group | Holds members' subscription access, decides who can lend right now, carries borrowed requests' encrypted bytes and splices the lender's token in. |
+| **lembas-mpc** | inside lembas.app, and in `build/` next to the pool | The helper for private borrowing: one process per session on each side (`mpc-tls/`). |
 
 ## Joining a pool
 
@@ -80,7 +82,10 @@ The **fallback** switch in the app header turns this off (direct only, no borrow
 
 **Updates** come only from this repository's GitHub releases, built by GitHub Actions
 from the public source, never from a pool, so whoever runs your pool can't ship code to
-your Mac. When a new release is out, lembas shows **Install latest build…** at the
+your Mac. The app installs a release only if its `version.json` is signed by the lembas
+release key (Ed25519; the public half is pinned in the app, the private half is a
+secret of the release workflow), so neither can anyone who merely gets to publish a
+release. When a new release is out, lembas shows **Install latest build…** at the
 bottom; one click updates and relaunches. Check where a download came from with
 `gh attestation verify lembas.zip --repo bodino/lembas`.
 
@@ -89,9 +94,8 @@ bottom; one click updates and relaunches. Check where a download came from with
 One person runs the pool on a Mac that's usually awake. Requirements: Node ≥ 22.18
 (the server has no npm dependencies), Tailscale, Xcode with the macOS 26 SDK or newer
 to build the app, and Rust via [rustup](https://rustup.rs) for the private-borrowing
-helper (`LEMBAS_SKIP_MPC=1 ./build.sh` builds without it; such a pool can't lend
-privately, so its members' borrowed requests use the readable relay, and their menu
-says so).
+helper (`LEMBAS_SKIP_MPC=1 ./build.sh` builds without it, for quick work on the app;
+such a pool can't lend at all, and its members' menu says so).
 
 1. Clone this repo and build the app (the pool serves it to joiners and offers each new
    build to members as an update):

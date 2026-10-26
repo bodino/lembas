@@ -13,7 +13,9 @@ import SwiftUI
 // with LEMBAS_PROFILE=<name> runs another member side by side (e.g. testing invites on
 // one Mac), with its own config, agent, port and Claude Code settings folder.
 enum Profile {
-  static let name: String? = ProcessInfo.processInfo.environment["LEMBAS_PROFILE"].flatMap { $0.isEmpty ? nil : $0 }
+  // Only a plain name: it becomes part of file names under the home directory.
+  static let name: String? = ProcessInfo.processInfo.environment["LEMBAS_PROFILE"]
+    .flatMap { $0.range(of: "^[a-z0-9_-]{1,32}$", options: .regularExpression) != nil ? $0 : nil }
   private static let home = FileManager.default.homeDirectoryForCurrentUser
   private static let suffix = name.map { "-\($0)" } ?? ""
 
@@ -31,9 +33,6 @@ struct Config: Codable {
   var url: String
   var token: String
   var agentPort: Int? // only set for profiles; the agent defaults to 8788
-  // `false` forces the pool's readable relay; otherwise borrowing is private. The agent
-  // re-reads this per request (src/PrivateBorrow.swift).
-  var privateBorrowing: Bool?
   // Test hook for the agent: borrow every request, as if the login were at its limit.
   var pretendLimited: Bool?
 }
@@ -46,6 +45,7 @@ struct AvailableUpdate {
   var version: String
   var build: Int
   var sha256: String
+  var signature: String // over "<version> <build> <sha256>", by the release key
 }
 
 // What I lend one person: whenever I'm away, and optionally even while I'm working
@@ -143,8 +143,7 @@ final class Store: ObservableObject {
   @Published var lastApplied: String?
   @Published var subscriptionConnected = false
   @Published var routedThroughPool = false
-  @Published var relayForced = false // config `privateBorrowing: false`: the readable relay, by hand
-  @Published var poolSupportsPrivate = false // the pool has the MPC helper
+  @Published var poolCanLend = false // the pool has the MPC helper, so it can lend at all
   @Published var connectHint: String?
   @Published private var savedSettings: [String] = []
 
@@ -180,7 +179,6 @@ final class Store: ObservableObject {
     if let data = try? Data(contentsOf: Self.configURL),
        let cfg = try? JSONDecoder().decode(Config.self, from: data) {
       config = cfg
-      relayForced = cfg.privateBorrowing == false
       if !AppLocation.isTranslocated { Task { try? await ensureAgentInstalled() } }
     }
   }
@@ -247,6 +245,12 @@ final class Store: ObservableObject {
       return
     }
     let pool = String(raw[..<slash])
+    // The pool token and then the login go to this address; over the open internet
+    // that has to be HTTPS. Plain HTTP is for this Mac, a home network or the tailnet.
+    if pool.hasPrefix("http://"), !isLocalNetworkHost(URL(string: pool)?.host) {
+      joinError = "A pool outside your own network needs an https:// address."
+      return
+    }
     let code = String(raw[raw.index(after: slash)...])
     busy = true
     joinError = nil
@@ -361,7 +365,7 @@ final class Store: ObservableObject {
       let obj = try await request("GET", "/pool")
       me = obj["you"] as? String
       canInvite = obj["canInvite"] as? Bool ?? false
-      poolSupportsPrivate = obj["privateBorrowing"] as? Bool ?? false
+      poolCanLend = obj["privateBorrowing"] as? Bool ?? false
       online = true
       loaded = true
       notAMemberStreak = 0
@@ -678,8 +682,23 @@ final class Store: ObservableObject {
           let (data, response) = try? await URLSession.shared.data(from: url),
           (response as? HTTPURLResponse)?.statusCode == 200,
           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-          let build = (obj["build"] as? NSNumber)?.intValue, let sha = obj["sha256"] as? String else { return nil }
-    return AvailableUpdate(version: obj["version"] as? String ?? "", build: build, sha256: sha)
+          let build = (obj["build"] as? NSNumber)?.intValue, let sha = obj["sha256"] as? String,
+          let signature = obj["signature"] as? String else { return nil }
+    let latest = AvailableUpdate(version: obj["version"] as? String ?? "", build: build, sha256: sha, signature: signature)
+    // Only a release signed with lembas's release key counts; the checksum alone would
+    // let anyone who can write to the GitHub project ship code to every member.
+    guard Self.releaseSigned(latest) else { return nil }
+    return latest
+  }
+
+  // Ed25519 public key of the release signing key (its private half is a secret of the
+  // release workflow; build.sh signs version.json with it).
+  static let releaseKey = Data(base64Encoded: "k90SSwOXYACHmwoav5Up+nWi8cswuHOnzJnUXGLy/9I=")!
+
+  static func releaseSigned(_ u: AvailableUpdate) -> Bool {
+    guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: releaseKey),
+          let signature = Data(base64Encoded: u.signature) else { return false }
+    return key.isValidSignature(signature, for: Data("\(u.version) \(u.build) \(u.sha256)".utf8))
   }
 
   // Downloads that release's lembas.zip (by its tag, so a newer release appearing
@@ -1877,11 +1896,9 @@ struct MainView: View {
         if let me = store.me { Text("Signed in as \(prettyName(me))") }
         Button(store.subscriptionConnected ? "Reconnect Subscription…" : "Connect Subscription…") { store.runConnect() }
         Divider()
-        // Borrowed requests go through the private path: the pool lends the token but
-        // can't read the request or the answer. Not a setting; the status line says
-        // when a pool can't do it.
-        if store.online && !store.poolSupportsPrivate && !store.relayForced {
-          Text("Your pool can't lend privately yet, so borrowed requests use its relay.")
+        // Borrowing is private or not at all: a pool without the helper can't lend.
+        if store.online && !store.poolCanLend {
+          Text("Your pool has no helper for private borrowing, so it can't lend yet.")
           Divider()
         }
         Button("Check for Updates…") { Task { await store.checkForUpdate(force: true) } }
@@ -1903,10 +1920,23 @@ struct MainView: View {
 
   private var subtitle: String {
     let who = store.me.map { prettyName($0) + " · " } ?? ""
-    let privately = store.poolSupportsPrivate && !store.relayForced
-    let mode = store.routedThroughPool ? (privately ? "Fallback on · private" : "Fallback on · relay") : "Fallback off"
+    let mode = store.routedThroughPool ? (store.poolCanLend ? "Fallback on" : "Fallback on · pool can't lend") : "Fallback off"
     return who + mode
   }
+}
+
+// Loopback, RFC 1918, Tailscale's CGNAT range (100.64.0.0/10) and .local names: places
+// where plain HTTP never crosses the open internet.
+func isLocalNetworkHost(_ host: String?) -> Bool {
+  guard let host = host?.lowercased() else { return false }
+  if host == "localhost" || host == "::1" || host.hasSuffix(".local") { return true }
+  let parts = host.split(separator: ".").compactMap { Int($0) }
+  guard parts.count == 4 else { return false }
+  if parts[0] == 127 || parts[0] == 10 { return true }
+  if parts[0] == 192 && parts[1] == 168 { return true }
+  if parts[0] == 172 && (16...31).contains(parts[1]) { return true }
+  if parts[0] == 100 && (64...127).contains(parts[1]) { return true }
+  return false
 }
 
 private func dollars(_ value: Double) -> String {

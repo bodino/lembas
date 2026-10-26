@@ -1,7 +1,6 @@
-// Private borrowing: the agent's side of borrowed requests with spliced token records.
+// Borrowing: the agent's side of borrowed requests with spliced token records.
 //
-// With the "Private borrowing" switch on, borrowed requests do not go to the pool as
-// HTTP. The agent keeps one session with the pool for as long as it has requests: a
+// A borrowed request never goes to the pool as HTTP. The agent keeps one session with the pool for as long as it has requests: a
 // WebSocket to the pool's /pool/borrow, bridged to a `lembas-mpc proxy` helper that
 // runs the TLS connections to Anthropic itself and holds their keys alone. Each
 // request from Claude Code goes to the helper's local port as plain HTTP; the helper
@@ -33,7 +32,7 @@ let maxRequestLine = 110
 // How long to wait for the helper to come up (it pays the OT setup first).
 let sessionStartTimeout: TimeInterval = 90
 
-// Re-read per borrow, so the switch in the app takes effect without restarting the agent.
+// Re-read per borrow, so config changes take effect without restarting the agent.
 func currentConfig() -> AgentConfig? {
   FileManager.default.contents(atPath: configPath).flatMap { try? JSONDecoder().decode(AgentConfig.self, from: $0) }
 }
@@ -56,7 +55,7 @@ enum PrivateBorrowError: Error, CustomStringConvertible {
 enum PrivateAttempt {
   case served // the response reached Claude Code, whatever its status
   case unsupported // the pool cannot lend privately at all
-  case failed // the private path failed; borrowing pauses rather than go readable
+  case failed // the private path failed; borrowing pauses
 }
 
 enum PrivateOutcome {
@@ -266,7 +265,7 @@ final class PrivateSession {
       for try await chunk in response.body { body.append(chunk) }
       let message = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])
         .flatMap { ($0["error"] as? [String: Any])?["message"] as? String } ?? String(decoding: body, as: UTF8.self)
-      throw kind == "refused" ? PrivateBorrowError.pool("no_capacity: \(message)") : PrivateBorrowError.helper(message)
+      throw kind == "refused" ? PrivateBorrowError.pool("refused: \(message)") : PrivateBorrowError.helper(message)
     }
     let reqNo = head.value(forHTTPHeaderField: "x-lembas-request").flatMap(Int.init) ?? 0
     log("private borrow: request \(reqNo) \(request.method) \(request.path) (\(request.body.count) bytes) → \(head.statusCode)")

@@ -1,7 +1,9 @@
 # Builds lembas from this repository's public source and publishes it as a GitHub
 # release. Members' apps update only from these releases, never from a pool, so the
-# person running a pool can't ship code to members. Every release carries build
-# provenance: anyone can check that lembas.zip came from this workflow and commit with
+# person running a pool can't ship code to members; and only when version.json is
+# signed by the release key (the LEMBAS_SIGNING_KEY secret), so neither can someone
+# who merely gets to publish a release. Every release also carries build provenance:
+# anyone can check that lembas.zip came from this workflow and commit with
 #   gh attestation verify lembas.zip --repo bodino/lembas
 name: release
 
@@ -42,6 +44,8 @@ jobs:
           restore-keys: lembas-mpc-${{ runner.os }}-
 
       - name: Build
+        env:
+          LEMBAS_SIGNING_KEY: ${{ secrets.LEMBAS_SIGNING_KEY }}
         run: ./build.sh
 
       - name: Record provenance

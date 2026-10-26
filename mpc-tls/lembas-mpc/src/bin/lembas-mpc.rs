@@ -426,7 +426,8 @@ enum ControlReply {
 /// Node spawns the helper with a fourth `pipe`).
 struct Control {
     writer: tokio::sync::Mutex<tokio::fs::File>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Option<Lease>>>>>,
+    // A lease, or the parent's reason for refusing one (it reaches the borrower).
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Lease, String>>>>>,
     next: AtomicU64,
 }
 
@@ -451,13 +452,13 @@ impl Control {
                 match serde_json::from_str::<ControlReply>(&line) {
                     Ok(ControlReply::Token { id, token, req }) => {
                         if let Some(tx) = pending.lock().unwrap().remove(&id) {
-                            let _ = tx.send(Some(Lease { token, req }));
+                            let _ = tx.send(Ok(Lease { token, req }));
                         }
                     }
                     Ok(ControlReply::Refuse { id, reason }) => {
                         warn!("pool: parent refused request {id}: {reason}");
                         if let Some(tx) = pending.lock().unwrap().remove(&id) {
-                            let _ = tx.send(None);
+                            let _ = tx.send(Err(reason));
                         }
                     }
                     Err(e) => warn!("pool: bad control line: {e}"),
@@ -481,7 +482,8 @@ impl Control {
                     .send(&serde_json::json!({ "type": "need_token", "id": id }).to_string())
                     .await?;
                 match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                    Ok(Ok(lease)) => Ok(lease),
+                    Ok(Ok(Ok(lease))) => Ok(Some(lease)),
+                    Ok(Ok(Err(reason))) => bail!("{reason}"),
                     Ok(Err(_)) => bail!("parent went away"),
                     Err(_) => {
                         control.pending.lock().unwrap().remove(&id);
