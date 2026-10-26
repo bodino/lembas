@@ -25,16 +25,15 @@ day, your unused capacity can help them.
   read, nobody borrows. Turn people off or adjust the limits in the app.
 - **Prompts stay home.** In the normal path only `{model, estimated USD}` leaves your
   Mac. Only borrowed requests pass through the pool.
-- **Private borrowing**, on by default. A borrowed request goes through a
+- **Borrowing is private.** A borrowed request goes through a
   [spliced token record](docs/mpc-tls.md): your Mac runs the TLS session to Anthropic
   and holds its keys alone, and the pool inserts the one record that carries the
   lender's token, computed between the two so that the pool never sees the keys and
   your Mac never sees the token. The pool can't read or change the request or the
   answer. If the private path fails, borrowing pauses rather than fall back to the
-  relay the pool can read; only a pool built without the helper gets the relay. The
-  switch in the ⚙ menu forces it on (strict even for such a pool) or off. In return
-  the pool has to take your agent's word for what the request cost and whether it hit
-  a limit, since it can no longer see Anthropic's answer. About a megabyte each way to set up when
+  relay the pool can read; only a pool built without the helper gets the relay, and the
+  menu says so. In return the pool has to take your agent's word for what the request
+  cost and whether it hit a limit, since it can no longer see Anthropic's answer. About a megabyte each way to set up when
   the agent starts borrowing, then a few tens of KB and some 20 ms per request, with
   the connections to Anthropic kept open and reused.
 
@@ -91,8 +90,8 @@ One person runs the pool on a Mac that's usually awake. Requirements: Node ≥ 2
 (the server has no npm dependencies), Tailscale, Xcode with the macOS 26 SDK or newer
 to build the app, and Rust via [rustup](https://rustup.rs) for the private-borrowing
 helper (`LEMBAS_SKIP_MPC=1 ./build.sh` builds without it; such a pool can't lend
-privately, so its members' borrowed requests use the readable relay, and anyone who
-forced private borrowing on sees borrowing paused).
+privately, so its members' borrowed requests use the readable relay, and their menu
+says so).
 
 1. Clone this repo and build the app (the pool serves it to joiners and offers each new
    build to members as an update):

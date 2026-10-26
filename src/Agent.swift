@@ -279,17 +279,16 @@ final class Agent {
 
   func tryPool(_ req: HTTPRequest, _ out: HTTPResponder) async -> Bool {
     guard let pool else { return false }
-    // Private borrowing is the default wherever the pool can lend privately. Unset, the
-    // relay the pool can read is used only when the pool itself says it has no helper;
-    // any failure of the private path pauses borrowing instead (Claude Code gets
-    // Anthropic's own limit error). Set to true it is strict even for such a pool; set
-    // to false it is off.
-    let setting = currentConfig()?.privateBorrowing
-    if setting != false {
+    // Borrowing is private wherever the pool can lend privately; the relay the pool
+    // can read is used only when the pool itself says it has no helper. Any failure
+    // of the private path pauses borrowing instead (Claude Code gets Anthropic's own
+    // limit error). `privateBorrowing: false` in the config is an escape hatch, not in
+    // the app's UI, that forces the relay.
+    if currentConfig()?.privateBorrowing != false {
       switch await tryPrivate(req, out) {
       case .served: return true
-      case .unsupported where setting == nil: break // no helper at the pool: the relay it is
-      case .unsupported, .failed: return false
+      case .unsupported: break // no helper at the pool: the relay it is
+      case .failed: return false
       }
     }
     do {
