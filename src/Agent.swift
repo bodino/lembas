@@ -15,8 +15,11 @@ struct AgentConfig: Decodable {
   var url: String
   var token: String
   var agentPort: Int?
-  // Borrow over MPC-TLS so the pool can't read the request or the answer (PrivateBorrow.swift).
+  // `false` forces the pool's readable relay; otherwise borrowing is private (PrivateBorrow.swift).
   var privateBorrowing: Bool?
+  // Test hook: act as if the native login were at its usage limit, so every inference
+  // request is borrowed. For a second profile that demonstrates borrowing.
+  var pretendLimited: Bool?
 }
 
 let env = ProcessInfo.processInfo.environment
@@ -185,7 +188,7 @@ final class Agent {
       // The native login recently hit a real usage limit: go straight to the pool until
       // the lock expires, then probe direct again. Only inference calls borrow — Claude
       // Code's /api/* account and usage screens always reflect the member's own login.
-      let limited = forcePool ? true : await directLock.active
+      let limited = forcePool || currentConfig()?.pretendLimited == true ? true : await directLock.active
       if usePool, limited, req.path.hasPrefix("/v1/") {
         if await tryPool(req, out) { return }
       }

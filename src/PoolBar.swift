@@ -31,9 +31,11 @@ struct Config: Codable {
   var url: String
   var token: String
   var agentPort: Int? // only set for profiles; the agent defaults to 8788
-  // Borrow over MPC-TLS, so the pool can't read my requests or the answers. The agent
+  // `false` forces the pool's readable relay; otherwise borrowing is private. The agent
   // re-reads this per request (src/PrivateBorrow.swift).
   var privateBorrowing: Bool?
+  // Test hook for the agent: borrow every request, as if the login were at its limit.
+  var pretendLimited: Bool?
 }
 
 // The pool rejected our token: we were removed, or left from another copy.
