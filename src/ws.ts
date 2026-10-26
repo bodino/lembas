@@ -32,11 +32,18 @@ export class WebSocketConnection extends EventEmitter {
     socket.on("data", (chunk: Buffer) => this.feed(chunk));
     socket.on("drain", () => this.emit("drain"));
     socket.on("error", (err) => this.emit("error", err));
-    socket.on("close", () => {
-      if (this.closed) return;
-      this.closed = true;
-      this.emit("close", 1006);
-    });
+    // Node's HTTP server keeps sockets half-open, so a peer that sends a FIN without a
+    // close frame only ever produces "end": the connection is over for us all the same.
+    socket.on("end", () => this.lost());
+    socket.on("close", () => this.lost());
+  }
+
+  // The peer is gone (hung up, half-closed, reset): over, once.
+  private lost(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.socket.destroy();
+    this.emit("close", 1006);
   }
 
   // Answers the upgrade; returns undefined (socket closed) if it isn't a WebSocket request.
@@ -72,15 +79,16 @@ export class WebSocketConnection extends EventEmitter {
     return typeof data === "string" ? this.frame(1, Buffer.from(data)) : this.frame(2, data);
   }
 
-  close(code = 1000, reason = ""): void {
+  // `grace` is how long the peer gets to answer with its own close frame before the
+  // socket is dropped: a refusal needs almost none, an ended session a moment.
+  close(code = 1000, reason = "", grace = 2000): void {
     if (this.closed || this.closing) return;
     this.closing = true;
     const payload = Buffer.alloc(2 + Buffer.byteLength(reason));
     payload.writeUInt16BE(code, 0);
     payload.write(reason, 2);
     this.frame(8, payload);
-    // Give the peer a moment to answer with its own close frame, then drop the socket.
-    const timer = setTimeout(() => this.socket.destroy(), 2000);
+    const timer = setTimeout(() => this.socket.destroy(), grace);
     this.socket.once("close", () => clearTimeout(timer));
   }
 

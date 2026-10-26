@@ -542,6 +542,21 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
    terminal scripts that edit `config.json` restart the pool, which otherwise wrote its
    in-memory copy back over the edit.
 
+43. **A FIN is not a close frame.** (Fourth external review.) Node's HTTP server keeps
+   sockets half-open, so a borrower that sent a TCP FIN without a WebSocket close frame
+   produced only `end`, and the pool cleaned up on `close`: the session stayed counted
+   and its helper (165 MB once set up) ran on until its two-hour idle timer, two slots
+   per member. Reproduced on a scratch pool; `end` now ends the connection like `close`.
+   Also from that review: a lender's parking time came from the borrower's report (up to
+   six hours) and now comes from Anthropic's own reset time for the window at the limit,
+   with the 20-minute default when there is none; a refused upgrade and a 401, 413 or 429
+   answer close the socket instead of leaving it kept alive; and the last-own-use marks
+   are rebuilt from the log only for a state file that predates them, so a mark deleted
+   with a removed member doesn't come back for a newcomer of that name. What stays: one
+   address behind Funnel can still fill the connection budget, since every Funnel
+   connection arrives from loopback and the pool can't tell them apart before the
+   headers; Claude Code keeps working through that, only borrowing pauses.
+
 ## Open
 
 - **Memory.** About 165 MB per helper at steady state, mostly allocator high-water

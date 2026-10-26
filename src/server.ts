@@ -369,6 +369,8 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
 
 // Same shape as Anthropic's own errors, so Claude Code displays them properly.
 function sendError(res: http.ServerResponse, status: number, type: string, message: string): void {
+  // A refused or rate-limited client doesn't get to keep the socket for free.
+  if (status === 401 || status === 413 || status === 429) res.setHeader("connection", "close");
   sendJson(res, status, { type: "error", error: { type, message } });
 }
 
@@ -489,7 +491,7 @@ function closeSessions(name: string, reason: string): void {
 async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: URL): Promise<void> {
   const fail = (code: string, message: string) => {
     ws.send(JSON.stringify({ type: "error", code, message }));
-    ws.close(1000);
+    ws.close(1000, "", 300); // the error frame goes out; the socket doesn't linger
   };
   if (!mpcAvailable()) return fail("unsupported", "This pool has no MPC helper, so it can't lend.");
   const mine = privateSessions.get(caller) ?? new Set<PrivateSession>();
@@ -648,6 +650,18 @@ async function borrowPrivately(ws: WebSocketConnection, caller: string, _url: UR
   ws.send(JSON.stringify({ type: "session" }));
 }
 
+// Until the earliest reset of a window that is at the limit, capped at six hours; the
+// default cooldown if none of the windows at the limit carries a reset time.
+function parkDuration(usage: Utilization, now = Date.now()): number {
+  const full = (pct: number) => pct >= BORROW_AT_PERCENT - 5;
+  const resets: number[] = [];
+  if (full(usage.fiveHour) && usage.resetsAt !== null) resets.push(usage.resetsAt);
+  if (full(usage.sevenDay) && usage.sevenDayResetsAt !== null) resets.push(usage.sevenDayResetsAt);
+  const soonest = Math.min(...resets.filter((t) => t > now));
+  if (!Number.isFinite(soonest)) return LIMIT_COOLDOWN_MS;
+  return Math.min(soonest - now, 6 * 60 * 60_000);
+}
+
 function describeGate(reason: "unconnected" | "usage_unknown" | "not_at_limit"): string {
   switch (reason) {
     case "unconnected": return "they have not connected a subscription";
@@ -684,9 +698,10 @@ async function recordPrivateResult(session: PrivateSession, text: string): Promi
       // behind a fresh 429, so a window within a few points of the threshold counts.
       const probe = await probeUsage(owner, 15_000);
       if (probe.usage && (probe.usage.locked || Object.values(probe.usage.windows).some((pct) => pct >= BORROW_AT_PERCENT - 5))) {
-        const forMs = typeof report.forMs === "number" && Number.isFinite(report.forMs) && report.forMs > 0
-          ? Math.min(report.forMs, 6 * 60 * 60_000)
-          : LIMIT_COOLDOWN_MS;
+        // How long: until Anthropic says the full window resets, never what the
+        // borrower's report says (a borrower must not pick a lender's outage), and
+        // the default cooldown when the limit is on a window with no reset time.
+        const forMs = parkDuration(probe.usage);
         ledger.park(owner, forMs);
         console.log(`[pool] ${owner}'s token is at its usage limit (${caller} reports, confirmed); parked for ${Math.round(forMs / 60_000)} min`);
       } else {

@@ -49,12 +49,18 @@ export class Ledger {
   constructor(path: string) {
     this.path = path;
     // Defaults first so state files written by older versions keep loading.
+    const loaded: Partial<State> = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
     this.state = {
       lends: {}, policies: {}, presence: {}, parkedUntil: {}, spend: {}, borrowLog: [], usageLog: [], lastOwnUse: {}, oauth: {},
-      ...(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {}),
+      ...loaded,
     };
-    for (const e of this.state.usageLog) {
-      if (e.consumer === e.owner && e.t > (this.state.lastOwnUse[e.owner] ?? 0)) this.state.lastOwnUse[e.owner] = e.t;
+    // The marks are rebuilt from the log once, for a state file from before they
+    // existed; after that the stored ones are what counts, so a mark deleted with a
+    // removed member doesn't come back from the old log for a newcomer of that name.
+    if (!("lastOwnUse" in loaded)) {
+      for (const e of this.state.usageLog) {
+        if (e.consumer === e.owner && e.t > (this.state.lastOwnUse[e.owner] ?? 0)) this.state.lastOwnUse[e.owner] = e.t;
+      }
     }
     // Old per-borrower slices become "may borrow when I'm away".
     for (const rules of Object.values(this.state.lends)) {
