@@ -186,6 +186,15 @@ const usageCache = new Map<string, { at: number } & UsageProbe>();
 // endpoint hard. `status` is the HTTP status of the last real answer (401 means the
 // login is dead), null when nothing came back.
 const probing = new Map<string, Promise<UsageProbe>>();
+// Bumped whenever what is known about a member's usage changes under a probe (their
+// agent reports a limit, say): a probe that started before then is about the old
+// state and must not cache its answer over the new one.
+const usageEpoch = new Map<string, number>();
+const usageEpochOf = (name: string) => usageEpoch.get(name) ?? 0;
+function forgetUsage(name: string): void {
+  usageCache.delete(name);
+  usageEpoch.set(name, usageEpochOf(name) + 1);
+}
 async function probeUsage(name: string, maxAgeMs = USAGE_CACHE_MS): Promise<UsageProbe> {
   const cached = usageCache.get(name);
   if (cached && Date.now() - cached.at < maxAgeMs) return cached;
@@ -202,6 +211,7 @@ async function probeUsage(name: string, maxAgeMs = USAGE_CACHE_MS): Promise<Usag
 
 async function fetchUsage(name: string): Promise<UsageProbe> {
   const generation = generationOf(name);
+  const epoch = usageEpochOf(name);
   let usage: Utilization | null = null;
   let status: number | null = null;
   try {
@@ -253,7 +263,7 @@ async function fetchUsage(name: string): Promise<UsageProbe> {
   // account's usage and says nothing about the new one.
   if (generationOf(name) !== generation || !Object.hasOwn(users, name)) return { usage: null, status: null };
   const probe = { at: Date.now(), usage, status };
-  usageCache.set(name, probe);
+  if (usageEpochOf(name) === epoch) usageCache.set(name, probe); // else: a limit landed meanwhile; this is the number from before it
   return probe;
 }
 
@@ -843,12 +853,14 @@ async function reportDirectLimit(raw: Buffer, res: http.ServerResponse, caller: 
   }
   if (forMs === 0) ledger.unpark(caller);
   else ledger.park(caller, forMs);
-  usageCache.delete(caller); // the borrow gate must see the limit, not a minute-old number
+  forgetUsage(caller); // the borrow gate must see the limit, not a minute-old number, nor a probe from before it
   sendJson(res, 200, { ok: true, parkedUntil: ledger.parkedUntil(caller) });
 }
 
-// Served unauthenticated from ./installer: the join script and the invite page's logo.
-// The app itself always comes from GitHub releases, never from a pool.
+// Served unauthenticated from ./installer: the invite page's logo. Nothing runnable:
+// the app always comes from GitHub releases, never from a pool, and the pool serves
+// no script to pipe into a shell either (it used to serve join.sh; a pool's operator
+// controls what the pool serves, and a joiner must not run their program).
 const INSTALLER_DIR = new URL("../installer/", import.meta.url);
 
 // Kept in memory, re-read when the file on disk changes (checked at most every few
@@ -872,7 +884,6 @@ function installerFile(file: string): Buffer | null {
 
 function serveInstaller(res: http.ServerResponse, file: string): void {
   const types: Record<string, string> = {
-    "join.sh": "text/x-shellscript; charset=utf-8",
     "logo.png": "image/png", // for the invite page
   };
   if (!types[file]) return sendError(res, 404, "not_found_error", "Not found.");
@@ -904,7 +915,7 @@ async function setTokens(raw: Buffer, res: http.ServerResponse, caller: string):
     delete users[caller].claudeToken; // the login replaces any setup token
     saveConfig();
   }
-  usageCache.delete(caller);
+  forgetUsage(caller);
   ledger.unpark(caller); // whatever the old login hit, this one hasn't
   console.log(`[pool] ${caller} connected their subscription (OAuth tokens stored)`);
   sendJson(res, 200, { ok: true });
@@ -1204,11 +1215,14 @@ async function redeem(req: http.IncomingMessage, res: http.ServerResponse): Prom
 function forgetMember(name: string): void {
   closeSessions(name, "You are no longer a member of this pool.");
   newGeneration(name);
+  // Their login goes first, and to disk at once: a crash between the two writes must
+  // leave a member without a login, never a login without a member (which a newcomer
+  // of the same name would inherit).
+  ledger.removeMember(name);
+  usageCache.delete(name);
   delete users[name];
   if (config.admins) config.admins = config.admins.filter((admin) => admin !== name);
   saveConfig();
-  ledger.removeMember(name);
-  usageCache.delete(name);
 }
 
 async function removeMember(res: http.ServerResponse, caller: string, name: string): Promise<void> {
@@ -1245,7 +1259,7 @@ async function leavePool(res: http.ServerResponse, caller: string): Promise<void
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET") {
-      const file = ["/join.sh", "/logo.png"].includes(req.url ?? "") ? req.url!.slice(1) : undefined;
+      const file = req.url === "/logo.png" ? "logo.png" : undefined;
       const inviteCode = req.url?.match(INVITE_PATH)?.[1];
       if (file || inviteCode) {
         // Public, so priced per visitor: one client can't keep the pool busy with them.

@@ -185,7 +185,10 @@ export class Ledger {
     this.state.borrowLog = prune(this.state.borrowLog);
     this.state.usageLog = prune(this.state.usageLog);
     // Monthly totals: this month and the last are read; older ones only grow the file.
-    const keep = new Set([currentMonth(), currentMonth(new Date(now - 31 * 86_400_000))]);
+    // The previous month by the calendar (31 days back from the 1st after a 30-day
+    // month would skip it).
+    const d = new Date(now);
+    const keep = new Set([currentMonth(d), currentMonth(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1)))]);
     for (const month of Object.keys(this.state.spend)) if (!keep.has(month)) delete this.state.spend[month];
   }
 
@@ -199,7 +202,7 @@ export class Ledger {
     delete this.state.policies[name];
     delete this.state.presence[name];
     delete this.state.lastOwnUse[name];
-    this.save();
+    this.saveNow(); // a revocation is not something to lose to a crash in the next half second
   }
 
   // Writes now whatever a debounced save still holds (the pool is stopping).

@@ -63,7 +63,10 @@ their pool with two buttons:
    lembas opens at login. Wrong invite? **Use a different invite** goes back, and the
    invite stays valid until you've connected.
 
-You can also download lembas from the [latest release](../../releases/latest).
+You can also download lembas from the [latest release](../../releases/latest). That first
+download is the one step the app can't check for you: it trusts GitHub's latest release
+(built by this repository's workflow; `gh attestation verify lembas.zip --repo
+bodino/lembas` confirms that). Every update after it is checked against the release key.
 
 That's it — no Terminal, no Tailscale, no Node. lembas installs its agent (a launchd
 job, `com.lembas.agent`) and sets only `ANTHROPIC_BASE_URL=http://127.0.0.1:8788` in
@@ -118,11 +121,14 @@ such a pool can't lend at all, and its members' menu says so).
    approve it. Put the printed `https://….ts.net` address in `config.json` as
    `publicUrl` and restart the pool:
    `launchctl kickstart -k gui/$(id -u)/com.lembas.pool`.
-5. Join your own pool: install the app on this Mac with your token —
+5. Join your own pool: download lembas from the [latest release](../../releases/latest)
+   like everyone else, write its config with your address and token —
    ```sh
-   curl -fsSL http://127.0.0.1:8787/join.sh | sh -s -- https://your-mac.your-tailnet.ts.net pool-…
+   mkdir -p ~/.config && printf '{"url":"%s","token":"%s"}\n' https://your-mac.your-tailnet.ts.net pool-… > ~/.config/lembas.json && chmod 600 ~/.config/lembas.json
    ```
-   — then choose **Connect Subscription…** in the app.
+   — open the app, then choose **Connect Subscription…**. (The pool never serves a
+   script to run: whoever runs a pool must not get to run code on a member's Mac, and
+   that includes the pool's own operator joining.)
 6. Invite friends: **Invite to Pool…** in the app copies a one-time link (valid 7 days)
    that opens the invite page described above. Nobody is added until it's used. Admins
    can also **Remove from Pool** on a person's page, which revokes their access at once.
@@ -133,8 +139,8 @@ such a pool can't lend at all, and its members' menu says so).
 
 ### What protects a public pool
 
-- Every route except the invite page, `/pool/redeem`, `/join.sh`, `/lembas.zip`,
-  `/version.json` and `/logo.png` needs a pool token (192 random bits). Invite codes
+- Every route except the invite page, `/pool/redeem` and `/logo.png` needs a pool
+  token (192 random bits); nothing the pool serves is a program. Invite codes
   are 16 characters (~79 bits) and single-use; the invite page only displays, it never
   joins anyone.
 - 10 failed tokens or codes from one client block it for 10 minutes. Valid tokens are
@@ -195,10 +201,9 @@ draws the app icon, signs ad hoc, and writes `installer/lembas.zip` plus
 - `src/HTTPServer.swift` — small HTTP server shared by the agent and login
 - `src/server.ts`, `src/ledger.ts` — the pool
 
-Terminal-only alternatives for pool admins: `./add-user.sh <name>` adds a member and
-prints a `join.sh` one-liner; `./set-token.sh <name>` stores a `claude setup-token`
-token for members who can't use the app's login (that path can't read usage windows,
-so such members never lend).
+Terminal-only alternative for pool admins: `./set-token.sh <name>` stores a `claude
+setup-token` token for a member who can't use the app's login (that path can't read
+usage windows, so such members never lend). Members are added with invites from the app.
 
 ## Notes
 

@@ -557,6 +557,21 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
    connection arrives from loopback and the pool can't tell them apart before the
    headers; Claude Code keeps working through that, only borrowing pauses.
 
+44. **The pool served a program.** (Fifth external review.) `join.sh`, fetched from the
+   pool and piped into `sh`, was the one path on which a pool's operator could run code
+   on a member's Mac, against the README's own promise; it is gone, along with the
+   `add-user.sh` that printed it (invites do that job), and the pool's operator joins
+   their own pool by writing the two-line config and opening the app like everyone
+   else. What remains is the first download itself, which trusts GitHub's latest
+   release and can be checked with `gh attestation verify`; every update after it is
+   checked against the release key. Also from that review: the agent's chunked-body
+   parser added a chunk size to the body length before comparing, so a size near
+   `Int.max` overflowed and trapped (reproduced on 1.3.8; the login app shares the
+   parser); a removal now writes the ledger first and at once, so a crash between its
+   two writes can't leave a login without a member; the usage cache has an epoch, so a
+   probe that started before a limit report can't cache the number from before it; and
+   the monthly totals keep the previous calendar month rather than "31 days ago".
+
 ## Open
 
 - **Memory.** About 165 MB per helper at steady state, mostly allocator high-water

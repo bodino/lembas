@@ -212,7 +212,9 @@ private final class Reader {
           while try await !line().isEmpty {} // trailers
           break
         }
-        guard request.body.count + size <= HTTPServer.maxBody else { throw HTTPError.tooLarge }
+        // Compared without adding: a size near Int.max would overflow the sum, and
+        // Swift traps on that.
+        guard size <= HTTPServer.maxBody, request.body.count <= HTTPServer.maxBody - size else { throw HTTPError.tooLarge }
         request.body.append(try await bytes(size))
         _ = try await line()
       }
