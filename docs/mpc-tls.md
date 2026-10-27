@@ -572,6 +572,26 @@ they are kept because several of them still apply (8, 9, 12, 13, 14, 15).
    probe that started before a limit report can't cache the number from before it; and
    the monthly totals keep the previous calendar month rather than "31 days ago".
 
+45. **A probe that never settled held every status read.** (Seen live, 2026-10-27.)
+   The pool asks Anthropic for a member's usage at most once at a time, and whoever
+   asks meanwhile waits on that one promise. A probe begun at 10:59:46, the second the
+   Mac entered sleep, was still pending at 11:51 with no socket behind it: its
+   `AbortSignal.timeout(6_000)` never fired through the dark wakes that followed. From
+   then on every `GET /pool` joined that promise and the app showed "can't reach the
+   pool" while borrowing was paused; unauthenticated requests still answered, so the
+   pool looked alive. Found by attaching the inspector to the live pool and breaking
+   inside the probe: the single-flight map held `alessandro`, the cache was 53 minutes
+   old, no refresh was in flight. Now every upstream call (the usage probe, the token
+   refresh) runs under `bounded(ms, fallback, op)`: an ordinary strongly held timer
+   that aborts the work and hands the caller the fallback at the deadline whatever
+   the work does, and the single-flight entry itself is bounded once more (a refresh
+   plus a probe at their longest, then "unknown"). Status also asks for every
+   member's usage at once rather than one after another, so with Anthropic
+   unreachable the answer takes one deadline, not one per member. Verified on a
+   scratch pool against a fake Anthropic whose usage endpoint holds the socket open:
+   status reads answer at the deadline with usage "unknown", recover with real
+   numbers once it answers, and 25 concurrent reads still cost one probe per member.
+
 ## Open
 
 - **Memory.** About 165 MB per helper at steady state, mostly allocator high-water

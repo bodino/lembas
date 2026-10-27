@@ -52,6 +52,7 @@ const USAGE_CACHE_MS = (config.usageCacheSeconds ?? 60) * 1000;
 const BORROW_AT_PERCENT = config.borrowAtPercent ?? 90;
 // One usage fetch; lenders are probed in parallel, and the helper waits 30 s in all.
 const USAGE_TIMEOUT_MS = 6_000;
+const REFRESH_TIMEOUT_MS = 15_000;
 // Members' requests to the pool carry JSON settings and reports, never model calls.
 const MAX_BODY = 64 * 1024;
 // A private session is closed after this long; the agent opens a fresh one, so the
@@ -92,6 +93,24 @@ const oauthGeneration = new Map<string, number>();
 const generationOf = (name: string) => oauthGeneration.get(name) ?? 0;
 const newGeneration = (name: string) => oauthGeneration.set(name, generationOf(name) + 1);
 
+// Runs `op` against a deadline it cannot outlive: the signal tells the work to stop
+// at `ms`, and whatever the work then does, the caller has `fallback` by then. The
+// timer is an ordinary strongly held one. A fetch with only `AbortSignal.timeout`
+// begun as the Mac fell asleep stayed pending for an hour with its 6-second signal
+// never firing, and the single-flight probe map held every status read on it
+// (finding 45): nothing upstream is awaited without this any more.
+function bounded<T>(ms: number, fallback: T, op: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const control = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<T>((resolve) => {
+    timer = setTimeout(() => {
+      control.abort(new Error(`no answer in ${ms} ms`));
+      resolve(fallback);
+    }, ms);
+  });
+  return Promise.race([op(control.signal), late]).finally(() => clearTimeout(timer));
+}
+
 // Refresh a member's stored OAuth token (rotation: store the new refresh token).
 async function refreshOAuth(name: string): Promise<string | null> {
   const generation = generationOf(name);
@@ -105,27 +124,32 @@ async function refreshOAuth(name: string): Promise<string | null> {
     const unchanged = () => generationOf(name) === generation && Object.hasOwn(users, name)
       && ledger.oauth(name)?.refreshToken === tokens.refreshToken;
     try {
-      const res = await fetch(OAUTH_TOKEN_URL, {
-        method: "POST",
-        headers: { "content-type": "application/json", "user-agent": "claude-cli/2.1.310" },
-        body: JSON.stringify({
-          grant_type: "refresh_token",
-          refresh_token: tokens.refreshToken,
-          client_id: OAUTH_CLIENT_ID,
-          scope: "user:inference user:profile",
-        }),
-        signal: AbortSignal.timeout(15_000),
+      type Refreshed = { access_token?: string; refresh_token?: string; expires_at?: number; expires_in?: number };
+      const answer = await bounded(REFRESH_TIMEOUT_MS, null, async (signal) => {
+        const res = await fetch(OAUTH_TOKEN_URL, {
+          method: "POST",
+          headers: { "content-type": "application/json", "user-agent": "claude-cli/2.1.310" },
+          body: JSON.stringify({
+            grant_type: "refresh_token",
+            refresh_token: tokens.refreshToken,
+            client_id: OAUTH_CLIENT_ID,
+            scope: "user:inference user:profile",
+          }),
+          signal,
+        });
+        return { status: res.status, body: res.ok ? ((await res.json()) as Refreshed) : null };
       });
       if (!unchanged()) return null; // someone else's result now; theirs is the one that counts
-      if (res.status === 400 || res.status === 401) {
+      if (!answer) throw new Error(`no answer in ${REFRESH_TIMEOUT_MS / 1000} s`);
+      if (answer.status === 400 || answer.status === 401) {
         // The refresh token itself was rejected (revoked, rotated elsewhere): this
         // login is gone and the member has to connect again.
-        console.log(`[pool] ${name}'s login was rejected by Anthropic (HTTP ${res.status}); their subscription is disconnected`);
+        console.log(`[pool] ${name}'s login was rejected by Anthropic (HTTP ${answer.status}); their subscription is disconnected`);
         ledger.clearOAuth(name);
         return null;
       }
-      if (!res.ok) throw new Error(`refresh failed: HTTP ${res.status}`);
-      const body = (await res.json()) as { access_token?: string; refresh_token?: string; expires_at?: number; expires_in?: number };
+      const body = answer.body;
+      if (!body) throw new Error(`refresh failed: HTTP ${answer.status}`);
       if (!body.access_token || !body.refresh_token) throw new Error("refresh response missing tokens");
       let expiresAt = body.expires_at ?? Date.now() + (body.expires_in ?? 3600) * 1000;
       if (expiresAt < 1e12) expiresAt *= 1000; // seconds -> ms
@@ -203,7 +227,11 @@ async function probeUsage(name: string, maxAgeMs = USAGE_CACHE_MS): Promise<Usag
   // this endpoint rate-limits hard and one 429 would leave everyone "unknown".
   let inFlight = probing.get(name);
   if (!inFlight) {
-    inFlight = fetchUsage(name).finally(() => probing.delete(name));
+    // Everyone who asks meanwhile waits on this one entry, so it must settle whatever
+    // the probe does: a refresh and a probe at their longest, then "unknown".
+    const unknown: UsageProbe = { usage: null, status: null };
+    inFlight = bounded(REFRESH_TIMEOUT_MS + USAGE_TIMEOUT_MS + 2_000, unknown, () => fetchUsage(name))
+      .finally(() => probing.delete(name));
     probing.set(name, inFlight);
   }
   return inFlight;
@@ -216,19 +244,23 @@ async function fetchUsage(name: string): Promise<UsageProbe> {
   let status: number | null = null;
   try {
     const token = await anthropicToken(name);
-    const res = await fetch(UPSTREAM + "/api/oauth/usage", {
-      headers: {
-        authorization: `Bearer ${token}`,
-        // The User-Agent shape is mandatory: without "claude-code/<version>" this endpoint 429s persistently.
-        "user-agent": "claude-code/2.1.0",
-        "anthropic-beta": "oauth-2025-04-20",
-        "content-type": "application/json",
-      },
-      signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
+    type UsageBody = Record<string, { utilization?: unknown; resets_at?: unknown; locked_reason?: unknown } | null>;
+    const answer = await bounded(USAGE_TIMEOUT_MS, null, async (signal) => {
+      const res = await fetch(UPSTREAM + "/api/oauth/usage", {
+        headers: {
+          authorization: `Bearer ${token}`,
+          // The User-Agent shape is mandatory: without "claude-code/<version>" this endpoint 429s persistently.
+          "user-agent": "claude-code/2.1.0",
+          "anthropic-beta": "oauth-2025-04-20",
+          "content-type": "application/json",
+        },
+        signal,
+      });
+      return { status: res.status, body: res.ok ? ((await res.json()) as UsageBody) : null };
     });
-    status = res.status;
-    if (res.ok) {
-      const body = (await res.json()) as Record<string, { utilization?: unknown; resets_at?: unknown; locked_reason?: unknown } | null>;
+    if (answer) status = answer.status;
+    if (answer?.body) {
+      const body = answer.body;
       const windows: Record<string, number> = {};
       let locked = false;
       for (const [key, value] of Object.entries(body)) {
@@ -391,9 +423,17 @@ async function status(caller: string): Promise<unknown> {
   // name is from when the readable relay still existed, and older apps read it.
   const out: Record<string, unknown> = { you: caller, canInvite: isAdmin(caller), privateBorrowing: mpcAvailable() };
   const borrowingFrom: Record<string, unknown> = {};
+  // Every member's usage is asked for at once (one in flight per member, whoever
+  // asks), not one after another: with Anthropic unreachable each probe runs to its
+  // deadline, and the app's wait for this answer must not grow with the pool.
+  const others = Object.keys(users).filter((name) => name !== caller);
+  const [ownUsage, availabilities] = await Promise.all([
+    fetchUtilization(caller),
+    Promise.all(others.map(async (name) => [name, await availability(name, caller)] as const)),
+  ]);
   for (const name of Object.keys(users)) {
     if (name === caller) {
-      const usage = await fetchUtilization(name);
+      const usage = ownUsage;
       const weekBy = ledger.borrowedThisWeekBy(name);
       const lending: Record<string, unknown> = {};
       for (const consumer of Object.keys(users)) {
@@ -435,7 +475,7 @@ async function status(caller: string): Promise<unknown> {
     } else {
       // The caller's view of each other member: can I borrow from them right now, and
       // why (not). Their own per-person choices for others are not exposed.
-      const { headroom, reason, left5h, leftWeek } = await availability(name, caller);
+      const { headroom, reason, left5h, leftWeek } = availabilities.find(([who]) => who === name)![1];
       borrowingFrom[name] = {
         reason,
         availablePoints: round1(headroom),
