@@ -52,7 +52,9 @@ done
 lipo -create "$TMP/lembas-arm64" "$TMP/lembas-x86_64" -output "$APP/MacOS/lembas"
 lipo -create "$TMP/lembas-agent-arm64" "$TMP/lembas-agent-x86_64" -output "$APP/MacOS/lembas-agent"
 
-# App icon, drawn by src/Logo.swift.
+# App icon, drawn by src/Logo.swift. installer/ holds only build output now (nothing
+# tracked), so a fresh checkout doesn't have it.
+mkdir -p installer
 xcrun swiftc -parse-as-library -O src/Logo.swift tools/MakeIcon.swift -o "$TMP/make-icon"
 "$TMP/make-icon" "$TMP/AppIcon.iconset" installer/logo.png
 iconutil -c icns "$TMP/AppIcon.iconset" -o "$APP/Resources/AppIcon.icns"
