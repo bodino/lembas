@@ -9,6 +9,8 @@
 //! lembas-mpc pool     --stdio ...            # one session, link on stdin/stdout
 //! lembas-mpc proxy    --stdio --listen 127.0.0.1:0 --port-file port
 //! lembas-mpc chat     --pool 127.0.0.1:7700
+//! lembas-mpc limit-verify --listen 127.0.0.1:7701        # a lender checks a limit proof
+//! lembas-mpc limit-prove  --verifier 127.0.0.1:7701 --token-env LEMBAS_TOKEN
 //! ```
 //!
 //! A session (`session`) carries many requests over many connections with one
@@ -35,7 +37,9 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use lembas_mpc::{
-    TOKEN_LEN, dechunk, fixture_roots, link,
+    TOKEN_LEN, dechunk, fixture_roots,
+    limit::{self, USAGE_PATH},
+    link,
     local::serve_local,
     mozilla_roots,
     session::{Connector, Lease, OnSpliced, Session, TokenSource, fixed_token, run_pool},
@@ -43,7 +47,7 @@ use lembas_mpc::{
 use rustls::RootCertStore;
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::oneshot,
 };
@@ -187,6 +191,39 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:7443")]
         listen: String,
     },
+    /// Check one limit proof: accept a prover, relay its usage probe to the
+    /// server, verify what it reveals, print the usage.
+    LimitVerify {
+        /// Address to accept the prover on.
+        #[arg(long, default_value = "127.0.0.1:7701")]
+        listen: String,
+        /// API server to connect to, host:port.
+        #[arg(long, default_value = "api.anthropic.com:443")]
+        server: String,
+        /// The Host the prover must use.
+        #[arg(long, default_value = "api.anthropic.com")]
+        server_name: String,
+        /// The path the prover must request.
+        #[arg(long, default_value = USAGE_PATH)]
+        path: String,
+    },
+    /// Prove to a verifier what the usage endpoint says about the token in
+    /// the environment, without showing it the token.
+    LimitProve {
+        /// The verifier's address.
+        #[arg(long, default_value = "127.0.0.1:7701")]
+        verifier: String,
+        /// Environment variable holding the bearer token.
+        #[arg(long, default_value = "LEMBAS_TOKEN")]
+        token_env: String,
+        #[arg(long, default_value = "api.anthropic.com")]
+        server_name: String,
+        /// The only path this prover reveals a response to.
+        #[arg(long, default_value = USAGE_PATH)]
+        path: String,
+        #[arg(long, value_enum, default_value_t = Roots::Mozilla)]
+        roots: Roots,
+    },
     /// Chat with the model; the conversation is one session, every turn one
     /// borrowed request.
     Chat {
@@ -296,6 +333,95 @@ async fn run() -> Result<()> {
             max_tokens,
             token_len,
         } => chat(&pool, &model, max_tokens, token_len).await,
+        Cmd::LimitVerify {
+            listen,
+            server,
+            server_name,
+            path,
+        } => {
+            let listener = TcpListener::bind(&listen).await?;
+            info!("verifier: listening on {listen}, probing {server} as {server_name}{path}");
+            let (stream, peer) = listener.accept().await?;
+            info!("verifier: prover connected from {peer}");
+            stream.set_nodelay(true)?;
+            let upstream = TcpStream::connect(&server)
+                .await
+                .with_context(|| format!("connecting to {server}"))?;
+            upstream.set_nodelay(true)?;
+            let counted = Counted::new(stream);
+            let meter = counted.meter();
+            let link = link(counted.compat())?;
+            let driver = tokio::spawn(link.driver);
+            let mut phases = Phases::new(meter);
+            let verified = limit::verify(
+                link.mpc,
+                link.up,
+                link.down,
+                upstream,
+                &server_name,
+                &path,
+                Some(&mut |p| phases.mark(p)),
+            )
+            .await;
+            drop(link.session);
+            let _ = link.close.send(());
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, driver).await;
+            let verified = verified?;
+            phases.print("verifier");
+            println!("request:  {}", verified.request.trim_end().replace("\r\n", " | "));
+            println!("response: {} ({} bytes of head, {} of body)", verified.status, verified.head.len(), verified.body.len());
+            match verified.usage() {
+                Ok(usage) => {
+                    for (w, u) in &usage.windows {
+                        println!("  {w}: {u:.1}%{}", usage.resets_at.get(w).map(|r| format!(", resets {r}")).unwrap_or_default());
+                    }
+                    println!("  locked: {}", usage.locked);
+                }
+                Err(e) => println!("  not a usage answer: {e:#}\n{}", String::from_utf8_lossy(&verified.body)),
+            }
+            Ok(())
+        }
+        Cmd::LimitProve {
+            verifier,
+            token_env,
+            server_name,
+            path,
+            roots,
+        } => {
+            let token = std::env::var(&token_env).with_context(|| format!("set {token_env} to the bearer token"))?;
+            let stream = TcpStream::connect(&verifier)
+                .await
+                .with_context(|| format!("connecting to the verifier at {verifier}"))?;
+            stream.set_nodelay(true)?;
+            let counted = Counted::new(stream);
+            let meter = counted.meter();
+            let link = link(counted.compat())?;
+            let driver = tokio::spawn(link.driver);
+            let mut phases = Phases::new(meter);
+            let proven = limit::prove(
+                link.mpc,
+                link.up,
+                link.down,
+                &roots.store()?,
+                &server_name,
+                &path,
+                &token,
+                Some(&mut |p| phases.mark(p)),
+            )
+            .await;
+            drop(link.session);
+            let _ = link.close.send(());
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, driver).await;
+            let proven = proven?;
+            phases.print("prover");
+            println!(
+                "status {}, verifier {}: {}",
+                proven.status,
+                if proven.accepted { "accepted" } else { "refused" },
+                proven.detail
+            );
+            Ok(())
+        }
         Cmd::Proxy {
             listen,
             port_file,
@@ -427,6 +553,107 @@ fn env_token(token_env: &str) -> Result<TokenSource> {
         bail!("{token_env} does not look like a token");
     }
     Ok(fixed_token(token))
+}
+
+// ---------------------------------------------------------------------------
+// Measuring the link
+
+#[derive(Default, Clone)]
+struct Meter {
+    sent: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
+}
+
+/// A stream that counts what passes.
+struct Counted<T> {
+    inner: T,
+    meter: Meter,
+}
+
+impl<T> Counted<T> {
+    fn new(inner: T) -> Self {
+        Self { inner, meter: Meter::default() }
+    }
+
+    fn meter(&self) -> Meter {
+        self.meter.clone()
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counted<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            let n = buf.filled().len() - before;
+            self.meter.received.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, data);
+        if let Poll::Ready(Ok(n)) = &res {
+            self.meter.sent.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Bytes and time per phase of a protocol run.
+struct Phases {
+    meter: Meter,
+    started: Instant,
+    last: (Instant, u64, u64),
+    rows: Vec<(&'static str, std::time::Duration, u64, u64)>,
+}
+
+impl Phases {
+    fn new(meter: Meter) -> Self {
+        let now = Instant::now();
+        Self { meter, started: now, last: (now, 0, 0), rows: Vec::new() }
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        let sent = self.meter.sent.load(Ordering::Relaxed);
+        let received = self.meter.received.load(Ordering::Relaxed);
+        let (t, s, r) = self.last;
+        self.rows.push((phase, now - t, sent - s, received - r));
+        self.last = (now, sent, received);
+    }
+
+    fn print(&self, who: &str) {
+        println!("{who}: {:>8}  {:>10}  {:>10}  {:>10}", "phase", "time", "sent", "received");
+        for (phase, took, sent, received) in &self.rows {
+            println!("{who}: {phase:>8}  {:>10}  {:>10}  {:>10}", format!("{took:.1?}"), kb(*sent), kb(*received));
+        }
+        println!(
+            "{who}: {:>8}  {:>10}  {:>10}  {:>10}",
+            "total",
+            format!("{:.1?}", self.started.elapsed()),
+            kb(self.meter.sent.load(Ordering::Relaxed)),
+            kb(self.meter.received.load(Ordering::Relaxed))
+        );
+    }
+}
+
+fn kb(n: u64) -> String {
+    if n >= 1 << 20 {
+        format!("{:.2} MB", n as f64 / (1u64 << 20) as f64)
+    } else {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    }
 }
 
 // ---------------------------------------------------------------------------

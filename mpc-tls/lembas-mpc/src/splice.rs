@@ -113,16 +113,16 @@ pub(crate) fn encode_record(nonce: &[u8; 12], ciphertext: &[u8], tag: [u8; 16]) 
 // ---------------------------------------------------------------------------
 // GHASH helpers, with tlsn's bit conventions.
 
-fn gf(block: [u8; 16]) -> Gf2_128 {
+pub(crate) fn gf(block: [u8; 16]) -> Gf2_128 {
     Gf2_128::from(Block::from(block).reverse_bits())
 }
 
-fn un_gf(x: Gf2_128) -> [u8; 16] {
+pub(crate) fn un_gf(x: Gf2_128) -> [u8; 16] {
     Block::from(x).reverse_bits().to_bytes()
 }
 
 /// The blocks GHASH runs over: AAD (padded), ciphertext (padded), lengths.
-fn ghash_blocks(aad: &[u8], ciphertext: &[u8]) -> Vec<[u8; 16]> {
+pub(crate) fn ghash_blocks(aad: &[u8], ciphertext: &[u8]) -> Vec<[u8; 16]> {
     let mut data = aad.to_vec();
     data.resize(aad.len().div_ceil(16) * 16, 0);
     let ct_start = data.len();
@@ -141,7 +141,7 @@ fn ghash_blocks(aad: &[u8], ciphertext: &[u8]) -> Vec<[u8; 16]> {
 }
 
 /// Powers of H for each GHASH block: block `j` of `m` is multiplied by H^(m-j).
-fn h_powers(h: Gf2_128, m: usize) -> Vec<Gf2_128> {
+pub(crate) fn h_powers(h: Gf2_128, m: usize) -> Vec<Gf2_128> {
     let mut powers = vec![Gf2_128::zero(); m];
     let mut acc = Gf2_128::one();
     for j in (0..m).rev() {
@@ -151,7 +151,7 @@ fn h_powers(h: Gf2_128, m: usize) -> Vec<Gf2_128> {
     powers
 }
 
-fn counter_block(nonce: &[u8; 12], ctr: u32) -> [u8; 16] {
+pub(crate) fn counter_block(nonce: &[u8; 12], ctr: u32) -> [u8; 16] {
     let mut b = [0u8; 16];
     b[..12].copy_from_slice(nonce);
     b[12..].copy_from_slice(&ctr.to_be_bytes());
@@ -167,7 +167,7 @@ pub fn span_blocks(header: &RequestHeader) -> Vec<usize> {
         .collect()
 }
 
-fn aes_block(key: &[u8; 16], block: [u8; 16]) -> [u8; 16] {
+pub(crate) fn aes_block(key: &[u8; 16], block: [u8; 16]) -> [u8; 16] {
     let cipher = aes::Aes128::new(GenericArray::from_slice(key));
     let mut b = GenericArray::from(block);
     cipher.encrypt_block(&mut b);
@@ -435,15 +435,28 @@ where
         key: Option<[u8; 16]>,
         nonce: &[u8; 12],
     ) -> Result<Vec<[u8; 16]>> {
+        // J0 is counter 1; the keystream starts at counter 2.
+        let counters: Vec<[u8; 16]> = (0..blocks).map(|i| counter_block(nonce, i as u32 + 2)).collect();
+        self.aes_blocks(ctx, key, &counters).await
+    }
+
+    /// AES under one committed key on public input blocks, proven in zero
+    /// knowledge. `key` is `Some` on the prover only; the verifier gets the
+    /// outputs for whatever key the prover committed to, or an error.
+    pub(crate) async fn aes_blocks(
+        &mut self,
+        ctx: &mut Context,
+        key: Option<[u8; 16]>,
+        inputs: &[[u8; 16]],
+    ) -> Result<Vec<[u8; 16]>> {
         let vm = &mut self.vm;
-        let ks = alloc_keystream(vm, blocks, key.is_some())?;
+        let ks = alloc_keystream(vm, inputs.len(), key.is_some())?;
         if let Some(key) = key {
             vm.assign(ks.key, key)?;
         }
         vm.commit(ks.key)?;
-        for (i, ctr) in ks.counters.iter().enumerate() {
-            // J0 is counter 1; the keystream starts at counter 2.
-            vm.assign(*ctr, counter_block(nonce, i as u32 + 2))?;
+        for (ctr, input) in ks.counters.iter().zip(inputs) {
+            vm.assign(*ctr, *input)?;
             vm.commit(*ctr)?;
         }
         vm.flush(ctx).await?;
