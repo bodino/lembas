@@ -1,7 +1,7 @@
-// Links a member's claude.ai subscription to the pool (port of installer/login.mjs).
-// OAuth with PKCE against Claude Code's client: the browser login happens between the
-// member and Anthropic; the pool only receives tokens scoped user:inference +
-// user:profile, so it can route borrowed requests and read usage windows.
+// Connects this Mac's claude.ai subscription: OAuth with PKCE against Claude Code's
+// client. The browser login happens between the member and Anthropic; the tokens
+// (scoped user:inference + user:profile) are written to a file on this Mac that only
+// the agent's peer reads, to lend with and to prove this Mac's usage. Nothing leaves.
 
 import AppKit
 import CryptoKit
@@ -11,7 +11,7 @@ enum SubscriptionLogin {
   static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
   static let port: UInt16 = 8912
 
-  static func run(pool: String, poolToken: String) async throws {
+  static func run(loginFile: URL) async throws {
     let verifier = base64url(randomBytes(32))
     let challenge = base64url(Data(SHA256.hash(data: Data(verifier.utf8))))
     let state = randomBytes(16).map { String(format: "%02x", $0) }.joined()
@@ -28,7 +28,7 @@ enum SubscriptionLogin {
     ]
 
     let result = ResultBox()
-    let attempt = Attempt(verifier: verifier, state: state, redirectURI: redirectURI, pool: pool, poolToken: poolToken)
+    let attempt = Attempt(verifier: verifier, state: state, redirectURI: redirectURI, loginFile: loginFile)
     let html = [("Content-Type", "text/html; charset=utf-8")]
     // Stays up until the subscription is connected (or we time out), so a failed attempt
     // can be retried from the browser instead of leaving the person stuck.
@@ -41,7 +41,7 @@ enum SubscriptionLogin {
         guard let code = query["code"], query["state"] == state else { throw LoginError("the login was not approved") }
         try await attempt.complete(code: code)
         await out.send(status: 200, headers: html,
-                       body: page(ok: true, "Subscription connected", "lembas can now lend and borrow for you. You can close this tab."))
+                       body: page(ok: true, "Subscription connected", "Your Mac can now lend to your circle and borrow from it. You can close this tab."))
         result.finish(nil)
       } catch {
         FileHandle.standardError.write(Data("[lembas] connecting subscription failed: \(error)\n".utf8))
@@ -60,12 +60,12 @@ enum SubscriptionLogin {
   // only the hand-off to the pool is retried. Serialized, because browsers sometimes
   // load the callback twice; once connected, later loads just succeed.
   private actor Attempt {
-    let verifier: String, state: String, redirectURI: String, pool: String, poolToken: String
+    let verifier: String, state: String, redirectURI: String, loginFile: URL
     private var tokens: (access: String, refresh: String, expiresAt: Int)?
     private var done = false
 
-    init(verifier: String, state: String, redirectURI: String, pool: String, poolToken: String) {
-      (self.verifier, self.state, self.redirectURI, self.pool, self.poolToken) = (verifier, state, redirectURI, pool, poolToken)
+    init(verifier: String, state: String, redirectURI: String, loginFile: URL) {
+      (self.verifier, self.state, self.redirectURI, self.loginFile) = (verifier, state, redirectURI, loginFile)
     }
 
     var hasTokens: Bool { tokens != nil }
@@ -95,19 +95,15 @@ enum SubscriptionLogin {
     }
 
     private func deposit(_ tokens: (access: String, refresh: String, expiresAt: Int)) async throws {
-      var put = URLRequest(url: URL(string: pool + "/pool/tokens")!)
-      put.httpMethod = "PUT"
-      put.timeoutInterval = 15
-      put.setValue("application/json", forHTTPHeaderField: "content-type")
-      put.setValue("Bearer \(poolToken)", forHTTPHeaderField: "authorization")
-      put.httpBody = try JSONSerialization.data(withJSONObject: [
+      let data = try JSONSerialization.data(withJSONObject: [
         "accessToken": tokens.access, "refreshToken": tokens.refresh, "expiresAt": tokens.expiresAt,
       ])
       do {
-        let (_, response) = try await URLSession.shared.data(for: put)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw LoginError("the pool didn't accept the login") }
-      } catch let error as URLError {
-        throw LoginError("couldn't reach the pool (\(error.localizedDescription))")
+        try FileManager.default.createDirectory(at: loginFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: loginFile, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: loginFile.path)
+      } catch {
+        throw LoginError("couldn't save the login (\(error.localizedDescription))")
       }
     }
   }

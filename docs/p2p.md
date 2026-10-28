@@ -178,20 +178,44 @@ sync, then on the first proxy request the limit proof over iroh (0.43 s; Alice's
 Anthropic's `200` with the one-word answer, spliced with Alice's token, about 1.1 s
 after `curl` started.
 
+## In the app (2026-10-28, later the same day)
+
+lembas.app and the agent on this branch use the peer and nothing else; there is no
+pool mode left in them (`src/server.ts` stays in the tree for the pool branch).
+
+- **The agent** (`Agent.swift`, `Peer.swift`, `PrivateBorrow.swift`) runs
+  `lembas-mpc peer --dir <Application Support/lembas/…/peer> --name … --token-file …
+  --control --socket …` as a child, restarts it if it dies, and speaks its control
+  channel. Borrowed requests go to the peer's socket as they went to `proxy`'s. The
+  config is `{"name", "secret"}`; the app shows the secret to the agent's new
+  endpoints: `GET /lembas/status`, `POST /lembas/cmd` (forwarded to the peer),
+  `POST /lembas/leave`. The agent flips the peer to away after the owner's idle time
+  and back on the next request, unless the owner flipped the switch.
+- **The login** stays on the Mac: `Login.swift` writes Claude Code's OAuth tokens to
+  `~/.config/lembas-login.json` (0600) instead of sending them to a pool; the agent
+  refreshes the access token when it is about to expire; the peer re-reads the file at
+  each use. Nobody else ever holds it.
+- **The app** (`PoolBar.swift`): the first screen asks for a name and either an invite
+  link (`lembas://join/…`, also as a clickable link) or *Start a Circle*; the checklist
+  then connects the subscription. The main screen is as before minus the dollar tiles
+  (there is no ledger: nobody sees anyone else's requests). Each person's page has the
+  two lending switches (*when I'm away*, *while I'm working*), what they lend you, and
+  *Remove from Circle*; *Invite a friend…* makes a one-time link for anyone in the
+  circle; the gear menu has *Leave Circle…*, which stops the peer and deletes its key,
+  the circle and the login on this Mac.
+- **Verified** with two agents and their peers on this Mac (scratchpad `e2e/run.sh`):
+  found, policy, invite over the agent's endpoints; join on the second; a
+  Claude-Code-shaped request to the second agent with `pretendLimited` came back `200`
+  from Anthropic through the first Mac's token, the proof and the session taking
+  about 2.5 s on first use, the request itself 1.4 s.
+
 ## What's left
 
-The order I would do it in:
-
-1. **The app.** The agent spawns `lembas-mpc peer --control --socket …` instead of
-   opening the pool WebSocket and `proxy`; `PrivateBorrow.swift` already talks to a
-   local socket and reads `x-lembas-request`. lembas.app drives the control channel:
-   found or join (the invite link replaces the pool's join page), the member list with
-   a *Lend to Sam?* prompt for members one did not invite, the away switch (the app's
-   auto-away stays), the limits. The pool's lending ledger (who used how much of whose)
-   becomes each Mac's own log.
-2. **Migration.** The pool could introduce existing members once (hand out an invite
-   and member list) and then drop out; or members simply re-invite each other. After
-   that the pool deletes the logins it holds.
+1. **Try the app with a friend.** `./build.sh` makes it; nothing in it needs a pool.
+   A *Lend to Sam?* prompt when someone one did not invite joins is still the switch
+   on their page (off by default for them, on for the one you invited).
+2. **Migration.** Members of a pool re-invite each other; the pool then deletes the
+   logins it holds. The pool code is untouched on this branch and does not run here.
 3. **The proof inside the borrowing session**, as one more `Up`/`Down` message pair,
    so it shares the OT setup: saves the 1.8 MB of setup and extension per proof and
    one stream. The verifier side needs the session's gate to keep a transcript for a

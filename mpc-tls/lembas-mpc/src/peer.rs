@@ -119,6 +119,14 @@ pub struct LendPolicy {
     pub week: f64,
     /// A borrower must prove a window at or past this.
     pub borrow_at: f64,
+    /// Idle this long and the owner counts as away (the app or agent flips
+    /// the switch; the peer only keeps the number).
+    #[serde(default = "default_away_after")]
+    pub away_after_minutes: u32,
+}
+
+fn default_away_after() -> u32 {
+    30
 }
 
 impl Default for LendPolicy {
@@ -127,6 +135,7 @@ impl Default for LendPolicy {
             away5h: 70.0,
             week: 60.0,
             borrow_at: 90.0,
+            away_after_minutes: 30,
         }
     }
 }
@@ -173,6 +182,9 @@ pub struct PeerConfig {
     pub name: String,
     /// This Mac's own subscription token, for lending and for proving.
     pub token: Option<String>,
+    /// Or a JSON file with `accessToken`, read at each use so that whoever
+    /// refreshes the login (the agent) need not restart the peer.
+    pub token_file: Option<PathBuf>,
     pub api: ApiTarget,
     /// Use n0's relays and address lookup (off for local tests).
     pub relay: bool,
@@ -228,6 +240,7 @@ pub struct Status {
     pub away: bool,
     pub lending: bool,
     pub usage: Option<Usage>,
+    pub policy: LendPolicy,
     pub members: Vec<MemberStatus>,
 }
 
@@ -326,6 +339,20 @@ impl Peer {
 
     pub fn id(&self) -> PublicKey {
         self.endpoint.id()
+    }
+
+    /// This Mac's own token, from the config or the token file.
+    pub fn token(&self) -> Option<String> {
+        if let Some(t) = &self.cfg.token {
+            return Some(t.clone());
+        }
+        let path = self.cfg.token_file.as_ref()?;
+        let text = std::fs::read(path).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&text).ok()?;
+        v.get("accessToken")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_graphic()))
+            .map(str::to_string)
     }
 
     fn persist(&self, state: &State) {
@@ -479,8 +506,9 @@ impl Peer {
             name: self.cfg.name.clone(),
             circle: st.circle.as_ref().map(|c| c.id),
             away: st.settings.away,
-            lending: self.cfg.token.is_some(),
+            lending: self.token().is_some(),
             usage: st.my_usage.as_ref().map(|(u, _)| u.clone()),
+            policy: st.settings.policy.clone(),
             members,
         }
     }
@@ -493,7 +521,7 @@ impl Peer {
             at: now(),
             name: self.cfg.name.clone(),
             away: st.settings.away,
-            lending: self.cfg.token.is_some(),
+            lending: self.token().is_some(),
             five_hour: usage.and_then(|u| u.windows.get("five_hour").copied()),
             seven_day: usage.and_then(|u| u.windows.get("seven_day").copied()),
             room: self.room(st, None).is_ok(),
@@ -503,7 +531,7 @@ impl Peer {
     /// Whether this Mac would lend right now (to `to`, if given), by its own
     /// limits against its own live usage.
     fn room(&self, st: &State, to: Option<&PublicKey>) -> Result<(), String> {
-        if self.cfg.token.is_none() {
+        if self.token().is_none() {
             return Err("no login to lend".into());
         }
         let Some((usage, at)) = &st.my_usage else {
@@ -548,11 +576,11 @@ impl Peer {
             _ => return Err("prove your limit first".into()),
         }
         self.room(&st, Some(who))?;
-        Ok(self.cfg.token.clone().ok_or("no login")?)
+        Ok(self.token().ok_or("no login")?)
     }
 
     async fn refresh_usage(&self) {
-        let Some(token) = self.cfg.token.clone() else { return };
+        let Some(token) = self.token() else { return };
         if !self.cfg.api.require_usage {
             // A test server has no usage endpoint: pretend an idle account.
             let mut st = self.state.lock().unwrap();
@@ -823,7 +851,7 @@ impl Peer {
 
     /// Proves this Mac's limit to `lender`, with its own token.
     pub async fn prove_to(&self, lender: PublicKey) -> Result<()> {
-        let token = self.cfg.token.clone().context("no login to prove with")?;
+        let token = self.token().context("no login to prove with")?;
         let conn = self.connect(lender).await?;
         let (mut send, recv) = conn.open_bi().await?;
         send.write_u8(Role::Limit as u8).await?;
@@ -1136,6 +1164,7 @@ mod tests {
             dir: tmp.join(who),
             name: who.to_string(),
             token: Some(token.clone()),
+            token_file: None,
             api: api.clone(),
             relay: false,
             bind: Some("127.0.0.1:0".parse().unwrap()),

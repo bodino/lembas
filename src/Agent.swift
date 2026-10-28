@@ -1,9 +1,10 @@
-// lembas agent — the local half of "direct first, pool only on limits".
+// lembas agent — the local half of "direct first, friends only on limits".
 //
 // Claude Code points at http://127.0.0.1:<port> with its normal claude.ai login.
 // Every request is forwarded straight to api.anthropic.com from this machine. Only
 // when Anthropic says that login hit a usage limit does the agent retry through the
-// pool. Prompts never go to the pool in the normal path; only metered USD metadata.
+// circle: a friend's Mac, reached by the peer this agent runs (Peer.swift). Prompts
+// never leave this Mac in the normal path, and nothing is metered anywhere else.
 //
 // Ships inside lembas.app; the app copies it to ~/Library/Application Support/lembas and
 // runs it under launchd, so it keeps working when the menu bar app is closed — and even
@@ -12,8 +13,10 @@
 import Foundation
 
 struct AgentConfig: Decodable {
-  var url: String
-  var token: String
+  /// This Mac's name in the circle.
+  var name: String
+  /// What the app shows to drive the agent's control endpoints (the config is 0600).
+  var secret: String
   var agentPort: Int?
   // Test hook: act as if the native login were at its usage limit, so every inference
   // request is borrowed. For a second profile that demonstrates borrowing.
@@ -83,6 +86,7 @@ actor Lifecycle {
   init(port: Int) { self.port = port }
 
   func touch() { lastRequest = Date() }
+  var idle: TimeInterval { Date().timeIntervalSince(lastRequest) }
 
   func check() async {
     // An update briefly swaps the app bundle, so require it missing on two checks.
@@ -162,17 +166,19 @@ actor Lifecycle {
 }
 
 final class Agent {
-  let pool: String?
-  let poolToken: String
+  let peer: PeerProcess?
+  let secret: String
   let directLock = DirectLock()
   let lifecycle: Lifecycle
   let port: Int
+  // The agent flipped the peer to away on idleness; the next request flips it back.
+  let autoAway = AutoAway()
 
   // Without a config the agent still forwards straight to Anthropic, so Claude Code
   // keeps working while it retires.
   init(config: AgentConfig?, lifecycle: Lifecycle, port: Int) {
-    pool = config.map { $0.url.hasSuffix("/") ? String($0.url.dropLast()) : $0.url }
-    poolToken = config?.token ?? ""
+    peer = config.map { PeerProcess(name: $0.name) }
+    secret = config?.secret ?? ""
     self.lifecycle = lifecycle
     self.port = port
   }
@@ -194,10 +200,11 @@ final class Agent {
 
   private func usingPool() async -> Bool {
     let retiring = await lifecycle.retiring
-    return pool != nil && !retiring
+    return peer != nil && !retiring
   }
 
   func handle(_ req: HTTPRequest, _ out: HTTPResponder) async {
+    if req.path.hasPrefix("/lembas/") { return await handleControl(req, out) }
     guard req.path.hasPrefix("/v1/") || req.path.hasPrefix("/api/") else {
       return await out.sendJSON(status: 404, ["type": "error", "error": ["type": "not_found_error", "message": "Not found."]])
     }
@@ -209,6 +216,7 @@ final class Agent {
     do {
       let model = modelName(req.body)
       let usePool = await usingPool()
+      if usePool, req.path.hasPrefix("/v1/"), await autoAway.back() { await setAway(false) }
 
       // The native login recently hit a real usage limit: go straight to the pool until
       // the lock expires, then probe direct again. Only inference calls borrow — Claude
@@ -226,7 +234,7 @@ final class Agent {
       if upstream.statusCode != 429 {
         let tap = UsageTap(contentType: upstream.value(forHTTPHeaderField: "content-type"))
         await relay(bytes, upstream, out, tap: tap)
-        reportDirectUsage(model: model, usd: costUsd(model: model, usage: tap.finish()))
+        _ = (model, tap.finish())
         return
       }
 
@@ -240,8 +248,8 @@ final class Agent {
 
       if usePool {
         let seconds = retryAfterSeconds(upstream) ?? defaultLimitSeconds
-        log("native login hit a usage limit; using the pool for \(Int(seconds))s")
-        await tellPoolItIsALimit(seconds: seconds)
+        log("native login hit a usage limit; borrowing from the circle for \(Int(seconds))s")
+        await directLock.lock(for: seconds)
         if await tryPool(req, out) { return }
       }
       await sendFixed(out, upstream, body) // pool down/no donors: preserve Anthropic's own error
@@ -311,42 +319,80 @@ final class Agent {
   // helper or not at all. Any failure pauses borrowing, and Claude Code gets
   // Anthropic's own limit error; a pool without the helper can't lend.
   func tryPool(_ req: HTTPRequest, _ out: HTTPResponder) async -> Bool {
-    guard pool != nil else { return false }
+    guard peer != nil else { return false }
     switch await tryPrivate(req, out) {
     case .served: return true
-    case .unsupported, .failed: return false
+    case .failed: return false
     }
   }
 
-  // ---------- talking to the pool: metadata only ----------
+  // ---------- the app's control endpoints: the peer, through the agent ----------
+  //
+  // Only the app, with the secret from the config file, may read the circle or change
+  // what this Mac lends. GET /lembas/status, POST /lembas/cmd {"cmd": …} (forwarded to
+  // the peer), POST /lembas/leave (stops the peer and forgets the circle).
 
-  func poolPut(_ path: String, _ body: [String: Any]) async throws {
-    guard let pool else { return }
-    var request = URLRequest(url: URL(string: pool + path)!)
-    request.httpMethod = "PUT"
-    request.timeoutInterval = 3
-    request.setValue("application/json", forHTTPHeaderField: "content-type")
-    request.setValue("Bearer \(poolToken)", forHTTPHeaderField: "authorization")
-    request.httpBody = try JSONSerialization.data(withJSONObject: body)
-    _ = try await session.data(for: request)
-  }
-
-  func tellPoolItIsALimit(seconds: Double) async {
-    await directLock.lock(for: seconds)
-    // The local lock still applies if this fails; the pool learns on the fallback request.
-    try? await poolPut("/pool/limit", ["forMs": Int(seconds * 1000)])
-  }
-
-  func reportDirectUsage(model: String?, usd: Double) {
-    guard usd > 0, pool != nil else { return }
-    var fields: [String: Any] = ["usd": usd]
-    if let model { fields["model"] = model }
-    let body = fields
-    Task {
-      do { try await poolPut("/pool/report", body) }
-      catch { log("could not report usage metadata: \(error.localizedDescription)") }
+  func handleControl(_ req: HTTPRequest, _ out: HTTPResponder) async {
+    guard !secret.isEmpty, req.header("authorization") == "Bearer \(secret)" else {
+      return await out.sendJSON(status: 401, ["error": ["type": "unauthorized", "message": "lembas agent: not the app."]])
+    }
+    guard let peer else {
+      return await out.sendJSON(status: 503, ["error": ["type": "no_peer", "message": "no circle on this Mac"]])
+    }
+    do {
+      switch (req.method, req.path) {
+      case ("GET", "/lembas/status"):
+        let status = try await peer.currentStatus()
+        await out.sendJSON(status: 200, ["status": status, "running": true])
+      case ("POST", "/lembas/cmd"):
+        guard let cmd = (try? JSONSerialization.jsonObject(with: req.body)) as? [String: Any], cmd["cmd"] is String else {
+          return await out.sendJSON(status: 400, ["error": ["type": "bad_request", "message": "a {\"cmd\"} object"]])
+        }
+        let result = try await peer.command(cmd)
+        if cmd["cmd"] as? String == "away" { await autoAway.manual() }
+        await out.sendJSON(status: 200, ["result": result])
+      case ("POST", "/lembas/leave"):
+        await peer.stop()
+        try? FileManager.default.removeItem(atPath: peerDir)
+        try? FileManager.default.removeItem(atPath: loginPath)
+        log("left the circle: the peer is stopped and its key, circle and login are deleted")
+        await out.sendJSON(status: 200, ["ok": true])
+      default:
+        await out.sendJSON(status: 404, ["error": ["type": "not_found", "message": "Not found."]])
+      }
+    } catch {
+      await out.sendJSON(status: 502, ["error": ["type": "peer", "message": "\(error)"]])
     }
   }
+
+  func setAway(_ away: Bool) async {
+    guard let peer else { return }
+    _ = try? await peer.command(["cmd": "away", "away": away])
+  }
+
+  // Away by itself after a while without Claude Code (the number is the owner's), back
+  // on the next request; a switch the owner flipped stays as flipped.
+  func watchIdleness() async {
+    while true {
+      try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+      guard let peer, await peer.running, let status = try? await peer.currentStatus(maxAge: 60) else { continue }
+      let away = status["away"] as? Bool ?? false
+      let minutes = ((status["policy"] as? [String: Any])?["away_after_minutes"] as? NSNumber)?.doubleValue ?? 30
+      if !away, await lifecycle.idle > minutes * 60, await autoAway.goAway() {
+        log("no Claude Code request for \(Int(minutes)) min: away")
+        await setAway(true)
+      }
+    }
+  }
+}
+
+// Whether the agent, not the owner, set the away switch.
+actor AutoAway {
+  private var byAgent = false
+  func goAway() -> Bool { byAgent = true; return true }
+  // Called on a request: true if the agent should flip the switch back.
+  func back() -> Bool { defer { byAgent = false }; return byAgent }
+  func manual() { byAgent = false }
 }
 
 func modelName(_ body: Data) -> String? {
@@ -467,16 +513,28 @@ struct LembasAgent {
     // No config (left the pool, or never joined): still serve, direct only, and retire.
     let config = FileManager.default.contents(atPath: configPath)
       .flatMap { try? JSONDecoder().decode(AgentConfig.self, from: $0) }
-      .flatMap { $0.url.isEmpty || $0.token.isEmpty ? nil : $0 }
+      .flatMap { $0.name.isEmpty || $0.secret.isEmpty ? nil : $0 }
     let port = config?.agentPort ?? defaultPort
     let lifecycle = Lifecycle(port: port)
     let agent = Agent(config: config, lifecycle: lifecycle, port: port)
     do {
       let server = try await HTTPServer(port: UInt16(port)) { req, out in await agent.handle(req, out) }
-      log("listening on http://127.0.0.1:\(port); \(config == nil ? "no pool: direct only" : "direct first, pool only on usage limits")")
+      log("listening on http://127.0.0.1:\(port); \(config == nil ? "no circle: direct only" : "direct first, friends only on usage limits")")
       _ = server
+      if let peer = agent.peer {
+        _ = await LoginFile.refreshIfNeeded()
+        await peer.start()
+        Task { await agent.watchIdleness() }
+        Task {
+          while true {
+            try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+            _ = await LoginFile.refreshIfNeeded()
+          }
+        }
+      }
       while true {
         await lifecycle.check()
+        if await lifecycle.retiring, let peer = agent.peer { await peer.stop() }
         try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
       }
     } catch {

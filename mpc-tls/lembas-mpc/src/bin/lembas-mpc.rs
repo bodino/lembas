@@ -249,6 +249,9 @@ enum Cmd {
         /// neither.
         #[arg(long, default_value = "LEMBAS_TOKEN")]
         token_env: String,
+        /// Or a JSON file with `accessToken`, re-read at each use.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
         /// Found a circle, if this Mac is in none.
         #[arg(long)]
         found: bool,
@@ -405,6 +408,7 @@ async fn run() -> Result<()> {
             dir,
             name,
             token_env,
+            token_file,
             found,
             join,
             invite,
@@ -422,14 +426,15 @@ async fn run() -> Result<()> {
             roots,
         } => {
             let token = std::env::var(&token_env).ok().filter(|t| !t.is_empty());
-            if token.is_none() {
-                warn!("peer: {token_env} is not set: this Mac can neither lend nor prove its limit");
+            if token.is_none() && token_file.is_none() {
+                warn!("peer: no {token_env} and no --token-file: this Mac can neither lend nor prove its limit");
             }
             let fixture = matches!(roots, Roots::Fixture);
             let cfg = PeerConfig {
                 dir,
                 name,
                 token,
+                token_file,
                 api: ApiTarget {
                     server: api,
                     server_name: api_name,
@@ -453,7 +458,9 @@ async fn run() -> Result<()> {
                     peer.join(link).await?;
                 }
             }
-            peer.set_policy(lembas_mpc::peer::LendPolicy { away5h, week, borrow_at });
+            if !control {
+                peer.set_policy(lembas_mpc::peer::LendPolicy { away5h, week, borrow_at, away_after_minutes: 30 });
+            }
             if invite {
                 let link = peer.invite().await?;
                 if control {
@@ -730,6 +737,23 @@ enum PeerCmd {
     Away { away: bool },
     Remove { member: String },
     Sync,
+    Found,
+    Policy {
+        away5h: f64,
+        week: f64,
+        #[serde(default = "default_borrow_at")]
+        borrow_at: f64,
+        #[serde(default = "default_away_after")]
+        away_after_minutes: u32,
+    },
+}
+
+fn default_borrow_at() -> f64 {
+    90.0
+}
+
+fn default_away_after() -> u32 {
+    30
 }
 
 async fn control_loop(peer: Arc<Peer>) -> Result<()> {
@@ -784,6 +808,14 @@ async fn run_cmd(peer: &Arc<Peer>, cmd: PeerCmd) -> Result<serde_json::Value> {
         PeerCmd::Sync => {
             peer.sync_all().await;
             serde_json::to_value(peer.status())?
+        }
+        PeerCmd::Found => {
+            peer.found()?;
+            serde_json::to_value(peer.status())?
+        }
+        PeerCmd::Policy { away5h, week, borrow_at, away_after_minutes } => {
+            peer.set_policy(lembas_mpc::peer::LendPolicy { away5h, week, borrow_at, away_after_minutes });
+            serde_json::Value::Null
         }
     })
 }

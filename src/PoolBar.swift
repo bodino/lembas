@@ -1,6 +1,7 @@
-// lembas bar — a macOS menu bar app for the lembas pool.
-// Shows your live sharing state and lets you lend to individual people.
-// Config: ~/.config/lembas.json  {"url": "http://…:8787", "token": "pool-…"}
+// lembas bar — a macOS menu bar app for a lembas circle: friends whose Macs lend to
+// each other directly (docs/p2p.md). Shows your live sharing state and lets you lend to
+// individual people. Everything goes through the agent on this Mac, which runs the peer.
+// Config: ~/.config/lembas.json  {"name": "alice", "secret": "…"}
 
 import AppKit
 import Combine
@@ -26,12 +27,13 @@ enum Profile {
   static let agentPort = name == nil ? 8788 : 8789
   // Claude Code reads CLAUDE_CONFIG_DIR; a profile's lives in ~/.claude-<name>.
   static let claudeSettings = home.appendingPathComponent(name.map { ".claude-\($0)" } ?? ".claude")
+  static let loginURL = home.appendingPathComponent(".config/lembas-login\(suffix).json")
     .appendingPathComponent("settings.json")
 }
 
 struct Config: Codable {
-  var url: String
-  var token: String
+  var name: String
+  var secret: String // the app's key to the agent's control endpoints (the file is 0600)
   var agentPort: Int? // only set for profiles; the agent defaults to 8788
   // Test hook for the agent: borrow every request, as if the login were at its limit.
   var pretendLimited: Bool?
@@ -51,12 +53,13 @@ struct AvailableUpdate {
 // What I lend one person: whenever I'm away, and optionally even while I'm working
 // (until my 5-hour window reaches `working5h`).
 struct LendingMember: Identifiable {
-  var name: String
+  var name: String // the member's key
+  var label: String
   var away: Bool
   var working: Bool
   var working5h: Double
   var id: String { name }
-  var displayName: String { prettyName(name) }
+  var displayName: String { prettyName(label) }
   // What a save would send; used to tell whether there are unsaved edits.
   var setting: String { "\(name):\(away):\(working ? Int(working5h) : 0)" }
 
@@ -76,7 +79,7 @@ struct LendPolicy: Equatable {
 
 // Whether I can borrow from someone right now, and why (not).
 struct BorrowSource: Identifiable {
-  var name: String
+  var name: String // the member's key
   var reason: String // away | working | off | unconnected | parked | unknown | full | weekFull
   var availablePoints: Double
   // Points left in each window, each in its own unit (never compared: a percent of a
@@ -118,6 +121,8 @@ final class Store: ObservableObject {
 
   @Published var config: Config?
   @Published var setupInvite = ""
+  @Published var setupName = ""
+  @Published var inCircle = false
   // The invite last used to join, so going back during setup can offer it again.
   private var lastInvite = ""
   @Published var joinStatus: String?
@@ -211,11 +216,12 @@ final class Store: ObservableObject {
   // so it only fills in the code: the person still sees which pool it is and presses
   // Join. Ignored while already in a pool.
   func handleInviteLink(_ url: URL) {
-    guard url.scheme == "lembas", url.host == "join",
-          let invite = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
-            .first(where: { $0.name == "invite" })?.value else { return }
-    guard config == nil else {
-      saveError = "You're already in a pool. Leave it first to join another."
+    guard url.scheme == "lembas", url.host == "join" else { return }
+    let invite = url.path.count > 1 ? url.absoluteString
+      : URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "invite" })?.value
+    guard let invite else { return }
+    guard config == nil || !inCircle else {
+      saveError = "You're already in a circle. Leave it first to join another."
       return
     }
     setupInvite = invite
@@ -223,65 +229,53 @@ final class Store: ObservableObject {
     SetupWindow.show()
   }
 
-  // The pool an invite (or pasted message) points at, to show before joining.
-  var invitePoolHost: String? {
-    let word = setupInvite.split(whereSeparator: \.isWhitespace).last { $0.contains("/") }.map(String.init)
-    guard let word, let url = URL(string: word.hasPrefix("http") ? word : "https://" + word) else { return nil }
-    return url.host
+  // The invite link in a pasted message, if any.
+  var inviteLink: String? {
+    setupInvite.split(whereSeparator: \.isWhitespace).map(String.init).last { $0.hasPrefix("lembas://join/") }
   }
 
-  // Joining from an invite code like "https://mac.tail1234.ts.net/abcd-efgh-…" (or a
-  // tailnet "100.1.2.3:8787/…"): swap the one-time code for this member's pool token,
-  // then install the bundled agent and point Claude Code at it.
-  func join() async {
-    // Accept the whole copied invite message: the code is the word with a "/" in it.
-    var raw = setupInvite.split(whereSeparator: \.isWhitespace).last { $0.contains("/") }.map(String.init)
-      ?? setupInvite.trimmingCharacters(in: .whitespacesAndNewlines)
-    if raw.hasPrefix("lembas://") { raw.removeFirst("lembas://".count) }
-    if !raw.hasPrefix("http://") && !raw.hasPrefix("https://") { raw = "http://" + raw }
-    guard let slash = raw.lastIndex(of: "/"), raw.distance(from: raw.startIndex, to: slash) > "https://".count,
-          let redeemURL = URL(string: raw[..<slash] + "/pool/redeem") else {
-      joinError = "That doesn't look like an invite code."
+  var inviteSummary: String? { inviteLink == nil ? nil : "An invite to a friend's circle" }
+
+  private var cleanName: String { setupName.trimmingCharacters(in: .whitespacesAndNewlines) }
+  var canStart: Bool { !cleanName.isEmpty && cleanName.count <= 48 && !busy }
+  var canJoin: Bool { canStart && inviteLink != nil }
+
+  // Starts a circle, or joins the one an invite link points to: writes the config,
+  // installs the bundled agent (which runs the peer) and points Claude Code at it, then
+  // tells the peer what to do.
+  func join(start: Bool) async {
+    guard canStart, start || inviteLink != nil else {
+      joinError = start ? "Pick a name first." : "That doesn't look like an invite link."
       return
     }
-    let pool = String(raw[..<slash])
-    // The pool token and then the login go to this address; over the open internet
-    // that has to be HTTPS. Plain HTTP is for this Mac, a home network or the tailnet.
-    if pool.hasPrefix("http://"), !isLocalNetworkHost(URL(string: pool)?.host) {
-      joinError = "A pool outside your own network needs an https:// address."
-      return
-    }
-    let code = String(raw[raw.index(after: slash)...])
     busy = true
     joinError = nil
     defer { busy = false; joinStatus = nil }
     do {
-      joinStatus = "Checking your invite…"
-      var req = URLRequest(url: redeemURL)
-      req.httpMethod = "POST"
-      req.timeoutInterval = 10
-      req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-      req.httpBody = try JSONSerialization.data(withJSONObject: ["code": code])
-      let (data, resp) = try await URLSession.shared.data(for: req)
-      let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-      guard (resp as? HTTPURLResponse)?.statusCode == 200, let token = obj["token"] as? String else {
-        let msg = (obj["error"] as? [String: Any])?["message"] as? String
-        throw NSError(domain: "lembas", code: 0, userInfo: [NSLocalizedDescriptionKey: msg ?? "The pool rejected this invite."])
-      }
       joinStatus = "Setting up lembas on this Mac…"
-      saveConfig(Config(url: pool, token: token, agentPort: Profile.name == nil ? nil : Profile.agentPort))
-      // (Re)starting the agent can take launchd several seconds; don't hold the screen
-      // for it. Claude Code is pointed at the agent once it's up.
-      Task {
-        try? await ensureAgentInstalled(restart: true)
-        setRouted(true)
+      if config == nil {
+        let secret = (0..<24).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+        saveConfig(Config(name: cleanName, secret: secret, agentPort: Profile.name == nil ? nil : Profile.agentPort))
+      }
+      try await ensureAgentInstalled(restart: true)
+      setRouted(true)
+      // launchd takes a moment to start the agent, and the agent its peer.
+      var ready = false
+      for _ in 0..<60 {
+        if (try? await request("GET", "/lembas/status")) != nil { ready = true; break }
+        try await Task.sleep(nanoseconds: 500_000_000)
+      }
+      guard ready else { throw NSError(domain: "lembas", code: 0, userInfo: [NSLocalizedDescriptionKey: "The agent didn't start. Check Library/Logs/lembas-agent.log."]) }
+      joinStatus = start ? "Starting your circle…" : "Joining the circle…"
+      if start {
+        _ = try await command(["cmd": "found"])
+      } else {
+        _ = try await command(["cmd": "join", "link": inviteLink!])
       }
       lastInvite = setupInvite
       setupInvite = ""
       askOpenAtLogin = true // after connecting, the setup asks about opening at login
       await refresh()
-    } catch let error as URLError {
-      joinError = "Can't reach the pool. Check the code, or ask your friend whether their Mac is awake. (\(error.localizedDescription))"
     } catch {
       joinError = error.localizedDescription
     }
@@ -316,13 +310,14 @@ final class Store: ObservableObject {
     }
   }
 
+  // The agent's control endpoints, with the secret from the config.
   private func request(_ method: String, _ path: String, body: [String: Any]? = nil) async throws -> [String: Any] {
     guard let cfg = config else { throw URLError(.badURL) }
-    guard let url = URL(string: cleanURL(cfg.url) + path) else { throw URLError(.badURL) }
+    guard let url = URL(string: Self.localAgentURL + path) else { throw URLError(.badURL) }
     var req = URLRequest(url: url)
-    req.timeoutInterval = 10
+    req.timeoutInterval = 70
     req.httpMethod = method
-    req.setValue("Bearer " + cfg.token, forHTTPHeaderField: "Authorization")
+    req.setValue("Bearer " + cfg.secret, forHTTPHeaderField: "Authorization")
     if let body {
       req.httpBody = try JSONSerialization.data(withJSONObject: body)
       req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -332,7 +327,6 @@ final class Store: ObservableObject {
     guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
       throw URLError(.cannotParseResponse)
     }
-    if http.statusCode == 401 { throw NotAMember() } // our pool token is no longer valid
     if http.statusCode >= 400 {
       let msg = ((obj["error"] as? [String: Any])?["message"] as? String) ?? "HTTP \(http.statusCode)"
       throw NSError(domain: "lembas", code: http.statusCode,
@@ -341,7 +335,12 @@ final class Store: ObservableObject {
     return obj
   }
 
-  // Asks the pool for everything the popover shows. A request made while one is in
+  // One command to the peer, through the agent.
+  private func command(_ cmd: [String: Any]) async throws -> Any {
+    try await request("POST", "/lembas/cmd", body: cmd)["result"] ?? NSNull()
+  }
+
+  // Asks the agent for everything the popover shows. A request made while one is in
   // flight (e.g. right after joining) runs once that one finishes — never dropped,
   // or the screen could wait for the next background refresh.
   func refresh() async {
@@ -362,104 +361,68 @@ final class Store: ObservableObject {
     guard config != nil else { return }
     reloadRoute()
     do {
-      let obj = try await request("GET", "/pool")
-      me = obj["you"] as? String
-      canInvite = obj["canInvite"] as? Bool ?? false
-      poolCanLend = obj["privateBorrowing"] as? Bool ?? false
+      let obj = try await request("GET", "/lembas/status")
+      guard let st = obj["status"] as? [String: Any] else { throw URLError(.cannotParseResponse) }
+      me = st["name"] as? String
+      inCircle = st["circle"] != nil && !(st["circle"] is NSNull)
+      canInvite = inCircle
       online = true
       loaded = true
-      notAMemberStreak = 0
       statusLine = "Connected."
-
-      guard let me, let user = obj[me] as? [String: Any] else {
-        online = false
-        statusLine = "Signed in, but this token is not in the pool."
-        return
-      }
-
-      subscriptionConnected = user["subscriptionConnected"] as? Bool ?? false
-      inviteReturnable = user["inviteReturnable"] as? Bool ?? false
+      subscriptionConnected = st["lending"] as? Bool ?? false
       if subscriptionConnected { connectHint = nil }
-
-      if let week = user["borrowedFromMeThisWeekUsd"] as? [String: Any] {
-        borrowedWeekTotal = number(week["total"])
-        if let by = week["byCaller"] as? [String: Any] {
-          borrowedWeekByCaller = by.mapValues { number($0) }
-        } else {
-          borrowedWeekByCaller = [:]
-        }
-      } else {
-        borrowedWeekTotal = 0
-        borrowedWeekByCaller = [:]
-      }
-      borrowed5h = number(user["borrowedFromMeLast5hUsd"])
-      if let week = user["borrowedByMeThisWeekUsd"] as? [String: Any] {
-        borrowedByMeWeekTotal = number(week["total"])
-        borrowedByMeWeekByOwner = (week["byOwner"] as? [String: Any])?.mapValues { number($0) } ?? [:]
-      } else {
-        borrowedByMeWeekTotal = 0
-        borrowedByMeWeekByOwner = [:]
-      }
-      borrowedByMe5h = number(user["borrowedByMeLast5hUsd"])
-      away = (user["presence"] as? [String: Any])?["away"] as? Bool ?? false
-
-      if let util = user["utilization"] as? [String: Any] {
-        utilizationFiveHour = number(util["fiveHour"])
-        utilizationSevenDay = number(util["sevenDay"])
-        lentFiveHour = number(util["lentFiveHour"])
-        lentSevenDay = number(util["lentSevenDay"])
+      away = st["away"] as? Bool ?? false
+      if let windows = (st["usage"] as? [String: Any])?["windows"] as? [String: Any] {
+        utilizationFiveHour = (windows["five_hour"] as? NSNumber)?.doubleValue
+        utilizationSevenDay = (windows["seven_day"] as? NSNumber)?.doubleValue
       } else {
         utilizationFiveHour = nil
         utilizationSevenDay = nil
       }
+      lentFiveHour = nil
+      lentSevenDay = nil
 
       var fresh: [LendingMember] = []
-      if let lending = user["lending"] as? [String: [String: Any]] {
-        fresh = lending.map { name, row in
-          let working5h = number(row["working5h"])
-          return LendingMember(name: name, away: row["away"] as? Bool ?? false,
-                               working: working5h > 0, working5h: working5h > 0 ? working5h : 40)
-        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+      var sources: [BorrowSource] = []
+      for row in st["members"] as? [[String: Any]] ?? [] {
+        guard let id = row["id"] as? String else { continue }
+        let label = row["name"] as? String ?? String(id.prefix(10))
+        let lendTo = row["lend_to"] as? Bool ?? false
+        let whileWorking = row["lend_while_working"] as? Bool ?? false
+        fresh.append(LendingMember(name: id, label: label, away: lendTo, working: lendTo && whileWorking, working5h: 40))
+        let presence = row["presence"] as? [String: Any]
+        let fiveHour = (presence?["five_hour"] as? NSNumber)?.doubleValue
+        let sevenDay = (presence?["seven_day"] as? NSNumber)?.doubleValue
+        let reason: String
+        if let presence {
+          let lending = presence["lending"] as? Bool ?? false
+          let room = presence["room"] as? Bool ?? false
+          let isAway = presence["away"] as? Bool ?? false
+          reason = !lending ? "unconnected" : !room ? "full" : isAway ? "away" : "working"
+        } else {
+          reason = "unknown"
+        }
+        sources.append(BorrowSource(name: id, reason: reason, availablePoints: 0,
+                                    left5h: fiveHour.map { 100 - $0 }, leftWeek: sevenDay.map { 100 - $0 }))
       }
+      fresh.sort { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+      sources.sort { $0.name < $1.name }
       var freshPolicy = LendPolicy()
-      if let p = user["policy"] as? [String: Any] {
+      if let p = st["policy"] as? [String: Any] {
         freshPolicy = LendPolicy(away5h: number(p["away5h"]), week: number(p["week"]),
-                                 awayAfterMinutes: Int(number(p["awayAfterMinutes"])))
+                                 awayAfterMinutes: Int(number(p["away_after_minutes"])))
       }
-      // Keep unsaved edits (a save is pending); otherwise take the server's view.
+      // Keep unsaved edits (a save is pending); otherwise take the peer's view.
       if !hasChanges || Set(fresh.map(\.name)) != Set(lendingMembers.map(\.name)) {
         lendingMembers = fresh
         policy = freshPolicy
       }
       savedSettings = fresh.map(\.setting) + [freshPolicy.setting]
-
-      if let borrowing = user["borrowingFrom"] as? [String: [String: Any]] {
-        borrowSources = borrowing.map { name, row in
-          BorrowSource(name: name, reason: row["reason"] as? String ?? "off",
-                       availablePoints: number(row["availablePoints"]),
-                       left5h: (row["left5h"] as? NSNumber)?.doubleValue,
-                       leftWeek: (row["leftWeek"] as? NSNumber)?.doubleValue)
-        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-      } else {
-        borrowSources = []
-      }
-    } catch is NotAMember {
-      // Removed by an admin, or left from another copy: tidy up like leaving does —
-      // but only after several 401s in a row, never on one. A single bad answer (say,
-      // from a flaky connection to the pool) used to delete the config and the agent,
-      // which took Claude Code's endpoint down with it.
-      notAMemberStreak += 1
-      if notAMemberStreak >= 3 {
-        await forgetMembership()
-        joinError = "You're no longer in this pool."
-      } else {
-        online = false
-        statusLine = "The pool rejected this token — rechecking (\(notAMemberStreak)/3)…"
-      }
+      borrowSources = sources
     } catch {
       online = false
       loaded = true // show the main screen with the error rather than spin forever
-      statusLine = "Can't reach the pool right now. Borrowing is paused — Claude Code still works normally."
+      statusLine = "Can't reach the lembas agent right now. Borrowing is paused — Claude Code still works normally."
     }
   }
 
@@ -519,7 +482,7 @@ final class Store: ObservableObject {
 
   // The setup checklist shows after joining until Done, and whenever the pool says our
   // subscription isn't connected (connecting is required to take part).
-  var needsSetup: Bool { online && (!subscriptionConnected || askOpenAtLogin) }
+  var needsSetup: Bool { online && (!inCircle || !subscriptionConnected || askOpenAtLogin) }
 
   // Which screen the popover shows. Every screen has the same size, so switching
   // never resizes the menu bar window.
@@ -546,7 +509,7 @@ final class Store: ObservableObject {
   // Starts a browser login. Calling it again while one is waiting (Retry — e.g. the tab
   // was closed) cancels that attempt first and opens a fresh one.
   func runConnect() {
-    guard let cfg = config else { return }
+    guard config != nil else { return }
     let previous = connectTask
     previous?.cancel()
     connectAttempt += 1
@@ -557,7 +520,7 @@ final class Store: ObservableObject {
       await previous?.value // let it release the login port before we reuse it
       defer { if attempt == connectAttempt { PopoverPin.pinned = false } }
       do {
-        try await SubscriptionLogin.run(pool: cleanURL(cfg.url), poolToken: cfg.token)
+        try await SubscriptionLogin.run(loginFile: Profile.loginURL)
         connectHint = nil
         await refresh()
       } catch is CancellationError {
@@ -625,6 +588,7 @@ final class Store: ObservableObject {
         "LEMBAS_AGENT_LABEL": Self.agentLabel,
         "LEMBAS_AGENT_PLIST": Self.agentPlist.path,
         "LEMBAS_MPC_HELPER": installedHelper.path,
+        "LEMBAS_LOGIN": Profile.loginURL.path,
       ],
       "RunAtLoad": true,
       "KeepAlive": true,
@@ -756,15 +720,13 @@ final class Store: ObservableObject {
     }
   }
 
-  // Leaves the pool (which deletes our subscription access there), then undoes what
-  // joining set up on this Mac: the agent, Claude Code's base URL and the config.
+  // Leaves the circle: the peer stops and its key, circle and this Mac's login go;
+  // then undoes what joining set up: Claude Code's base URL and the config.
   func leavePool() async -> Bool {
     busy = true
     defer { busy = false }
     do {
-      _ = try await request("POST", "/pool/leave")
-    } catch is NotAMember {
-      // Already out of the pool; just clean up this Mac.
+      _ = try await request("POST", "/lembas/leave")
     } catch {
       saveError = "Couldn't leave: \(error.localizedDescription)"
       return false
@@ -773,8 +735,8 @@ final class Store: ObservableObject {
     return true
   }
 
-  // Back from setup: leave (the pool makes the invite valid again since nothing was
-  // connected) and show the join screen with that invite filled in.
+  // Back from setup: leave and show the join screen with that invite filled in (a
+  // one-time invite is spent, though; ask for another).
   func goBackToJoin() async {
     let invite = lastInvite
     if await leavePool() { setupInvite = invite }
@@ -792,32 +754,36 @@ final class Store: ObservableObject {
     me = nil
     loaded = false
     online = false
+    inCircle = false
     lendingMembers = []
     borrowSources = []
     config = nil // back to the join screen
   }
 
   func removeMember(_ name: String) async {
+    let label = lendingMembers.first { $0.name == name }?.displayName ?? "them"
     do {
-      _ = try await request("DELETE", "/pool/members/\(name)")
+      _ = try await command(["cmd": "remove", "member": name])
       saveError = nil
       await refresh()
     } catch {
-      saveError = "Couldn't remove \(prettyName(name)): \(error.localizedDescription)"
+      saveError = "Couldn't remove \(label): \(error.localizedDescription)"
     }
   }
 
   func apply() async {
     busy = true
     defer { busy = false }
-    var lendTo: [String: Any] = [:]
-    for member in lendingMembers {
-      lendTo[member.name] = ["away": member.away, "working5h": member.working ? Int(member.working5h) : 0]
-    }
-    let policyBody: [String: Any] = ["away5h": Int(policy.away5h), "week": Int(policy.week),
-                                     "awayAfterMinutes": policy.awayAfterMinutes]
     do {
-      _ = try await request("PUT", "/pool/share", body: ["lendTo": lendTo, "policy": policyBody])
+      let saved = Set(savedSettings)
+      for member in lendingMembers where !saved.contains(member.setting) {
+        _ = try await command(["cmd": "lend", "member": member.name, "to": member.away || member.working,
+                               "while_working": member.working])
+      }
+      if !saved.contains(policy.setting) {
+        _ = try await command(["cmd": "policy", "away5h": policy.away5h, "week": policy.week,
+                               "away_after_minutes": policy.awayAfterMinutes])
+      }
       lastApplied = Date.now.formatted(date: .omitted, time: .shortened)
       saveError = nil
       await refresh()
@@ -830,7 +796,7 @@ final class Store: ObservableObject {
   func setAway(_ value: Bool) async {
     away = value
     do {
-      _ = try await request("PUT", "/pool/presence", body: ["away": value])
+      _ = try await command(["cmd": "away", "away": value])
       await refresh()
     } catch {
       saveError = "Couldn't update: \(error.localizedDescription)"
@@ -848,11 +814,12 @@ final class Store: ObservableObject {
     }
   }
 
-  // Admin only: adds someone to the pool and returns the join one-liner to send them.
-  func invite(_ name: String) async throws -> String {
-    let obj = try await request("POST", "/pool/invite", body: ["name": name])
+  // Anyone in the circle: a one-time link to send. Whoever joins with it is lent to
+  // by this Mac from the start; everyone else decides for themselves.
+  func invite() async throws -> String {
+    let obj = try await command(["cmd": "invite"]) as? [String: Any]
     await refresh()
-    return obj["invite"] as? String ?? ""
+    return obj?["link"] as? String ?? ""
   }
 
   // Keeps the numbers current while the app runs; also retries an unreachable pool.
@@ -865,21 +832,21 @@ final class Store: ObservableObject {
   }
 }
 
-// First run: join a pool with an invite code. Same layout as the Invite page.
+// First run: a name, then join a friend's circle with their invite link, or start one.
 struct SetupView: View {
   @EnvironmentObject var store: Store
   @FocusState private var focused: Bool
 
-  private var canJoin: Bool { !store.setupInvite.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !store.busy }
+  private var canJoin: Bool { store.canJoin }
 
   var body: some View {
     VStack(spacing: 0) {
       PopoverHeader()
       Spacer(minLength: 12)
-      Hero(icon: "envelope.open.fill", title: "Join a pool",
-           subtitle: "Paste the invite a friend sent you.")
+      Hero(icon: "person.2.fill", title: "Your circle",
+           subtitle: "Friends whose Macs back each other up. Paste an invite, or start a circle of your own.")
 
-      TextField("Invite code", text: $store.setupInvite)
+      TextField("Your name", text: $store.setupName)
         .textFieldStyle(.plain)
         .font(Typography.body)
         .padding(.horizontal, Spacing.card)
@@ -887,8 +854,16 @@ struct SetupView: View {
         .background(InputBackground())
         .focused($focused)
         .disabled(store.busy)
-        .onSubmit { if canJoin { Task { await store.join() } } }
         .padding(.top, Spacing.section)
+      TextField("Invite link (optional)", text: $store.setupInvite)
+        .textFieldStyle(.plain)
+        .font(Typography.body)
+        .padding(.horizontal, Spacing.card)
+        .padding(.vertical, Spacing.card)
+        .background(InputBackground())
+        .disabled(store.busy)
+        .onSubmit { if canJoin { Task { await store.join(start: false) } } }
+        .padding(.top, 8)
 
       MessageSlot {
         if let status = store.joinStatus {
@@ -903,8 +878,8 @@ struct SetupView: View {
             .foregroundStyle(.orange)
             .lineLimit(2)
             .transition(.opacity)
-        } else if let host = store.invitePoolHost {
-          Label("Pool at \(host)", systemImage: "network")
+        } else if let summary = store.inviteSummary {
+          Label(summary, systemImage: "envelope.open")
             .font(Typography.caption)
             .foregroundStyle(.secondary)
             .lineLimit(1)
@@ -913,19 +888,31 @@ struct SetupView: View {
         }
       }
       .padding(.top, Spacing.header)
-      .animation(.easeInOut(duration: 0.15), value: store.invitePoolHost)
+      .animation(.easeInOut(duration: 0.15), value: store.inviteSummary)
       .animation(.easeInOut(duration: 0.15), value: store.joinStatus)
       .animation(.easeInOut(duration: 0.15), value: store.joinError)
 
-      Button { Task { await store.join() } } label: {
-        Text(store.busy ? "Joining…" : "Join").frame(maxWidth: .infinity)
+      if store.inviteLink != nil {
+        Button { Task { await store.join(start: false) } } label: {
+          Text(store.busy ? "Joining…" : "Join").frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .tint(accent)
+        .keyboardShortcut(.defaultAction)
+        .disabled(!canJoin)
+        .padding(.top, 10)
+      } else {
+        Button { Task { await store.join(start: true) } } label: {
+          Text(store.busy ? "Starting…" : "Start a Circle").frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .tint(accent)
+        .keyboardShortcut(.defaultAction)
+        .disabled(!store.canStart)
+        .padding(.top, 10)
       }
-      .buttonStyle(.borderedProminent)
-      .controlSize(.large)
-      .tint(accent)
-      .keyboardShortcut(.defaultAction)
-      .disabled(!canJoin)
-      .padding(.top, 10)
       Spacer(minLength: 12)
     }
     .padding(.horizontal, Spacing.edge)
@@ -1230,7 +1217,7 @@ struct PersonRow: View {
   var body: some View {
     HoverRow(action: open) {
       HStack(spacing: 10) {
-        Avatar(name: member.name)
+        Avatar(name: member.label)
         VStack(alignment: .leading, spacing: 3) {
           Text(member.displayName).font(Typography.title)
           HStack(spacing: 4) {
@@ -1251,9 +1238,7 @@ struct PersonRow: View {
 struct PersonDetail: View {
   @Binding var member: LendingMember
   let source: BorrowSource?
-  let lentThisWeek: Double
-  let borrowedThisWeek: Double
-  var remove: (() -> Void)? // admins only
+  var remove: (() -> Void)?
   let back: () -> Void
   @State private var confirmingRemove = false
 
@@ -1268,7 +1253,7 @@ struct PersonDetail: View {
         }
         .buttonStyle(.plain)
         .keyboardShortcut(.cancelAction)
-        Avatar(name: member.name, size: 24)
+        Avatar(name: member.label, size: 24)
         Text(member.displayName).font(Typography.title)
         Spacer()
       }
@@ -1303,15 +1288,6 @@ struct PersonDetail: View {
       .frame(maxWidth: .infinity, alignment: .leading)
       .background(card)
 
-      HStack(spacing: 10) {
-        Text("This week").foregroundStyle(.secondary)
-        Spacer()
-        Label(dollars(lentThisWeek), systemImage: "arrow.up.right")
-        Label(dollars(borrowedThisWeek), systemImage: "arrow.down.left")
-      }
-      .font(Typography.caption.monospacedDigit())
-      .padding(.horizontal, 2)
-
       if let remove {
         if confirmingRemove {
           // Same footprint as the button it replaces: the popover can't grow.
@@ -1324,12 +1300,12 @@ struct PersonDetail: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
-            .help("Their pool access stops right away")
+            .help("Your Mac stops lending to them right away; the others hear of it")
           }
           .controlSize(.large)
         } else {
           Button { confirmingRemove = true } label: {
-            Label("Remove from Pool", systemImage: "person.badge.minus")
+            Label("Remove from Circle", systemImage: "person.badge.minus")
               .font(Typography.title)
               .foregroundStyle(.red)
               .frame(maxWidth: .infinity)
@@ -1355,14 +1331,10 @@ struct PersonDetail: View {
 struct InviteView: View {
   @EnvironmentObject var store: Store
   let back: () -> Void
-  @State private var name = ""
   @State private var code: String?
   @State private var error: String?
   @State private var working = false
   @State private var copied = false
-  @FocusState private var nameFocused: Bool
-
-  private var cleanName: String { name.trimmingCharacters(in: .whitespaces).lowercased() }
 
   var body: some View {
     // One layout for both steps (name → code): every element keeps its place and only
@@ -1373,11 +1345,11 @@ struct InviteView: View {
 
       ZStack {
         if code == nil {
-          Hero(icon: "person.badge.plus", title: "Invite someone",
-               subtitle: "They get a one-time code. Nobody joins until they use it.")
+          Hero(icon: "person.badge.plus", title: "Invite a friend",
+               subtitle: "A one-time link. Your Mac lends to whoever joins with it; the others choose for themselves.")
             .transition(.opacity)
         } else {
-          Hero(icon: "checkmark", title: "Invite for \(prettyName(cleanName))",
+          Hero(icon: "checkmark", title: "Your invite link",
                subtitle: "Send this link. It works once and expires in 7 days.")
             .transition(.opacity)
         }
@@ -1394,12 +1366,11 @@ struct InviteView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .transition(.opacity)
         } else {
-          TextField("Their name", text: $name)
-            .textFieldStyle(.plain)
-            .font(Typography.body)
+          Text("Nobody joins until they use it.")
+            .font(Typography.caption)
+            .foregroundStyle(.secondary)
             .padding(.horizontal, Spacing.card)
-            .focused($nameFocused)
-            .onSubmit(create)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .transition(.opacity)
         }
       }
@@ -1427,7 +1398,7 @@ struct InviteView: View {
       .buttonStyle(.borderedProminent)
       .controlSize(.large)
       .tint(accent)
-      .disabled(code == nil && (cleanName.isEmpty || working))
+      .disabled(code == nil && working)
       .padding(.top, 10)
 
       Spacer(minLength: 8)
@@ -1437,7 +1408,6 @@ struct InviteView: View {
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .animation(.easeInOut(duration: 0.2), value: code)
     .animation(.easeInOut(duration: 0.15), value: error)
-    .onAppear { nameFocused = true }
   }
 
   private func copy(_ code: String) {
@@ -1453,16 +1423,16 @@ struct InviteView: View {
 
   private func inviteMessage(_ code: String) -> String {
     """
-    Join my lembas pool: \(code)
+    Join my lembas circle: \(code)
     """
   }
 
   private func create() {
-    guard !cleanName.isEmpty, !working else { return }
+    guard !working else { return }
     working = true
     error = nil
     Task {
-      do { code = try await store.invite(cleanName) }
+      do { code = try await store.invite() }
       catch { self.error = error.localizedDescription }
       working = false
     }
@@ -1531,8 +1501,13 @@ struct SetupChecklistView: View {
       Hero(icon: "checklist", title: "Finish setting up", subtitle: "Two quick things and you're in.")
 
       VStack(spacing: 0) {
-        ChecklistRow(done: true, title: "Joined the pool",
-                     detail: store.config.flatMap { URL(string: $0.url)?.host } ?? "") { EmptyView() }
+        ChecklistRow(done: store.inCircle, title: store.inCircle ? "In a circle" : "No circle yet",
+                     detail: store.inCircle ? "as \(store.me.map(prettyName) ?? "")" : "Start one, or paste an invite") {
+          if !store.inCircle {
+            Button("Start") { Task { await store.join(start: true) } }
+              .controlSize(.small)
+          }
+        }
         Divider().padding(.leading, 42)
         ChecklistRow(done: store.subscriptionConnected, title: "Connect subscription",
                      detail: store.subscriptionConnected ? "Connected" : store.connectHint ?? "Approve in your browser") {
@@ -1575,7 +1550,7 @@ struct SetupChecklistView: View {
 
       // Right after joining, "wrong pool?": leave it and enter another invite. The row
       // keeps its space when hidden, so nothing moves.
-      Button("Use a different invite") { Task { await store.goBackToJoin() } }
+      Button("Leave and start over") { Task { await store.goBackToJoin() } }
         .buttonStyle(.plain)
         .font(Typography.body)
         .foregroundStyle(.secondary)
@@ -1671,8 +1646,8 @@ struct LeaveView: View {
     VStack(spacing: 0) {
       BackHeader(title: "", back: back)
       Spacer(minLength: 8)
-      Hero(icon: "rectangle.portrait.and.arrow.right", title: "Leave this pool?",
-           subtitle: "Your subscription access is deleted from the pool, and Claude Code goes back to using only your own account.")
+      Hero(icon: "rectangle.portrait.and.arrow.right", title: "Leave this circle?",
+           subtitle: "Your Mac stops lending and borrowing, forgets the circle and its key, and Claude Code goes back to using only your own account.")
       MessageSlot(alignment: .top) {
         if let error = store.saveError {
           Text(error)
@@ -1688,7 +1663,7 @@ struct LeaveView: View {
       Button(role: .destructive) {
         Task { if !(await store.leavePool()) { return } }
       } label: {
-        Text(store.busy ? "Leaving…" : "Leave Pool").frame(maxWidth: .infinity)
+        Text(store.busy ? "Leaving…" : "Leave Circle").frame(maxWidth: .infinity)
       }
       .buttonStyle(.borderedProminent)
       .controlSize(.large)
@@ -1730,8 +1705,6 @@ struct MainView: View {
           PersonDetail(
             member: $store.lendingMembers[i],
             source: store.borrowSources.first { $0.name == name },
-            lentThisWeek: store.borrowedWeekByCaller[name] ?? 0,
-            borrowedThisWeek: store.borrowedByMeWeekByOwner[name] ?? 0,
             remove: store.canInvite ? {
               withAnimation(.easeInOut(duration: 0.2)) { selected = nil }
               Task { await store.removeMember(name) }
@@ -1767,27 +1740,12 @@ struct MainView: View {
       lendingStatus
         .padding(.horizontal, Spacing.edge)
         .padding(.top, Spacing.card)
-      SectionHeader(title: "This week")
-        .padding(.top, Spacing.section)
-      HStack(spacing: 8) {
-        WeekTile(title: "Lent", icon: "arrow.up.right", value: store.borrowedWeekTotal)
-        WeekTile(title: "Borrowed", icon: "arrow.down.left", value: store.borrowedByMeWeekTotal)
-      }
-      .padding(.horizontal, Spacing.edge)
       SectionHeader(title: "Your usage")
         .padding(.top, Spacing.section)
       // Anthropic's own live numbers for this subscription (what lending limits use).
       VStack(spacing: 8) {
         UsageBar(label: "5h", percent: store.utilizationFiveHour, lent: store.lentFiveHour)
         UsageBar(label: "Week", percent: store.utilizationSevenDay, lent: store.lentSevenDay)
-        HStack(spacing: 12) {
-          Label { Text("You") } icon: { Circle().fill(accent).frame(width: 7, height: 7) }
-          Label { Text("Friends") } icon: { Circle().fill(friendsColor).frame(width: 7, height: 7) }
-          Spacer()
-        }
-        .font(Typography.caption)
-        .foregroundStyle(.secondary)
-        .padding(.leading, 42)
       }
       .padding(Spacing.card)
       .background(card)
@@ -1810,7 +1768,7 @@ struct MainView: View {
                     .foregroundStyle(accent)
                     .frame(width: 28, height: 28)
                     .background(Circle().fill(.quaternary))
-                  Text("Invite to Pool…").font(Typography.title)
+                  Text("Invite a friend…").font(Typography.title)
                 }
               }
             }
@@ -1890,25 +1848,20 @@ struct MainView: View {
           .foregroundStyle(store.routedThroughPool ? Color.secondary : Color.orange)
       }
       Spacer()
-      Toggle("Pool fallback", isOn: Binding(get: { store.routedThroughPool }, set: { store.setRouted($0) }))
+      Toggle("Borrowing", isOn: Binding(get: { store.routedThroughPool }, set: { store.setRouted($0) }))
         .labelsHidden()
         .toggleStyle(.switch)
         .tint(accent)
-        .help("Pool fallback: borrow from friends when you hit your limit")
+        .help("Borrow from friends when you hit your limit")
       Menu {
         // Account, then app, then the ways out — the usual macOS menu order.
         if let me = store.me { Text("Signed in as \(prettyName(me))") }
         Button(store.subscriptionConnected ? "Reconnect Subscription…" : "Connect Subscription…") { store.runConnect() }
         Divider()
-        // Borrowing is private or not at all: a pool without the helper can't lend.
-        if store.online && !store.poolCanLend {
-          Text("Your pool has no helper for private borrowing, so it can't lend yet.")
-          Divider()
-        }
         Button("Check for Updates…") { Task { await store.checkForUpdate(force: true) } }
         Text("Version \(Store.currentVersion) (\(Store.currentBuild))")
         Divider()
-        Button("Leave Pool…") { go { leaving = true } }
+        Button("Leave Circle…") { go { leaving = true } }
         Button("Quit lembas") { NSApp.terminate(nil) }
           .keyboardShortcut("q")
       } label: {
@@ -1924,7 +1877,7 @@ struct MainView: View {
 
   private var subtitle: String {
     let who = store.me.map { prettyName($0) + " · " } ?? ""
-    let mode = store.routedThroughPool ? (store.poolCanLend ? "Fallback on" : "Fallback on · pool can't lend") : "Fallback off"
+    let mode = store.routedThroughPool ? (store.online ? "Borrowing on" : "Agent unreachable") : "Borrowing off"
     return who + mode
   }
 }

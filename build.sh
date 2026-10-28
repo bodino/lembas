@@ -47,7 +47,7 @@ VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/I
 
 for arch in arm64 x86_64; do
   xcrun swiftc -parse-as-library -O -target $arch-apple-macos26.0 src/PoolBar.swift src/Login.swift src/Logo.swift src/HTTPServer.swift -o "$TMP/lembas-$arch"
-  xcrun swiftc -parse-as-library -O -target $arch-apple-macos26.0 src/Agent.swift src/HTTPServer.swift src/PrivateBorrow.swift -o "$TMP/lembas-agent-$arch"
+  xcrun swiftc -parse-as-library -O -target $arch-apple-macos26.0 src/Agent.swift src/HTTPServer.swift src/PrivateBorrow.swift src/Peer.swift -o "$TMP/lembas-agent-$arch"
 done
 lipo -create "$TMP/lembas-arm64" "$TMP/lembas-x86_64" -output "$APP/MacOS/lembas"
 lipo -create "$TMP/lembas-agent-arm64" "$TMP/lembas-agent-x86_64" -output "$APP/MacOS/lembas-agent"

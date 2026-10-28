@@ -10,6 +10,14 @@ day, your unused capacity can help them.
 > stores every member's subscription access, so treat it (and its `config.json` /
 > `state.json`) as highly sensitive. Use it at your own risk.
 
+> **This branch (`p2p`) has no pool.** Members' Macs lend to each other directly, in a
+> *circle*: each login stays on its owner's Mac, borrowing goes Mac to Mac over
+> [iroh](https://iroh.computer) (a relay carries encrypted bytes when hole punching
+> fails), and a borrower proves its usage limit to the lender in zero knowledge instead
+> of a pool checking it. See [docs/p2p.md](docs/p2p.md). The paragraphs below describe
+> the pool version on `main`; the app and agent in this branch replace "pool" with
+> "circle" throughout, and the pool server is not used.
+
 ## How it works
 
 - **Direct first, always.** Every normal Claude Code request goes straight from your
