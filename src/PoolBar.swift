@@ -24,7 +24,10 @@ enum Profile {
   static let agentLabel = "com.lembas.agent" + (name.map { ".\($0)" } ?? "")
   static let agentPlist = home.appendingPathComponent("Library/LaunchAgents/\(agentLabel).plist")
   static let agentLog = home.appendingPathComponent("Library/Logs/lembas-agent\(suffix).log").path
-  static let agentPort = name == nil ? 8788 : 8789
+  // A profile's agent port: 8789, or LEMBAS_AGENT_PORT so that several profiles can run
+  // side by side (a circle of one person's Macs, for testing).
+  static let agentPort = name == nil ? 8788
+    : Int(ProcessInfo.processInfo.environment["LEMBAS_AGENT_PORT"] ?? "") ?? 8789
   // Claude Code reads CLAUDE_CONFIG_DIR; a profile's lives in ~/.claude-<name>.
   static let claudeSettings = home.appendingPathComponent(name.map { ".claude-\($0)" } ?? ".claude")
   static let loginURL = home.appendingPathComponent(".config/lembas-login\(suffix).json")
