@@ -54,3 +54,5 @@ tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "io-util", 
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+iroh = { version = "1.4.1", default-features = false, features = ["tls-ring"] }
+data-encoding = "2"

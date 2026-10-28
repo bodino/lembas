@@ -261,7 +261,7 @@ pub trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 impl LocalListener {
-    async fn accept(&self) -> Result<(LocalStream, String)> {
+    pub async fn accept(&self) -> Result<(LocalStream, String)> {
         match self {
             LocalListener::Tcp(l) => {
                 let (stream, peer) = l.accept().await?;
@@ -303,7 +303,7 @@ pub async fn serve_local(session: Arc<Session>, listener: LocalListener) -> Resu
     }
 }
 
-async fn serve_client(session: Arc<Session>, stream: LocalStream) -> Result<()> {
+pub async fn serve_client(session: Arc<Session>, stream: LocalStream) -> Result<()> {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut rd = BufReader::new(rd);
     let result = async {
@@ -433,7 +433,7 @@ fn parse_request(head: &[u8]) -> Result<(String, usize)> {
     Ok((template, body_len))
 }
 
-async fn respond_error<W: AsyncWrite + Unpin>(wr: &mut W, status: u16, kind: &str, message: &str) -> Result<()> {
+pub async fn respond_error<W: AsyncWrite + Unpin>(wr: &mut W, status: u16, kind: &str, message: &str) -> Result<()> {
     let reason = match status {
         400 => "Bad Request",
         503 => "Service Unavailable",

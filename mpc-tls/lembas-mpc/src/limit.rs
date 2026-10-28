@@ -627,6 +627,7 @@ pub enum Cheat {
 /// Runs the prover's side: the probe with `token`, then the proof. The
 /// verifier must name `expected_path` (the prover reveals a response to that
 /// path and no other).
+#[allow(clippy::too_many_arguments)]
 pub async fn prove(
     mpc: Context,
     up: Context,

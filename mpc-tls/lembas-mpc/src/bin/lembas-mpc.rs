@@ -11,7 +11,17 @@
 //! lembas-mpc chat     --pool 127.0.0.1:7700
 //! lembas-mpc limit-verify --listen 127.0.0.1:7701        # a lender checks a limit proof
 //! lembas-mpc limit-prove  --verifier 127.0.0.1:7701 --token-env LEMBAS_TOKEN
+//! lembas-mpc peer --dir ~/.lembas/peer --name Alice --found --invite --control
+//! lembas-mpc peer --dir ~/.lembas/peer --name Bob --join lembas://join/... --listen 127.0.0.1:8789
 //! ```
+//!
+//! `peer` is the serverless mode: one process per Mac, lending and borrowing
+//! with the other members of a circle directly over iroh (QUIC with hole
+//! punching, a relay when that fails). With `--control` it takes JSON lines
+//! on stdin (`{"cmd":"status"}`, `invite`, `join`, `lend`, `away`, `remove`,
+//! `sync`) and answers on stdout, one line each, plus a `status` event every
+//! half minute; the local port or socket serves borrowed requests as `proxy`
+//! does.
 //!
 //! A session (`session`) carries many requests over many connections with one
 //! two-party setup. `proxy` is how the lembas agent uses it: the link to the
@@ -41,6 +51,7 @@ use lembas_mpc::{
     limit::{self, USAGE_PATH},
     link,
     local::serve_local,
+    peer::{ApiTarget, Peer, PeerConfig},
     mozilla_roots,
     session::{Connector, Lease, OnSpliced, Session, TokenSource, fixed_token, run_pool},
 };
@@ -224,6 +235,63 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = Roots::Mozilla)]
         roots: Roots,
     },
+    /// Run this Mac as a peer of a circle: lend to and borrow from the other
+    /// members directly, no pool.
+    Peer {
+        /// Where the key, the circle and the settings are kept.
+        #[arg(long)]
+        dir: PathBuf,
+        /// This Mac's name in the circle.
+        #[arg(long)]
+        name: String,
+        /// Environment variable holding this Mac's own subscription token,
+        /// for lending and for proving its limit. Without it the peer can do
+        /// neither.
+        #[arg(long, default_value = "LEMBAS_TOKEN")]
+        token_env: String,
+        /// Found a circle, if this Mac is in none.
+        #[arg(long)]
+        found: bool,
+        /// Join the circle this invite link points to, if in none.
+        #[arg(long)]
+        join: Option<String>,
+        /// Print an invite link at start.
+        #[arg(long)]
+        invite: bool,
+        /// Local TCP address for borrowed requests; port 0 picks a free one.
+        #[arg(long, default_value = "127.0.0.1:0", conflicts_with = "socket")]
+        listen: String,
+        #[arg(long)]
+        port_file: Option<PathBuf>,
+        /// Serve borrowed requests on a Unix socket instead (created 0600).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Take commands as JSON lines on stdin, answer on stdout.
+        #[arg(long)]
+        control: bool,
+        /// No relay or address lookup: direct addresses only (local tests).
+        #[arg(long)]
+        no_relay: bool,
+        /// Bind the endpoint here (local tests).
+        #[arg(long)]
+        bind: Option<std::net::SocketAddr>,
+        /// A borrower must prove a window at or past this percent.
+        #[arg(long, default_value_t = 90.0)]
+        borrow_at: f64,
+        /// Lend while away until the five-hour window reaches this percent.
+        #[arg(long, default_value_t = 70.0)]
+        away5h: f64,
+        /// Never lend past this percent of the week.
+        #[arg(long, default_value_t = 60.0)]
+        week: f64,
+        /// API server to lend for and probe, host:port.
+        #[arg(long, default_value = "api.anthropic.com:443")]
+        api: String,
+        #[arg(long, default_value = "api.anthropic.com")]
+        api_name: String,
+        #[arg(long, value_enum, default_value_t = Roots::Mozilla)]
+        roots: Roots,
+    },
     /// Chat with the model; the conversation is one session, every turn one
     /// borrowed request.
     Chat {
@@ -333,6 +401,95 @@ async fn run() -> Result<()> {
             max_tokens,
             token_len,
         } => chat(&pool, &model, max_tokens, token_len).await,
+        Cmd::Peer {
+            dir,
+            name,
+            token_env,
+            found,
+            join,
+            invite,
+            listen,
+            port_file,
+            socket,
+            control,
+            no_relay,
+            bind,
+            borrow_at,
+            away5h,
+            week,
+            api,
+            api_name,
+            roots,
+        } => {
+            let token = std::env::var(&token_env).ok().filter(|t| !t.is_empty());
+            if token.is_none() {
+                warn!("peer: {token_env} is not set: this Mac can neither lend nor prove its limit");
+            }
+            let fixture = matches!(roots, Roots::Fixture);
+            let cfg = PeerConfig {
+                dir,
+                name,
+                token,
+                api: ApiTarget {
+                    server: api,
+                    server_name: api_name,
+                    usage_path: if fixture { "/".into() } else { USAGE_PATH.into() },
+                    roots: roots.store()?,
+                    require_usage: !fixture,
+                },
+                relay: !no_relay,
+                bind,
+            };
+            let peer = Peer::start(cfg).await?;
+            {
+                let mut st = peer.status();
+                if found && st.circle.is_none() {
+                    peer.found()?;
+                    st = peer.status();
+                }
+                if let Some(link) = &join
+                    && st.circle.is_none()
+                {
+                    peer.join(link).await?;
+                }
+            }
+            peer.set_policy(lembas_mpc::peer::LendPolicy { away5h, week, borrow_at });
+            if invite {
+                let link = peer.invite().await?;
+                if control {
+                    println!("{}", serde_json::json!({ "event": "invite", "link": link }));
+                } else {
+                    println!("{link}");
+                }
+            }
+            let listener = match &socket {
+                Some(path) => {
+                    let _ = std::fs::remove_file(path);
+                    let listener = tokio::net::UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+                    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                    lembas_mpc::local::LocalListener::Unix(listener)
+                }
+                None => {
+                    let listener = TcpListener::bind(&listen).await?;
+                    if let Some(path) = &port_file {
+                        let port = listener.local_addr()?.port();
+                        std::fs::write(path, format!("{port}\n")).with_context(|| format!("writing {}", path.display()))?;
+                    }
+                    lembas_mpc::local::LocalListener::Tcp(listener)
+                }
+            };
+            info!("peer: {} ({}), borrowed requests on {}", peer.status().name, peer.id().fmt_short(), listener.describe());
+            let proxy = tokio::spawn(peer.clone().serve_proxy(listener));
+            if control {
+                tokio::select! {
+                    r = control_loop(peer.clone()) => r?,
+                    r = proxy => r??,
+                }
+            } else {
+                proxy.await??;
+            }
+            Ok(())
+        }
         Cmd::LimitVerify {
             listen,
             server,
@@ -553,6 +710,82 @@ fn env_token(token_env: &str) -> Result<TokenSource> {
         bail!("{token_env} does not look like a token");
     }
     Ok(fixed_token(token))
+}
+
+// ---------------------------------------------------------------------------
+// The peer's control channel: JSON lines on stdin and stdout
+
+#[derive(Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum PeerCmd {
+    Status,
+    Invite,
+    Join { link: String },
+    Lend {
+        member: String,
+        to: bool,
+        #[serde(default)]
+        while_working: bool,
+    },
+    Away { away: bool },
+    Remove { member: String },
+    Sync,
+}
+
+async fn control_loop(peer: Arc<Peer>) -> Result<()> {
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    let say = |v: serde_json::Value| {
+        println!("{v}");
+        let _ = std::io::stdout().flush();
+    };
+    loop {
+        tokio::select! {
+            _ = tick.tick() => say(serde_json::json!({ "event": "status", "status": peer.status() })),
+            line = lines.next_line() => {
+                let Some(line) = line? else { return Ok(()) };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let reply = match serde_json::from_str::<PeerCmd>(&line) {
+                    Err(e) => Err(anyhow::anyhow!("bad command: {e}")),
+                    Ok(cmd) => run_cmd(&peer, cmd).await,
+                };
+                match reply {
+                    Ok(v) => say(serde_json::json!({ "ok": true, "result": v })),
+                    Err(e) => say(serde_json::json!({ "ok": false, "error": format!("{e:#}") })),
+                }
+            }
+        }
+    }
+}
+
+async fn run_cmd(peer: &Arc<Peer>, cmd: PeerCmd) -> Result<serde_json::Value> {
+    let member = |s: &str| -> Result<iroh::PublicKey> { s.parse().map_err(|e| anyhow::anyhow!("bad member id: {e}")) };
+    Ok(match cmd {
+        PeerCmd::Status => serde_json::to_value(peer.status())?,
+        PeerCmd::Invite => serde_json::json!({ "link": peer.invite().await? }),
+        PeerCmd::Join { link } => {
+            peer.join(&link).await?;
+            serde_json::to_value(peer.status())?
+        }
+        PeerCmd::Lend { member: m, to, while_working } => {
+            peer.set_lend(member(&m)?, to, while_working);
+            serde_json::Value::Null
+        }
+        PeerCmd::Away { away } => {
+            peer.set_away(away);
+            serde_json::Value::Null
+        }
+        PeerCmd::Remove { member: m } => {
+            peer.remove(member(&m)?).await?;
+            serde_json::Value::Null
+        }
+        PeerCmd::Sync => {
+            peer.sync_all().await;
+            serde_json::to_value(peer.status())?
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
