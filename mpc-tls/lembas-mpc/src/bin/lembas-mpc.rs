@@ -738,6 +738,13 @@ enum PeerCmd {
     Remove { member: String },
     Sync,
     Found,
+    /// A borrowed request's cost, from the agent that metered it.
+    Report {
+        lender: String,
+        usd: f64,
+        #[serde(default)]
+        model: String,
+    },
     Policy {
         away5h: f64,
         week: f64,
@@ -812,6 +819,10 @@ async fn run_cmd(peer: &Arc<Peer>, cmd: PeerCmd) -> Result<serde_json::Value> {
         PeerCmd::Found => {
             peer.found()?;
             serde_json::to_value(peer.status())?
+        }
+        PeerCmd::Report { lender, usd, model } => {
+            peer.report(member(&lender)?, usd, model).await?;
+            serde_json::Value::Null
         }
         PeerCmd::Policy { away5h, week, borrow_at, away_after_minutes } => {
             peer.set_policy(lembas_mpc::peer::LendPolicy { away5h, week, borrow_at, away_after_minutes });

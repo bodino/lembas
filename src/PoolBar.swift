@@ -384,6 +384,12 @@ final class Store: ObservableObject {
       }
       lentFiveHour = nil
       lentSevenDay = nil
+      borrowedWeekTotal = number(st["lent_week"])
+      borrowed5h = number(st["lent_5h"])
+      borrowedByMeWeekTotal = number(st["borrowed_week"])
+      borrowedByMe5h = number(st["borrowed_5h"])
+      var lentBy: [String: Double] = [:]
+      var borrowedFrom: [String: Double] = [:]
 
       var fresh: [LendingMember] = []
       var sources: [BorrowSource] = []
@@ -393,6 +399,8 @@ final class Store: ObservableObject {
         let lendTo = row["lend_to"] as? Bool ?? false
         let whileWorking = row["lend_while_working"] as? Bool ?? false
         fresh.append(LendingMember(name: id, label: label, away: lendTo, working: lendTo && whileWorking, working5h: 40))
+        lentBy[id] = number(row["lent_week"])
+        borrowedFrom[id] = number(row["borrowed_week"])
         let presence = row["presence"] as? [String: Any]
         let fiveHour = (presence?["five_hour"] as? NSNumber)?.doubleValue
         let sevenDay = (presence?["seven_day"] as? NSNumber)?.doubleValue
@@ -422,6 +430,8 @@ final class Store: ObservableObject {
       }
       savedSettings = fresh.map(\.setting) + [freshPolicy.setting]
       borrowSources = sources
+      borrowedWeekByCaller = lentBy
+      borrowedByMeWeekByOwner = borrowedFrom
     } catch {
       online = false
       loaded = true // show the main screen with the error rather than spin forever
@@ -1241,6 +1251,8 @@ struct PersonRow: View {
 struct PersonDetail: View {
   @Binding var member: LendingMember
   let source: BorrowSource?
+  let lentThisWeek: Double
+  let borrowedThisWeek: Double
   var remove: (() -> Void)?
   let back: () -> Void
   @State private var confirmingRemove = false
@@ -1290,6 +1302,15 @@ struct PersonDetail: View {
       .padding(Spacing.card)
       .frame(maxWidth: .infinity, alignment: .leading)
       .background(card)
+
+      HStack(spacing: 10) {
+        Text("This week").foregroundStyle(.secondary)
+        Spacer()
+        Label(dollars(lentThisWeek), systemImage: "arrow.up.right")
+        Label(dollars(borrowedThisWeek), systemImage: "arrow.down.left")
+      }
+      .font(Typography.caption.monospacedDigit())
+      .padding(.horizontal, 2)
 
       if let remove {
         if confirmingRemove {
@@ -1708,6 +1729,8 @@ struct MainView: View {
           PersonDetail(
             member: $store.lendingMembers[i],
             source: store.borrowSources.first { $0.name == name },
+            lentThisWeek: store.borrowedWeekByCaller[name] ?? 0,
+            borrowedThisWeek: store.borrowedByMeWeekByOwner[name] ?? 0,
             remove: store.canInvite ? {
               withAnimation(.easeInOut(duration: 0.2)) { selected = nil }
               Task { await store.removeMember(name) }
@@ -1743,6 +1766,15 @@ struct MainView: View {
       lendingStatus
         .padding(.horizontal, Spacing.edge)
         .padding(.top, Spacing.card)
+      SectionHeader(title: "This week")
+        .padding(.top, Spacing.section)
+      // What friends' requests on this login cost, and ours on theirs, as the
+      // borrower's agent metered them and told the lender.
+      HStack(spacing: 8) {
+        WeekTile(title: "Lent", icon: "arrow.up.right", value: store.borrowedWeekTotal)
+        WeekTile(title: "Borrowed", icon: "arrow.down.left", value: store.borrowedByMeWeekTotal)
+      }
+      .padding(.horizontal, Spacing.edge)
       SectionHeader(title: "Your usage")
         .padding(.top, Spacing.section)
       // Anthropic's own live numbers for this subscription (what lending limits use).

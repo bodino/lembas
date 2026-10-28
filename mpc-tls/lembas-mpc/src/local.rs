@@ -304,6 +304,12 @@ pub async fn serve_local(session: Arc<Session>, listener: LocalListener) -> Resu
 }
 
 pub async fn serve_client(session: Arc<Session>, stream: LocalStream) -> Result<()> {
+    serve_client_for(session, stream, None).await
+}
+
+/// As [`serve_client`], naming the lender in an `x-lembas-lender` header so the
+/// client can report what the request cost against the right person.
+pub async fn serve_client_for(session: Arc<Session>, stream: LocalStream, lender: Option<String>) -> Result<()> {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut rd = BufReader::new(rd);
     let result = async {
@@ -342,7 +348,7 @@ pub async fn serve_client(session: Arc<Session>, stream: LocalStream) -> Result<
         }
 
         let req = Arc::new(AtomicU64::new(0));
-        let mut out = HeaderInsert::new(&mut wr, req.clone());
+        let mut out = HeaderInsert::new(&mut wr, req.clone(), lender.clone());
         let on_req = {
             let req = req.clone();
             move |n: u64| req.store(n, Ordering::Relaxed)
@@ -458,16 +464,18 @@ pub async fn respond_error<W: AsyncWrite + Unpin>(wr: &mut W, status: u16, kind:
 struct HeaderInsert<'a, W> {
     inner: &'a mut W,
     req: Arc<AtomicU64>,
+    lender: Option<String>,
     head: Vec<u8>,
     in_head: bool,
     started: bool,
 }
 
 impl<'a, W: AsyncWrite + Unpin> HeaderInsert<'a, W> {
-    fn new(inner: &'a mut W, req: Arc<AtomicU64>) -> Self {
+    fn new(inner: &'a mut W, req: Arc<AtomicU64>, lender: Option<String>) -> Self {
         Self {
             inner,
             req,
+            lender,
             head: Vec::new(),
             in_head: true,
             started: false,
@@ -489,7 +497,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for HeaderInsert<'_, W> {
         if self.in_head {
             self.head.extend_from_slice(data);
             if let Some(end) = self.head.windows(4).position(|w| w == b"\r\n\r\n") {
-                let line = format!("x-lembas-request: {}\r\n", self.req.load(Ordering::Relaxed));
+                let mut line = format!("x-lembas-request: {}\r\n", self.req.load(Ordering::Relaxed));
+                if let Some(lender) = &self.lender {
+                    line.push_str(&format!("x-lembas-lender: {lender}\r\n"));
+                }
                 self.head.splice(end + 2..end + 2, line.into_bytes());
                 self.in_head = false;
                 // Hand the whole head (and whatever followed) to the inner

@@ -198,7 +198,9 @@ pool mode left in them (`src/server.ts` stays in the tree for the pool branch).
 - **The app** (`PoolBar.swift`): the first screen asks for a name and either an invite
   link (`lembas://join/…`, also as a clickable link) or *Start a Circle*; the checklist
   then connects the subscription. The main screen is as before minus the dollar tiles
-  (there is no ledger: nobody sees anyone else's requests). Each person's page has the
+  with its *This week* tiles fed by each Mac's own book: the borrower's agent meters a
+  borrowed request as before and tells its peer, which tells the lender's peer on the
+  next sync; both keep the entries for eight days. Each person's page has the
   two lending switches (*when I'm away*, *while I'm working*), what they lend you, and
   *Remove from Circle*; *Invite a friend…* makes a one-time link for anyone in the
   circle; the gear menu has *Leave Circle…*, which stops the peer and deletes its key,

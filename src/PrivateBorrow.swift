@@ -107,6 +107,7 @@ extension Agent {
       throw kind == "refused" ? PrivateBorrowError.peer("refused: \(message)") : PrivateBorrowError.helper(message)
     }
     let reqNo = head.value(forHTTPHeaderField: "x-lembas-request").flatMap(Int.init) ?? 0
+    let lender = head.value(forHTTPHeaderField: "x-lembas-lender")
     log("private borrow: request \(reqNo) \(request.method) \(request.path) (\(request.body.count) bytes) → \(head.statusCode)")
 
     let tap = UsageTap(contentType: head.value(forHTTPHeaderField: "content-type"))
@@ -127,7 +128,7 @@ extension Agent {
       return .served
     }
     var headers = responseHeaders(head)
-    headers = headers.filter { $0.0.lowercased() != "x-lembas-request" }
+    headers = headers.filter { !["x-lembas-request", "x-lembas-lender"].contains($0.0.lowercased()) }
     await out.start(status: head.statusCode, headers: headers)
     var pending = Data()
     do {
@@ -148,6 +149,10 @@ extension Agent {
     await out.end()
     let usd = costUsd(model: model, usage: tap.finish())
     log("private borrow: request \(reqNo) \(model ?? "request") ~$\(String(format: "%.4f", usd))")
+    // Into this Mac's book, and the lender's on the next sync.
+    if let lender, let peer {
+      Task { _ = try? await peer.command(["cmd": "report", "lender": lender, "usd": usd, "model": model ?? ""]) }
+    }
     return .served
   }
 }

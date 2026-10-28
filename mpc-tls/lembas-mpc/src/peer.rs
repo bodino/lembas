@@ -45,7 +45,7 @@ use crate::{
     circle::{Circle, CircleId, CircleState, Invite, JoinReply, JoinRequest, Membership, Removal, now},
     limit::{self, Usage},
     link,
-    local::{LocalListener, serve_client},
+    local::{LocalListener, serve_client_for},
     session::{Connector, Lease, Session, TokenSource, run_pool},
 };
 
@@ -63,6 +63,10 @@ pub const PROOF_DEFAULT_SECS: u64 = 3600;
 pub const PROOF_MAX_SECS: u64 = 6 * 3600;
 /// Largest control message on a join or sync stream.
 const MAX_MESSAGE: usize = 1 << 20;
+/// Ledger entries older than this are dropped; the app shows a week.
+const LEDGER_KEEP_SECS: u64 = 8 * 24 * 3600;
+/// Most a single borrowed request may be reported to have cost, in dollars.
+const MAX_REPORT_USD: f64 = 10.0;
 const STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a stream is for: its first byte.
@@ -101,6 +105,28 @@ pub struct Presence {
     pub room: bool,
 }
 
+/// What one borrowed request cost, as the borrower's agent metered it. The
+/// lender takes the borrower's word, as the pool did: it cannot see the
+/// response, and the borrower has little to gain from lying to a friend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Report {
+    pub id: u64,
+    pub at: u64,
+    pub usd: f64,
+    pub model: String,
+}
+
+/// A borrowed request in this Mac's own book: lent by `lender` to `borrower`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub id: u64,
+    pub at: u64,
+    pub lender: PublicKey,
+    pub borrower: PublicKey,
+    pub usd: f64,
+    pub model: String,
+}
+
 /// One sync exchange, each way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncMsg {
@@ -108,6 +134,9 @@ pub struct SyncMsg {
     pub state: CircleState,
     pub presence: Presence,
     pub addr: EndpointAddr,
+    /// What the sender borrowed from the receiver lately.
+    #[serde(default)]
+    pub reports: Vec<Report>,
 }
 
 /// The owner's limits, the pool's numbers by default.
@@ -211,6 +240,7 @@ struct State {
     /// Lenders that hold a proof of ours, until when.
     proved: BTreeMap<PublicKey, u64>,
     my_usage: Option<(Usage, u64)>,
+    ledger: Vec<LedgerEntry>,
 }
 
 /// A borrowing session with one lender.
@@ -241,6 +271,11 @@ pub struct Status {
     pub lending: bool,
     pub usage: Option<Usage>,
     pub policy: LendPolicy,
+    /// Dollars lent and borrowed, last 7 days and last 5 hours.
+    pub lent_week: f64,
+    pub borrowed_week: f64,
+    pub lent_5h: f64,
+    pub borrowed_5h: f64,
     pub members: Vec<MemberStatus>,
 }
 
@@ -253,6 +288,8 @@ pub struct MemberStatus {
     pub presence: Option<Presence>,
     pub proof: Option<Proof>,
     pub proved_until: Option<u64>,
+    pub lent_week: f64,
+    pub borrowed_week: f64,
 }
 
 impl Peer {
@@ -278,6 +315,9 @@ impl Peer {
         }
         if let Ok(text) = std::fs::read(cfg.dir.join("settings.json")) {
             state.settings = serde_json::from_slice(&text).unwrap_or_default();
+        }
+        if let Ok(text) = std::fs::read(cfg.dir.join("ledger.json")) {
+            state.ledger = serde_json::from_slice(&text).unwrap_or_default();
         }
         let peer = Arc::new(Self {
             endpoint,
@@ -364,6 +404,59 @@ impl Peer {
         if let Ok(json) = serde_json::to_vec_pretty(&state.settings) {
             let _ = std::fs::write(self.cfg.dir.join("settings.json"), json);
         }
+    }
+
+    fn persist_ledger(&self, state: &mut State) {
+        let keep = now().saturating_sub(LEDGER_KEEP_SECS);
+        state.ledger.retain(|e| e.at >= keep);
+        if let Ok(json) = serde_json::to_vec(&state.ledger) {
+            let _ = std::fs::write(self.cfg.dir.join("ledger.json"), json);
+        }
+    }
+
+    /// Dollars `who` lent or borrowed in the last `secs`, and per counterpart.
+    fn sums(state: &State, me: &PublicKey, secs: u64) -> (f64, f64, BTreeMap<PublicKey, f64>, BTreeMap<PublicKey, f64>) {
+        let since = now().saturating_sub(secs);
+        let mut lent = 0.0;
+        let mut borrowed = 0.0;
+        let mut lent_to = BTreeMap::new();
+        let mut borrowed_from = BTreeMap::new();
+        for e in state.ledger.iter().filter(|e| e.at >= since) {
+            if e.lender == *me {
+                lent += e.usd;
+                *lent_to.entry(e.borrower).or_insert(0.0) += e.usd;
+            } else if e.borrower == *me {
+                borrowed += e.usd;
+                *borrowed_from.entry(e.lender).or_insert(0.0) += e.usd;
+            }
+        }
+        (lent, borrowed, lent_to, borrowed_from)
+    }
+
+    /// The borrower's agent metered a borrowed request: into the book, and to
+    /// the lender on the next sync (started now).
+    pub async fn report(self: &Arc<Self>, lender: PublicKey, usd: f64, model: String) -> Result<()> {
+        ensure!(usd.is_finite() && (0.0..=MAX_REPORT_USD).contains(&usd), "a cost between 0 and {MAX_REPORT_USD} dollars");
+        {
+            let mut st = self.state.lock().unwrap();
+            ensure!(st.circle.as_ref().is_some_and(|c| c.is_member(&lender)), "not a member");
+            st.ledger.push(LedgerEntry {
+                id: rand::random(),
+                at: now(),
+                lender,
+                borrower: self.id(),
+                usd,
+                model: model.chars().take(64).collect(),
+            });
+            self.persist_ledger(&mut st);
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = me.sync_with(lender).await {
+                debug!("peer: telling the lender what it cost: {e:#}");
+            }
+        });
+        Ok(())
     }
 
     // ---- the circle --------------------------------------------------------
@@ -483,6 +576,9 @@ impl Peer {
 
     pub fn status(&self) -> Status {
         let st = self.state.lock().unwrap();
+        let me = self.id();
+        let (lent_week, borrowed_week, lent_to, borrowed_from) = Self::sums(&st, &me, 7 * 24 * 3600);
+        let (lent_5h, borrowed_5h, _, _) = Self::sums(&st, &me, 5 * 3600);
         let members = st
             .circle
             .as_ref()
@@ -497,6 +593,8 @@ impl Peer {
                         presence: st.presence.get(&m.member).cloned(),
                         proof: st.proofs.get(&m.member).cloned(),
                         proved_until: st.proved.get(&m.member).copied(),
+                        lent_week: lent_to.get(&m.member).copied().unwrap_or(0.0),
+                        borrowed_week: borrowed_from.get(&m.member).copied().unwrap_or(0.0),
                     })
                     .collect()
             })
@@ -509,6 +607,10 @@ impl Peer {
             lending: self.token().is_some(),
             usage: st.my_usage.as_ref().map(|(u, _)| u.clone()),
             policy: st.settings.policy.clone(),
+            lent_week,
+            borrowed_week,
+            lent_5h,
+            borrowed_5h,
             members,
         }
     }
@@ -766,12 +868,48 @@ impl Peer {
         if changed {
             self.persist(&st);
         }
+        // What they borrowed from us, by their count; new entries only.
+        let me = self.id();
+        let mut booked = false;
+        for r in theirs.reports.iter().take(1000) {
+            if !r.usd.is_finite() || !(0.0..=MAX_REPORT_USD).contains(&r.usd) || st.ledger.iter().any(|e| e.id == r.id) {
+                continue;
+            }
+            st.ledger.push(LedgerEntry {
+                id: r.id,
+                at: r.at.min(now()),
+                lender: me,
+                borrower: remote,
+                usd: r.usd,
+                model: r.model.chars().take(64).collect(),
+            });
+            booked = true;
+        }
+        if booked {
+            self.persist_ledger(&mut st);
+        }
         Ok(SyncMsg {
             circle: id,
             state,
             presence: self.presence(&st),
             addr: self.endpoint.addr(),
+            reports: Self::reports_for(&st, &me, &remote),
         })
+    }
+
+    /// What `me` borrowed from `lender` in the last week, to tell them.
+    fn reports_for(st: &State, me: &PublicKey, lender: &PublicKey) -> Vec<Report> {
+        let since = now().saturating_sub(7 * 24 * 3600);
+        st.ledger
+            .iter()
+            .filter(|e| e.borrower == *me && e.lender == *lender && e.at >= since)
+            .map(|e| Report {
+                id: e.id,
+                at: e.at,
+                usd: e.usd,
+                model: e.model.clone(),
+            })
+            .collect()
     }
 
     fn name_of(&self, who: &PublicKey) -> String {
@@ -833,6 +971,7 @@ impl Peer {
                 state: circle.state(),
                 presence: self.presence(&st),
                 addr: self.endpoint.addr(),
+                reports: Self::reports_for(&st, &self.id(), &member),
             }
         };
         let conn = self.connect(member).await?;
@@ -972,7 +1111,7 @@ impl Peer {
                         }
                     }
                 };
-                if let Err(e) = serve_client(session, stream).await {
+                if let Err(e) = serve_client_for(session, stream, Some(lender.to_string())).await {
                     debug!("peer: proxy client: {e:#}");
                 }
             });
