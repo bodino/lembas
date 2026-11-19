@@ -375,13 +375,19 @@ final class Agent {
   func watchIdleness() async {
     while true {
       try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
-      guard let peer, await peer.running, let status = try? await peer.currentStatus(maxAge: 60) else { continue }
-      let away = status["away"] as? Bool ?? false
-      let minutes = ((status["policy"] as? [String: Any])?["away_after_minutes"] as? NSNumber)?.doubleValue ?? 30
-      if !away, await lifecycle.idle > minutes * 60, await autoAway.goAway() {
-        log("no Claude Code request for \(Int(minutes)) min: away")
-        await setAway(true)
-      }
+      await awayIfIdle()
+    }
+  }
+
+  // One check, in a function of its own: with the body inline in the loop above,
+  // Swift 6.3's optimizer (the one the release is built with) never finishes.
+  private func awayIfIdle() async {
+    guard let peer, await peer.running, let status = try? await peer.currentStatus(maxAge: 60) else { return }
+    let away = status["away"] as? Bool ?? false
+    let minutes = ((status["policy"] as? [String: Any])?["away_after_minutes"] as? NSNumber)?.doubleValue ?? 30
+    if !away, await lifecycle.idle > minutes * 60, await autoAway.goAway() {
+      log("no Claude Code request for \(Int(minutes)) min: away")
+      await setAway(true)
     }
   }
 }
