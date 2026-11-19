@@ -30,8 +30,40 @@ enum Profile {
     : Int(ProcessInfo.processInfo.environment["LEMBAS_AGENT_PORT"] ?? "") ?? 8789
   // Claude Code reads CLAUDE_CONFIG_DIR; a profile's lives in ~/.claude-<name>.
   static let claudeSettings = home.appendingPathComponent(name.map { ".claude-\($0)" } ?? ".claude")
-  static let loginURL = home.appendingPathComponent(".config/lembas-login\(suffix).json")
     .appendingPathComponent("settings.json")
+  static let loginURL = home.appendingPathComponent(".config/lembas-login\(suffix).json")
+
+  // 1.4.0 had those two paths mixed up: it took Claude Code's folder for its settings
+  // file, and making "the file" 0600 locked Claude Code out of its own folder (no
+  // settings, no transcripts); the login went into a folder named like the login file.
+  // Puts both right before anything reads them. Does nothing on any other install.
+  static func repairPathsFrom140() {
+    let fm = FileManager.default
+    var isDir: ObjCBool = false
+    let claudeDir = claudeSettings.deletingLastPathComponent()
+    if fm.fileExists(atPath: claudeDir.path, isDirectory: &isDir) {
+      if isDir.boolValue {
+        let mode = ((try? fm.attributesOfItem(atPath: claudeDir.path))?[.posixPermissions] as? NSNumber)?.intValue
+        if let mode, mode & 0o700 != 0o700 {
+          try? fm.setAttributes([.posixPermissions: mode | 0o700], ofItemAtPath: claudeDir.path)
+        }
+      } else {
+        // There was no folder yet, so the settings were written where it belongs.
+        let aside = claudeDir.appendingPathExtension("lembas-moving")
+        if (try? fm.moveItem(at: claudeDir, to: aside)) != nil {
+          try? fm.createDirectory(at: claudeDir, withIntermediateDirectories: true)
+          try? fm.moveItem(at: aside, to: claudeSettings)
+        }
+      }
+    }
+    if fm.fileExists(atPath: loginURL.path, isDirectory: &isDir), isDir.boolValue {
+      let aside = loginURL.appendingPathExtension("lembas-moving")
+      try? fm.removeItem(at: aside)
+      let moved = (try? fm.moveItem(at: loginURL.appendingPathComponent("settings.json"), to: aside)) != nil
+      try? fm.removeItem(at: loginURL) // only ever held that one file
+      if moved { try? fm.moveItem(at: aside, to: loginURL) }
+    }
+  }
 }
 
 struct Config: Codable {
@@ -178,6 +210,7 @@ final class Store: ObservableObject {
 
   init() {
     AppDelegate.store = self // so lembas:// links reach us even before the popover opens
+    Profile.repairPathsFrom140() // before the agent is (re)installed with these paths
     // Runs from launch, not from first opening the popover: membership changes and
     // updates are noticed even if nobody clicks the menu bar icon.
     Task { await self.autoRefresh() }
