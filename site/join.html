@@ -70,9 +70,9 @@
   }
   .lead { margin-top: 16px; font-size: 18px; line-height: 28px; color: var(--muted); text-wrap: pretty; }
 
-  .steps { display: grid; gap: 12px; margin: 32px 0 0; padding: 0; list-style: none; text-align: left; }
+  .steps { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; margin: 32px 0 0; padding: 0; list-style: none; text-align: left; }
   .step {
-    display: flex; align-items: center; gap: 16px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 16px;
     padding: 16px; border-radius: 16px; border: 1px solid var(--line);
   }
   .num {
@@ -97,15 +97,14 @@
   .btn.quiet { background: var(--chip); color: var(--ink); font-size: 14px; line-height: 20px; }
   .btn.quiet:hover { background: #D9D1BE; }
 
-  .fine { margin-top: 16px; font-size: 14px; line-height: 20px; color: var(--dim); text-wrap: pretty; }
   .notice {
     margin-top: 24px; padding: 12px 16px; border-radius: 12px;
     background: var(--chip); font-size: 14px; line-height: 20px; color: var(--ink); text-wrap: pretty;
   }
 
-  .paste { margin-top: 32px; text-align: left; }
-  .paste label { display: block; margin-bottom: 8px; font-size: 14px; line-height: 20px; color: var(--muted); }
+  /* The invite itself, to copy and paste into lembas: a row of its own in the Join step. */
   .field {
+    flex: 1 0 100%; min-width: 0;
     display: flex; align-items: center; gap: 8px;
     padding: 8px 8px 8px 16px; border-radius: 12px; border: 1px solid var(--line);
   }
@@ -168,19 +167,12 @@
             <p>Opens lembas with your invite filled in.</p>
           </div>
           <button class="btn" id="join" type="button">Join</button>
+          <div class="field">
+            <output id="link" aria-label="Your invite, to paste into lembas"></output>
+            <button class="btn quiet" id="copy" type="button">Copy</button>
+          </div>
         </li>
       </ol>
-
-      <p class="fine">First launch: macOS asks you to allow it under System Settings › Privacy &amp; Security › Open Anyway.</p>
-      <p class="fine" id="terms">Needs macOS 26 or later. The invite works once.</p>
-
-      <div class="paste">
-        <label id="paste-label">If Join does nothing, copy the invite and paste it into lembas.</label>
-        <div class="field">
-          <output id="link" aria-labelledby="paste-label"></output>
-          <button class="btn quiet" id="copy" type="button">Copy</button>
-        </div>
-      </div>
     </section>
 
     <!-- An invite past its date. -->
@@ -204,7 +196,6 @@
   <footer class="foot">
     <a href="https://github.com/bodino/lembas">Source on GitHub</a>
     <a href="https://github.com/bodino/lembas/blob/main/LICENSE">MIT License</a>
-    <span>Not made or endorsed by Anthropic</span>
   </footer>
 </div>
 
@@ -239,9 +230,6 @@
       document.getElementById("title").textContent = `${from} invited you to their circle`;
       document.title = `${from} invited you to lembas`;
     }
-
-    const until = new Date(invite.expires * 1000).toLocaleDateString(undefined, { day: "numeric", month: "long" });
-    document.getElementById("terms").textContent = `Needs macOS 26 or later. The invite works once, until ${until}.`;
 
     // An iPad says it's a Mac but has a touch screen.
     const mac = /Mac/.test(navigator.platform || navigator.userAgent) && !(navigator.maxTouchPoints > 1);
