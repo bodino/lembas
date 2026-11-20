@@ -1,0 +1,1075 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lembas · Keep Claude Code going after you hit your limit</title>
+<meta name="description" content="Friends back up each other's Claude subscriptions: borrow a friend's spare capacity when you hit your limit, lend yours while you're away.">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#ECE6D8">
+<meta property="og:type" content="website">
+<meta property="og:title" content="lembas · Keep Claude Code going after you hit your limit">
+<meta property="og:description" content="Friends back up each other's Claude subscriptions: borrow when you hit your limit, lend when you're away.">
+<meta property="og:image" content="logo.png">
+<meta name="twitter:card" content="summary">
+<link rel="icon" type="image/png" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    /* --paper must match PAPER in the script exactly, so the drawing sits on the page. */
+    --paper: #ECE6D8;
+    --ink: #2A251E;
+    --muted: #5A544A;
+    --dim: #857E70;
+    --chip: #E3DCCB;
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Geist", system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 24px;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, p { margin: 0; }
+  a { color: inherit; }
+  :focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  .skip {
+    position: fixed; top: 8px; left: 8px; z-index: 10;
+    padding: 8px 12px; border-radius: 8px;
+    background: var(--ink); color: var(--paper); font-weight: 600; text-decoration: none;
+    transform: translateY(-64px); transition: transform 300ms var(--ease);
+  }
+  .skip:focus { transform: none; }
+
+  .page {
+    min-height: 100vh; min-height: 100svh;
+    display: grid; grid-template-rows: auto 1fr; gap: 24px;
+    padding: 16px;
+  }
+  @media (min-width: 768px) { .page { padding: 24px; } }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px; }
+  @media (min-width: 768px) { .wrap { padding: 0 24px; } }
+
+  .top { display: flex; justify-content: space-between; align-items: center; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-radius: 9999px;
+    background: var(--chip); border: 1px solid rgba(42, 37, 30, 0.08);
+    font-size: 14px; line-height: 20px; font-weight: 600; text-decoration: none;
+    transition: background-color 300ms var(--ease), border-color 300ms var(--ease);
+  }
+  .chip img { width: 20px; height: 20px; border-radius: 6px; }
+  a.chip:hover { background: #D9D1BE; border-color: rgba(42, 37, 30, 0.16); }
+
+  .stage { display: grid; gap: 32px; align-items: center; align-content: center; }
+  @media (min-width: 1024px) {
+    .stage { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 48px; padding: 0 48px; }
+  }
+
+  .copy { text-align: center; max-width: 680px; justify-self: center; padding-top: 32px; }
+  @media (min-width: 1024px) { .copy { text-align: left; justify-self: start; padding-top: 0; } }
+  .copy h1 {
+    font-size: 36px; line-height: 40px; font-weight: 600; letter-spacing: -0.02em; text-wrap: balance;
+    background: linear-gradient(90deg, #000000, #666666);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  @media (min-width: 768px) { .copy h1 { font-size: 48px; line-height: 1; } }
+  /* The tool name is typed out, erased, and typed again: Claude Code, Codex, Antigravity.
+     The name ends its line, and hidden copies of the longest names sit in the same grid
+     cell, so the slot keeps the width of the widest name and nothing else ever moves. */
+  .tool { display: inline-grid; white-space: nowrap; text-align: left; vertical-align: baseline; }
+  .tool > span { grid-area: 1 / 1; }
+  .tool-ghost { visibility: hidden; }
+  .tool-live::after {
+    content: ""; display: inline-block; width: 2px; height: 0.85em;
+    margin-left: 0.06em; vertical-align: -0.08em; border-radius: 1px;
+    background: var(--ink); animation: caret 1s steps(1) infinite;
+  }
+  .tool-live.still::after { animation: none; opacity: 0; }
+  @keyframes caret { 50% { opacity: 0; } }
+  .lead {
+    margin-top: 24px; max-width: 480px;
+    font-size: 18px; line-height: 28px; color: var(--muted); text-wrap: pretty;
+  }
+  @media (max-width: 1023px) { .lead { margin-left: auto; margin-right: auto; } }
+  .actions { display: flex; flex-direction: column; align-items: center; gap: 12px; margin-top: 32px; }
+  @media (min-width: 1024px) { .actions { align-items: flex-start; } }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-radius: 8px;
+    background: var(--ink); color: var(--paper);
+    font-size: 16px; line-height: 24px; font-weight: 600; text-decoration: none;
+    transition: background-color 300ms var(--ease), transform 300ms var(--ease);
+  }
+  .btn:hover { background: #3D362C; transform: translateY(-2px); }
+  .btn:active { transform: scale(0.98); }
+  .btn svg { width: 20px; height: 20px; }
+  .meta { font-size: 14px; line-height: 20px; color: var(--dim); }
+  .meta span { white-space: nowrap; }
+  .meta a { text-underline-offset: 4px; transition: color 300ms var(--ease); }
+  .meta a:hover { color: var(--ink); }
+
+  .print { justify-self: center; width: 100%; max-width: 640px; }
+  #loop { display: block; width: 100%; aspect-ratio: 1 / 1; }
+
+  /* How it works */
+  .how { padding: 96px 0; }
+  .eyebrow { font-size: 14px; line-height: 20px; font-weight: 500; color: var(--dim); margin-bottom: 16px; }
+  .h2 {
+    max-width: 680px; font-size: 30px; line-height: 36px; font-weight: 600; letter-spacing: -0.01em; text-wrap: balance;
+  }
+  @media (min-width: 768px) { .h2 { font-size: 36px; line-height: 40px; } }
+  .how .lead { margin-top: 16px; max-width: 560px; }
+
+  .route { margin-top: 48px; }
+  .nodes { display: grid; gap: 12px; align-items: stretch; }
+  @media (min-width: 900px) { .nodes { grid-template-columns: 1fr 48px 1fr 48px 1fr; gap: 0; } }
+  .node {
+    padding: 24px; border-radius: 16px;
+    border: 1px solid rgba(42, 37, 30, 0.2);
+  }
+  .node .ic { width: 32px; height: 32px; color: var(--ink); }
+  .node h4 { margin: 12px 0 0; font-size: 16px; line-height: 24px; font-weight: 600; }
+  .node p { margin-top: 4px; font-size: 14px; line-height: 20px; color: var(--muted); text-wrap: pretty; }
+  .link { display: grid; place-items: center; color: var(--dim); }
+  .link svg { width: 24px; height: 24px; transform: rotate(90deg); }
+  @media (min-width: 900px) { .link svg { transform: none; } }
+  .promise {
+    margin-top: 32px; max-width: 680px;
+    font-size: 18px; line-height: 28px; font-weight: 500; text-wrap: pretty;
+  }
+  .fine { margin-top: 12px; max-width: 680px; font-size: 14px; line-height: 20px; color: var(--dim); text-wrap: pretty; }
+
+  code, .mono { font-family: "Geist Mono", ui-monospace, monospace; }
+  .node .tag { display: block; margin-top: 12px; font-family: "Geist Mono", ui-monospace, monospace; font-size: 12px; line-height: 16px; color: var(--dim); }
+  .more { display: inline-block; margin-top: 24px; font-size: 14px; line-height: 20px; font-weight: 600; text-underline-offset: 4px; }
+
+  .reveal { opacity: 0; transform: translateY(32px); transition: opacity 700ms var(--ease), transform 700ms var(--ease); }
+  .reveal.in { opacity: 1; transform: none; }
+
+  .foot {
+    display: flex; flex-wrap: wrap; gap: 4px 16px; padding-top: 32px; padding-bottom: 32px;
+    font-size: 12px; line-height: 16px; color: var(--dim);
+  }
+  .foot a { text-decoration: none; transition: color 300ms var(--ease); }
+  .foot a:hover { color: var(--ink); }
+
+  .rise { opacity: 0; transform: translateY(32px); animation: rise 800ms var(--ease) forwards; }
+  .rise:nth-child(2) { animation-delay: 80ms; }
+  .rise:nth-child(3) { animation-delay: 160ms; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  #loop { opacity: 0; transition: opacity 800ms var(--ease); }
+  #loop.ready { opacity: 1; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .rise { animation: fade 300ms linear forwards; transform: none; }
+    .tool-live::after { display: none; }
+    @keyframes fade { to { opacity: 1; } }
+    .btn, .chip, .skip, #loop { transition: none; }
+    .reveal { transform: none; transition: opacity 300ms linear; }
+    .btn:hover { transform: none; }
+  }
+</style>
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<div class="page">
+  <header class="top">
+    <span class="chip"><img src="logo.png" alt="" width="20" height="20">lembas</span>
+    <a class="chip" href="https://github.com/bodino/lembas">GitHub</a>
+  </header>
+
+  <main id="main" class="stage">
+    <div class="copy">
+      <h1 class="rise">Keep <span class="tool"><span class="tool-live" id="tool">Claude Code</span><span class="tool-ghost" aria-hidden="true">Claude Code</span><span class="tool-ghost" aria-hidden="true">Antigravity</span></span><br>going after you hit your limit</h1>
+      <p class="lead rise">Borrow a friend's spare capacity when you run out, and lend yours while you're away.</p>
+      <div class="actions rise">
+        <a class="btn" href="https://github.com/bodino/lembas/releases/latest">
+          <svg viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M224 144v64a8 8 0 0 1-8 8H40a8 8 0 0 1-8-8v-64a8 8 0 0 1 16 0v56h160v-56a8 8 0 0 1 16 0Zm-101.66 5.66a8 8 0 0 0 11.32 0l40-40a8 8 0 0 0-11.32-11.32L136 124.69V32a8 8 0 0 0-16 0v92.69L93.66 98.34a8 8 0 0 0-11.32 11.32Z"/></svg>
+          Download lembas for macOS
+        </a>
+        <span class="meta"><span>macOS 26 or later ·</span> <span>Open source ·</span> <span><a href="#how">How it works</a></span></span>
+      </div>
+    </div>
+
+    <div class="print">
+      <canvas id="loop" role="img" aria-label="An impossible brick waterway drawn like an Escher lithograph: four towers with pools, each pouring down into the next, and the last pouring back into the first, so the water never stops. Small koi swim in the pools. Now and then one jumps out of the front trough and falls out of the picture."></canvas>
+    </div>
+  </main>
+</div>
+
+<section class="how" id="how" aria-labelledby="how-title">
+  <div class="wrap">
+    <p class="eyebrow reveal">How it works</p>
+    <h2 class="h2 reveal" id="how-title">Mac to Mac, with nothing in between</h2>
+    <p class="lead reveal">When you hit your limit, your request goes to a friend's Mac that's away. It adds its login to one encrypted record and passes it on. It never sees your prompt, you never see its login, and it can't change the answer you get back.</p>
+
+    <div class="route reveal">
+      <div class="nodes">
+        <div class="node">
+          <svg class="ic" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M232 168h-8V72a24 24 0 0 0-24-24H56a24 24 0 0 0-24 24v96h-8a8 8 0 0 0-8 8v16a24 24 0 0 0 24 24h176a24 24 0 0 0 24-24v-16a8 8 0 0 0-8-8ZM48 72a8 8 0 0 1 8-8h144a8 8 0 0 1 8 8v96H48Zm176 120a8 8 0 0 1-8 8H40a8 8 0 0 1-8-8v-8h192ZM152 88a8 8 0 0 1-8 8h-32a8 8 0 0 1 0-16h32a8 8 0 0 1 8 8Z"/></svg>
+          <h4>Your Mac</h4>
+          <p>Runs the TLS session to Anthropic and keeps its keys.</p>
+          <span class="tag">TLS 1.2 · AES 128 GCM</span>
+        </div>
+        <div class="link" aria-hidden="true"><svg viewBox="0 0 256 256" fill="currentColor"><path d="m221.66 133.66-72 72a8 8 0 0 1-11.32-11.32L196.69 136H40a8 8 0 0 1 0-16h156.69l-58.35-58.34a8 8 0 0 1 11.32-11.32l72 72a8 8 0 0 1 0 11.32Z"/></svg></div>
+        <div class="node">
+          <svg class="ic" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M117.25 157.92a60 60 0 1 0-66.5 0 95.83 95.83 0 0 0-47.22 37.71 8 8 0 1 0 13.4 8.74 80 80 0 0 1 134.14 0 8 8 0 0 0 13.4-8.74 95.83 95.83 0 0 0-47.22-37.71ZM40 108a44 44 0 1 1 44 44 44.05 44.05 0 0 1-44-44Zm210.14 98.7a8 8 0 0 1-11.07-2.33A79.83 79.83 0 0 0 172 168a8 8 0 0 1 0-16 44 44 0 1 0-16.34-84.87 8 8 0 1 1-5.94-14.85 60 60 0 0 1 55.53 105.64 95.83 95.83 0 0 1 47.22 37.71 8 8 0 0 1-2.33 11.07Z"/></svg>
+          <h4>Your friend's Mac</h4>
+          <p>Splices its token into one record. Relays everything else, unable to read or alter it.</p>
+          <span class="tag">zero knowledge keystream proof</span>
+        </div>
+        <div class="link" aria-hidden="true"><svg viewBox="0 0 256 256" fill="currentColor"><path d="m221.66 133.66-72 72a8 8 0 0 1-11.32-11.32L196.69 136H40a8 8 0 0 1 0-16h156.69l-58.35-58.34a8 8 0 0 1 11.32-11.32l72 72a8 8 0 0 1 0 11.32Z"/></svg></div>
+        <div class="node">
+          <svg class="ic" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M160 40a88.09 88.09 0 0 0-78.71 48.67A64 64 0 1 0 72 216h88a88 88 0 0 0 0-176Zm0 160H72a48 48 0 0 1 0-96c1.1 0 2.2 0 3.29.11A88 88 0 0 0 72 128a8 8 0 0 0 16 0 72 72 0 1 1 72 72Z"/></svg>
+          <h4>Anthropic</h4>
+          <p>Gets a normal Claude Code request on your friend's subscription.</p>
+          <span class="tag">api.anthropic.com</span>
+        </div>
+      </div>
+      <p class="promise">Your friend's Mac can't change a single byte of the answer. Every record is sealed with a key only your Mac and Anthropic hold.</p>
+      <p class="fine">Friends lend only while they're away, up to 70% of their five hour window. If nobody has room, you wait for your own reset, as always.</p>
+      <a class="more" href="https://github.com/bodino/lembas/blob/main/docs/mpc-tls.md">Read the protocol</a>
+    </div>
+  </div>
+</section>
+
+<footer class="foot wrap">
+  <a href="https://github.com/bodino/lembas">Source on GitHub</a>
+  <a href="https://github.com/bodino/lembas/blob/main/docs/mpc-tls.md">Privacy protocol</a>
+  <a href="https://github.com/bodino/lembas/blob/main/LICENSE">MIT License</a>
+  <span>Not made or endorsed by Anthropic</span>
+</footer>
+
+<script>
+  // The headline types a tool name, holds it, erases it, and moves on to the next.
+  (() => {
+    const el = document.getElementById("tool");
+    if (!el) return;
+    const tools = ["Claude Code", "Codex", "Antigravity"];
+    const HOLD = 2600, GAP = 500, TYPE = 70, ERASE = 40;
+    let i = 0;
+    const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduced) {
+      // No typing: swap the whole word now and then.
+      el.classList.add("still");
+      setInterval(() => { i = (i + 1) % tools.length; el.textContent = tools[i]; }, HOLD + GAP);
+      return;
+    }
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const jitter = (ms) => ms * (0.7 + Math.random() * 0.6);
+    (async () => {
+      while (true) {
+        el.classList.add("still");
+        await sleep(HOLD);
+        el.classList.remove("still");
+        const word = tools[i];
+        for (let n = word.length - 1; n >= 0; n--) { el.textContent = word.slice(0, n); await sleep(jitter(ERASE)); }
+        await sleep(GAP);
+        i = (i + 1) % tools.length;
+        const next = tools[i];
+        for (let n = 1; n <= next.length; n++) { el.textContent = next.slice(0, n); await sleep(jitter(TYPE)); }
+      }
+    })();
+  })();
+</script>
+
+<script>
+  // Sections rise into place once as they scroll into view.
+  (() => {
+    const els = document.querySelectorAll(".reveal");
+    if (!("IntersectionObserver" in window)) { els.forEach((e) => e.classList.add("in")); return; }
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+    }, { rootMargin: "0px 0px -10% 0px" });
+    els.forEach((e) => io.observe(e));
+  })();
+</script>
+
+<script type="module">
+import * as THREE from "three";
+
+const canvas = document.getElementById("loop");
+const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+
+// Colours go straight to the screen with no conversion, so these match the CSS exactly.
+const PAPER = [236 / 255, 230 / 255, 216 / 255];
+const INK = [42 / 255, 37 / 255, 30 / 255];
+
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false });
+} catch (e) {
+  canvas.parentElement.hidden = true;
+  throw e;
+}
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// Nothing that casts a shadow moves, so the shadow map is drawn once.
+renderer.shadowMap.autoUpdate = false;
+renderer.shadowMap.needsUpdate = true;
+
+// ---------------------------------------------------------------------------
+// The impossible loop.
+// The camera looks exactly along (1, 1, 1), so moving anything by (t, t, t) changes
+// only its depth. The loop drops DROP at each of its four basins; the last side is
+// longer by 4 * DROP, so it ends at a ghost of the first basin, (-4 DROP) along the
+// view line. On screen that ghost is the first basin. The last trough's depth is
+// eased toward the camera along its length so it actually draws on top of it.
+// ---------------------------------------------------------------------------
+const S = 2.3, RW = 0.17, WH = 0.42, DROP = 0.85, A = 5.0, B = A + 4 * DROP;
+const TOP = 4.4, BOTTOM = -9, CW = 0.86, CT = 0.1, OVER = 0.5;
+const WATER = 0.13;
+const basins = [
+  { x: 0, z: 0, top: TOP, out: { axis: "x", dir: 1 } },
+  { x: A, z: 0, top: TOP - DROP, out: { axis: "z", dir: 1 } },
+  { x: A, z: A, top: TOP - 2 * DROP, out: { axis: "x", dir: -1 } },
+  { x: A - B, z: A, top: TOP - 3 * DROP, out: { axis: "z", dir: -1 } },
+];
+const ghost = { x: A - B, z: A - B, top: TOP - 4 * DROP };
+const SHIFT = 4 * DROP;
+const SEAM = new THREE.Vector4(1, A - S / 2, ghost.z + S / 2, SHIFT);
+const NOSEAM = new THREE.Vector4(0, 0, 1, 0);
+
+const SEAM_GLSL = `
+uniform vec4 uSeam;
+float seamK(vec3 wp) {
+  if (uSeam.x < 0.5) return 0.0;
+  float t = clamp((wp.z - uSeam.y) / (uSeam.z - uSeam.y), 0.0, 1.0);
+  return t * uSeam.w; // linear, so it agrees with interpolation across long boxes
+}
+`;
+const HL_GLSL = `
+float hl(float c, float hw) {
+  float d = abs(fract(c) - 0.5);
+  float aa = max(fwidth(c) * 0.75, 1e-4);
+  return (1.0 - smoothstep(hw - aa, hw + aa, d)) * clamp(hw / aa, 0.0, 1.0);
+}
+float hash(float n) { return fract(sin(n * 12.9898) * 43758.5453); }
+float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float vnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash2(i), hash2(i + vec2(1.0, 0.0)), f.x), mix(hash2(i + vec2(0.0, 1.0)), hash2(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+`;
+
+const shared = {
+  uPaper: { value: new THREE.Vector3(...PAPER) },
+  uInk: { value: new THREE.Vector3(...INK) },
+  uPx: { value: 100 },
+  uLine: { value: 5 },
+  uDpr: { value: 1 },
+  uTime: { value: 0 },
+};
+
+// Lit stone, turned into ink hatching that follows each surface.
+const HATCH_HEAD = `
+uniform vec3 uPaper; uniform vec3 uInk; uniform vec3 uTint;
+uniform float uPx; uniform float uLine; uniform float uDpr;
+uniform float uBrick; uniform float uInkK; uniform float uTone; uniform vec4 uArch;
+varying vec3 vWPos; varying vec3 vWNrm;
+${HL_GLSL}
+`;
+const HATCH_BODY = `
+{
+  vec3 n = normalize(vWNrm); vec3 an = abs(n);
+  bool top = an.y >= max(an.x, an.z);
+  vec2 p = top ? vWPos.xz : (an.x > an.z ? vec2(vWPos.z, vWPos.y) : vec2(vWPos.x, vWPos.y));
+  vec2 c = p * uPx / uLine;
+  float lum = dot(gl_FragColor.rgb, vec3(0.299, 0.587, 0.114)) * uTone;
+  float dk = clamp(1.0 - lum, 0.0, 1.0);
+  float l1, l2, l3;
+  if (top) { l1 = (c.x - c.y) * 0.7071; l2 = (c.x + c.y) * 0.7071; l3 = c.x; }
+  else { l1 = c.y; l2 = (c.x + c.y) * 0.7071; l3 = (c.x - c.y) * 0.7071; }
+  float ink = max(hl(l1, clamp((dk - 0.12) * 0.6, 0.0, 0.5)),
+              max(hl(l2, clamp((dk - 0.45) * 0.65, 0.0, 0.5)),
+                  hl(l3, clamp((dk - 0.7) * 0.9, 0.0, 0.5))));
+  if (uBrick > 0.0) {
+    if (!top) {
+      float by = vWPos.y / 0.21;
+      float row = hl(by, 0.75 * uDpr / (0.21 * uPx));
+      float bx = p.x / 0.46 + 0.5 * mod(floor(by + 0.5), 2.0);
+      float col = hl(bx, 0.75 * uDpr / (0.46 * uPx));
+      ink = max(ink, max(row, col) * 0.62 * uBrick);
+    } else {
+      ink = max(ink, hl(p.x / 0.46, 0.75 * uDpr / (0.46 * uPx)) * 0.4 * uBrick);
+    }
+  }
+  if (uArch.w > 0.0 && !top) {
+    float hx = p.x - (an.x > an.z ? uArch.y : uArch.x);
+    for (int i = 0; i < 3; i++) {
+      float y = vWPos.y - (uArch.z - float(i) * 1.55);
+      float r = 0.17;
+      float inside = step(abs(hx), r) * step(0.0, y) * max(step(y, 0.46), step(length(vec2(hx, y - 0.46)), r));
+      float frame = step(abs(hx), r + 0.05) * step(-0.05, y) * max(step(y, 0.46), step(length(vec2(hx, y - 0.46)), r + 0.05));
+      ink = max(ink, inside * 0.92);
+      ink = max(ink, (frame - inside) * 0.5);
+    }
+  }
+  vec3 col = mix(uPaper * uTint, uInk, clamp(ink * uInkK, 0.0, 1.0));
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function hatchMat(o = {}) {
+  const m = new THREE.MeshLambertMaterial({ color: 0xffffff, side: o.side || THREE.FrontSide });
+  const own = {
+    uTint: { value: new THREE.Vector3(...(o.tint || [1, 1, 1])) },
+    uBrick: { value: o.brick || 0 },
+    uInkK: { value: o.inkK ?? 1 },
+    uTone: { value: o.tone ?? 1 },
+    uArch: { value: new THREE.Vector4(...(o.arch || [0, 0, 0, 0])) },
+    uSeam: { value: o.seam ? SEAM : NOSEAM },
+  };
+  m.userData.own = own;
+  m.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, shared, own);
+    sh.vertexShader = sh.vertexShader
+      .replace("#include <common>", "#include <common>\n" + SEAM_GLSL + "varying vec3 vWPos; varying vec3 vWNrm;")
+      .replace("#include <project_vertex>", `#include <project_vertex>
+        vec4 swp = modelMatrix * vec4(transformed, 1.0);
+        vWPos = swp.xyz;
+        vWNrm = normalize(mat3(modelMatrix) * objectNormal);
+        float sk = seamK(swp.xyz);
+        if (sk != 0.0) { swp.xyz += vec3(sk); gl_Position = projectionMatrix * viewMatrix * swp; }`);
+    sh.fragmentShader = sh.fragmentShader
+      .replace("#include <common>", "#include <common>\n" + HATCH_HEAD)
+      .replace("#include <opaque_fragment>", "#include <opaque_fragment>\n" + HATCH_BODY);
+  };
+  return m;
+}
+
+// Normals for the outline pass, with the same seam so edges line up.
+function normalMat(seam) {
+  return new THREE.ShaderMaterial({
+    uniforms: { uSeam: { value: seam ? SEAM : NOSEAM } },
+    side: THREE.DoubleSide,
+    vertexShader: SEAM_GLSL + `
+      varying vec3 vN;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        wp.xyz += vec3(seamK(wp.xyz));
+        vN = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }`,
+    fragmentShader: `varying vec3 vN; void main() { gl_FragColor = vec4(normalize(vN) * 0.5 + 0.5, 1.0); }`,
+  });
+}
+const NORMAL = normalMat(false), NORMAL_SEAM = normalMat(true);
+
+const WATER_VERT = SEAM_GLSL + `
+  uniform vec3 uFlow; uniform float uBend; uniform float uFallH;
+  varying vec3 vWPos; varying vec2 vUv; varying float vDrop;
+  void main() {
+    vUv = uv;
+    vec4 wp = modelMatrix * vec4(position, 1.0);
+    // A falling sheet arcs out from the lip the way a dropped koi does.
+    vDrop = (1.0 - uv.y) * uFallH;
+    wp.xyz += uFlow * uBend * sqrt(max(vDrop, 0.0));
+    vWPos = wp.xyz;
+    wp.xyz += vec3(seamK(wp.xyz));
+    gl_Position = projectionMatrix * viewMatrix * wp;
+  }`;
+const WATER_HEAD = `
+  uniform vec3 uPaper; uniform vec3 uInk; uniform float uPx; uniform float uLine; uniform float uTime;
+  varying vec3 vWPos; varying vec2 vUv; varying float vDrop;
+  ${HL_GLSL}
+  const vec3 TINT = vec3(0.84, 0.93, 0.92);
+  // One set of engraved flow lines for pools and troughs. uOut describes the trough that
+  // leaves this pool (or this trough): axis (0 = x), direction, where it starts, its centre line.
+  // In a pool the lines lie level; over the last stretch before the outlet they bend into the
+  // trough's direction, and in the trough they break into dashes that ride the current.
+  // Pool and trough evaluate the same function, so the lines run on across the join.
+  uniform vec4 uOut;
+  float flowInk(vec2 p, float extra, out float along, out float across) {
+    float ax = 1.0 - step(0.5, uOut.x);
+    along = mix(p.y, p.x, ax) * uOut.y;
+    across = mix(p.x, p.y, ax);
+    float fromStart = along - uOut.z * uOut.y;
+    float lat = abs(across - uOut.w);
+    float swell = (sin(p.x * 2.2 + uTime * 0.7) + sin(p.y * 2.9 - uTime * 0.9 + p.x * 1.4)) * 0.018;
+    float shimmer = sin(p.x * 3.1 + uTime * 0.8) * sin(p.y * 2.7 - uTime * 0.6) * 0.5 + 0.5;
+    float inPool = clamp(-fromStart / 0.3, 0.0, 1.0);
+    float w = smoothstep(-0.9, 0.0, fromStart) * (1.0 - smoothstep(0.3, 1.0, lat) * inPool);
+    // Both line families are measured from the outlet, so they agree where they blend
+    // and the bend stays evenly spaced.
+    vec2 o = mix(vec2(uOut.w, uOut.z), vec2(uOut.z, uOut.w), ax);
+    float psiPool = dot(p - o, vec2(0.7071)) + swell + extra * (1.0 - w);
+    float psiRun = across - uOut.w + sin(along * 6.0 - uTime * 4.5 + across * 9.0) * 0.008;
+    float lc = mix(psiPool, psiRun, w) * uPx / (uLine * 1.2);
+    float line = hl(lc, mix(0.04 + 0.13 * shimmer, 0.11, w));
+    // Broken into crisp dashes travelling at 0.75 units a second, the koi's current.
+    float da = along * 0.9 - uTime * 0.675 + hash(floor(lc));
+    float f = fract(da), aa = max(fwidth(da), 1e-4);
+    float dash = (1.0 - smoothstep(0.62 - aa, 0.62 + aa, f)) * smoothstep(0.0, aa * 2.0, f);
+    return line * mix(1.0, dash, smoothstep(0.0, 0.6, fromStart)) * 0.7;
+  }
+`;
+function waterMat(kind, extra, seam) {
+  const frag = {
+    pool: `
+      uniform vec3 uRip; uniform vec4 uKoi[8]; uniform vec4 uIn;
+      void main() {
+        vec2 p = vWPos.xz;
+        float d = length(p - uRip.xy);
+        // Landing waves and koi wakes bend the engraved lines.
+        float off = sin(d * 13.0 - uTime * 5.5) * exp(-d * 1.8) * 0.045 * uRip.z;
+        for (int i = 0; i < 8; i++) {
+          vec4 k = uKoi[i];
+          if (k.w < 0.5) continue;
+          float dk = length(p - k.xy);
+          off += sin(dk * 34.0 - uTime * 9.0) * exp(-dk * 7.0) * 0.024 * k.z;
+        }
+        float along, across;
+        float ink = flowInk(p, off, along, across);
+        // Foam where the fall lands: a churning white patch as wide as the sheet.
+        float inAx = 1.0 - step(0.5, uIn.x);
+        vec2 lp = p - uRip.xy;
+        float dAl = mix(lp.y, lp.x, inAx), dAc = mix(lp.x, lp.y, inAx);
+        float churn = vnoise(p * 14.0 + vec2(uTime * 1.7, -uTime * 1.3));
+        float fd = length(vec2(dAl * 1.5, max(abs(dAc) - uIn.y * 0.85, 0.0))) + (churn - 0.5) * 0.07;
+        float foam = (1.0 - smoothstep(0.02, 0.21, fd)) * uRip.z;
+        ink *= 1.0 - foam * 0.9;
+        ink = max(ink, foam * smoothstep(0.6, 0.72, vnoise(p * 30.0 + vec2(-uTime * 2.3, uTime * 1.9))) * 0.55);
+        // Rings spreading out from the edge of the foam.
+        float rr = fract(d * 2.6 - uTime * 0.85);
+        ink = max(ink, (1.0 - smoothstep(0.0, 0.1, abs(rr - 0.5))) * exp(-d * 1.5) * uRip.z * 0.8 * (1.0 - foam));
+        // Bubbles drifting off the foam.
+        vec2 cell = floor(p / 0.07);
+        float seed = hash2(cell);
+        float life = fract(uTime * 1.3 + seed);
+        float born = hash2(cell + floor(uTime * 1.3 + seed) * 7.13);
+        float near = 1.0 - smoothstep(0.0, 0.45, fd);
+        float bub = step(1.0 - near * 0.8, born);
+        float rad = length(fract(p / 0.07) - 0.5);
+        ink = max(ink, bub * (1.0 - smoothstep(0.05, 0.12, abs(rad - (0.08 + 0.28 * life)))) * (1.0 - life) * 0.85 * uRip.z);
+        vec3 base = mix(uPaper * TINT, uPaper * 1.02, foam * 0.85);
+        gl_FragColor = vec4(mix(base, uInk, ink), 0.9);
+      }`,
+    run: `
+      uniform vec2 uSpan; uniform vec4 uKoi[8];
+      void main() {
+        float along, across;
+        float ink = flowInk(vWPos.xz, 0.0, along, across);
+        // Glassy bands as it speeds toward the lip.
+        float lip = 1.0 - smoothstep(0.0, 0.6, uSpan.y - along);
+        ink = max(ink, hl(along * 7.0 - uTime * 2.6, 0.05 + 0.12 * lip) * lip * 0.55);
+        // V wakes behind koi riding the current.
+        for (int i = 0; i < 8; i++) {
+          vec4 k = uKoi[i];
+          if (k.w < 0.5) continue;
+          float rel = along - k.x, lat = across - k.y;
+          if (rel < 0.0 && rel > -0.7) {
+            float v = abs(abs(lat) + rel * 0.42);
+            ink = max(ink, (1.0 - smoothstep(0.006, 0.02, v)) * (1.0 + rel / 0.7) * 0.68);
+          }
+        }
+        gl_FragColor = vec4(mix(uPaper * TINT, uInk, ink), 0.9);
+      }`,
+    fall: `
+      uniform float uAxis;
+      void main() {
+        float across = uAxis < 0.5 ? vWPos.z : vWPos.x;
+        float wav = sin(vDrop * 9.0 - uTime * 7.0 + across * 5.0) * 0.01;
+        float lc = (across + wav) * uPx / (uLine * 1.05);
+        float h = hash(floor(lc));
+        // Streaks speed up as they fall.
+        float f = fract(sqrt(vDrop + 0.02) * 3.2 - uTime * 1.8 + h);
+        float dash = smoothstep(0.05, 0.2, f) * (1.0 - smoothstep(0.5, 0.8, f));
+        float edge = 1.0 - smoothstep(0.0, 0.07, min(vUv.x, 1.0 - vUv.x) + sin(vDrop * 14.0 - uTime * 6.0) * 0.012);
+        float foam = 1.0 - smoothstep(0.0, 0.32, vUv.y);
+        float ink = max(hl(lc, 0.08 + 0.08 * (1.0 - vUv.y)) * dash * (1.0 - foam), edge * 0.85 * (1.0 - foam * 0.9));
+        // The foot of the sheet turns to the pool's foam and melts into it along a ragged edge.
+        float melt = smoothstep(0.0, 0.22, vUv.y + (vnoise(vec2(across * 28.0, uTime * 2.5)) - 0.5) * 0.16);
+        vec3 water = mix(uPaper * vec3(0.97, 1.0, 1.0) * 1.03, uPaper * 1.02, foam);
+        gl_FragColor = vec4(mix(water, uInk, ink * 0.8), mix(0.97, 0.74, vUv.y) * melt);
+      }`,
+  }[kind];
+  return new THREE.ShaderMaterial({
+    uniforms: { ...shared, uSeam: { value: seam ? SEAM : NOSEAM }, uOut: { value: new THREE.Vector4(0, 1, 1e4, 0) }, uIn: { value: new THREE.Vector4(0, 0.3, 0, 0) },
+      uFlow: { value: new THREE.Vector3() }, uBend: { value: 0 }, uFallH: { value: 0 }, ...extra },
+    vertexShader: WATER_VERT,
+    fragmentShader: WATER_HEAD + frag,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Scene.
+// ---------------------------------------------------------------------------
+const scene = new THREE.Scene();
+const solids = [];
+const waters = [];
+
+function box(x0, x1, y0, y1, z0, z1, mat, seam) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(x1 - x0, y1 - y0, z1 - z0), mat);
+  m.position.set((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
+  m.castShadow = true; m.receiveShadow = true;
+  m.userData.nmat = seam ? NORMAL_SEAM : NORMAL;
+  scene.add(m); solids.push(m);
+  return m;
+}
+function flat(w, d, x, y, z, mat) {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, d), mat);
+  m.rotation.x = -Math.PI / 2;
+  m.position.set(x, y, z);
+  scene.add(m); waters.push(m);
+  return m;
+}
+
+const stone = hatchMat({ brick: 1 });
+const coping = hatchMat({ brick: 0.6 });
+const floorMat = hatchMat({ tone: 0.9 });
+const seamStone = hatchMat({ brick: 1, seam: true });
+const seamCoping = hatchMat({ brick: 0.6, seam: true });
+
+const koiSlots = () => Array.from({ length: 8 }, () => new THREE.Vector4());
+const outlet = (b) => new THREE.Vector4(b.out.axis === "x" ? 0 : 1, b.out.dir,
+  (b.out.axis === "x" ? b.x : b.z) + b.out.dir * (S / 2 - RW), b.out.axis === "x" ? b.z : b.x);
+const h = S / 2;
+basins.forEach((b, i) => {
+  const floorY = b.top - WH;
+  const winTop = floorY - 1.05;
+  box(b.x - h, b.x + h, BOTTOM, floorY, b.z - h, b.z + h, hatchMat({ brick: 1, arch: [b.x, b.z, winTop, 1] }));
+  box(b.x - h + RW, b.x + h - RW, floorY, floorY + 0.02, b.z - h + RW, b.z + h - RW, floorMat);
+  // Rim walls, with a gap where the water leaves.
+  const gap = (axis, dir) => b.out.axis === axis && b.out.dir === dir;
+  const wallX = (x0, x1, dir) => {
+    if (gap("x", dir)) {
+      box(x0, x1, floorY, b.top, b.z - h, b.z - CW / 2, coping);
+      box(x0, x1, floorY, b.top, b.z + CW / 2, b.z + h, coping);
+    } else box(x0, x1, floorY, b.top, b.z - h, b.z + h, coping);
+  };
+  const wallZ = (z0, z1, dir) => {
+    if (gap("z", dir)) {
+      box(b.x - h + RW, b.x - CW / 2, floorY, b.top, z0, z1, coping);
+      box(b.x + CW / 2, b.x + h - RW, floorY, b.top, z0, z1, coping);
+    } else box(b.x - h + RW, b.x + h - RW, floorY, b.top, z0, z1, coping);
+  };
+  wallX(b.x - h, b.x - h + RW, -1);
+  wallX(b.x + h - RW, b.x + h, 1);
+  wallZ(b.z - h, b.z - h + RW, -1);
+  wallZ(b.z + h - RW, b.z + h, 1);
+  b.waterY = b.top - WATER;
+  b.rip = { value: new THREE.Vector3(b.x, b.z, 1) };
+  const pool = flat(S - 2 * RW, S - 2 * RW, b.x, b.waterY, b.z, waterMat("pool", { uRip: b.rip, uKoi: { value: koiSlots() }, uOut: { value: outlet(b) } }, false));
+  pool.renderOrder = 1;
+  pool.userData.nmat = NORMAL;
+  b.poolMat = pool.material;
+});
+
+// Troughs between basins, with a waterfall off each end.
+const rivers = [];
+// Koi fall forward at 0.45 a second under gravity 7, so the sheet's arc is 0.45 * sqrt(2 * drop / 7).
+const FALL_BEND = 0.45 * Math.sqrt(2 / 7);
+basins.forEach((b, i) => { b.i = i; });
+basins.forEach((f, i) => {
+  const t = i < 3 ? basins[i + 1] : ghost;
+  const into = i < 3 ? t : basins[0];
+  const seam = i === 3;
+  const { axis, dir } = f.out;
+  const wl = f.top - WATER;
+  const fTop = wl - 0.1, fBot = wl - 0.22, wTop = f.top;
+  const c0 = (axis === "x" ? f.x : f.z) + dir * (h - RW);
+  const c1 = (axis === "x" ? t.x : t.z) - dir * (h - OVER);
+  const lo = Math.min(c0, c1), hi = Math.max(c0, c1), mid = (lo + hi) / 2, len = hi - lo;
+  const cross = axis === "x" ? f.z : f.x;
+  // The seam ramps over exactly this trough's length, so everything in it shifts alike.
+  if (seam) SEAM.set(1, c0, c1, SHIFT);
+  const sm = seam ? seamStone : stone, cm = seam ? seamCoping : coping;
+  const part = (a0, a1, y0, y1, b0, b1, m) =>
+    axis === "x" ? box(a0, a1, y0, y1, cross + b0, cross + b1, m, seam) : box(cross + b0, cross + b1, y0, y1, a0, a1, m, seam);
+  part(lo, hi, fBot, fTop, -CW / 2, CW / 2, cm);
+  { const r0 = (axis === "x" ? f.x : f.z) + dir * (h - RW), r1 = (axis === "x" ? f.x : f.z) + dir * h;
+    part(Math.min(r0, r1), Math.max(r0, r1), f.top - WH, fBot, -CW / 2, CW / 2, cm); }
+  part(lo, hi, fTop, wTop, -CW / 2, -CW / 2 + CT, cm);
+  part(lo, hi, fTop, wTop, CW / 2 - CT, CW / 2, cm);
+  // A pier under the middle of the run.
+  part(mid - 0.22, mid + 0.22, BOTTOM, fBot - 0.03, -0.22, 0.22, sm);
+  // Running water.
+  const inner = CW - 2 * CT;
+  const run = flat(axis === "x" ? len : inner, axis === "x" ? inner : len,
+    axis === "x" ? mid : cross, wl, axis === "x" ? cross : mid,
+    waterMat("run", { uAxis: { value: axis === "x" ? 0 : 1 }, uDir: { value: dir },
+      uSpan: { value: new THREE.Vector2(c0 * dir, c1 * dir) }, uKoi: { value: koiSlots() }, uOut: { value: outlet(f) } }, seam));
+  run.renderOrder = 2;
+  run.userData.nmat = seam ? NORMAL_SEAM : NORMAL;
+  // The fall.
+  const tw = t.top - WATER, fh = wl - tw;
+  const fall = new THREE.Mesh(new THREE.PlaneGeometry(inner, fh, 1, 14), waterMat("fall", {
+    uAxis: { value: axis === "x" ? 0 : 1 }, uBend: { value: FALL_BEND }, uFallH: { value: fh },
+    uFlow: { value: new THREE.Vector3(axis === "x" ? dir : 0, 0, axis === "z" ? dir : 0) },
+  }, seam));
+  if (axis === "x") { fall.rotation.y = Math.PI / 2; fall.position.set(c1, (wl + tw) / 2, cross); }
+  else fall.position.set(cross, (wl + tw) / 2, c1);
+  fall.renderOrder = 3;
+  scene.add(fall); waters.push(fall);
+  // Where it lands, in the basin it really lands in.
+  const sx = seam ? SHIFT : 0;
+  const reach = FALL_BEND * Math.sqrt(fh);
+  const land = axis === "x" ? [c1 + dir * reach + sx, cross + sx] : [cross + sx, c1 + dir * reach + sx];
+  into.rip.value.set(land[0], land[1], 1);
+  into.poolMat.uniforms.uIn.value.set(axis === "x" ? 0 : 1, inner / 2, 0, 0);
+  rivers[i] = { i, runMat: run.material, axis, dir, cross, c0, c1, len, wl, tw, seam, next: (i + 1) % 4, current: 0.75,
+    angle: axis === "x" ? (dir > 0 ? 0 : Math.PI) : (dir > 0 ? Math.PI / 2 : -Math.PI / 2) };
+});
+
+// Escher's polyhedra on two corner posts.
+{
+  const b0 = basins[0], cx = b0.x - h + RW / 2, cz = b0.z - h + RW / 2;
+  box(cx - 0.12, cx + 0.12, b0.top, b0.top + 0.55, cz - 0.12, cz + 0.12, coping);
+  const g = new THREE.Group();
+  for (const r of [[Math.PI / 4, 0, 0], [0, Math.PI / 4, 0], [0, 0, Math.PI / 4]]) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), hatchMat());
+    m.rotation.set(...r); m.castShadow = true; m.receiveShadow = true; m.userData.nmat = NORMAL;
+    g.add(m); solids.push(m);
+  }
+  g.position.set(cx, b0.top + 0.55 + 0.24, cz);
+  scene.add(g);
+}
+{
+  const b1 = basins[1], cx = b1.x + h - RW / 2, cz = b1.z - h + RW / 2;
+  box(cx - 0.12, cx + 0.12, b1.top, b1.top + 0.5, cz - 0.12, cz + 0.12, coping);
+  const g = new THREE.Group();
+  for (const ry of [0, Math.PI / 2]) {
+    const m = new THREE.Mesh(new THREE.TetrahedronGeometry(0.24), hatchMat());
+    m.rotation.y = ry; m.castShadow = true; m.receiveShadow = true; m.userData.nmat = NORMAL;
+    g.add(m); solids.push(m);
+  }
+  g.position.set(cx, b1.top + 0.5 + 0.2, cz);
+  scene.add(g);
+}
+
+// Small koi, two to a pool.
+const KOI_BODY = new THREE.SphereGeometry(1, 18, 10);
+const KOI_TAIL = (() => {
+  const s = new THREE.Shape();
+  s.moveTo(0, 0); s.lineTo(-0.15, 0.08); s.lineTo(-0.11, 0); s.lineTo(-0.15, -0.08); s.lineTo(0, 0);
+  const g = new THREE.ShapeGeometry(s);
+  g.rotateX(-Math.PI / 2);
+  return g;
+})();
+const KOI_COLORS = [
+  { body: [1.04, 1.04, 1.05], spot: [1.0, 0.45, 0.3] },
+  { body: [1.06, 0.66, 0.4] },
+  { body: [1.06, 0.88, 0.5] },
+  { body: [1.04, 1.04, 1.05], spot: [0.98, 0.36, 0.26] },
+  { body: [1.06, 0.7, 0.45], spot: [1.04, 1.04, 1.05] },
+  { body: [1.04, 1.04, 1.05], spot: [1.0, 0.5, 0.32] },
+  { body: [1.06, 0.88, 0.5] },
+  { body: [1.06, 0.66, 0.4], spot: [1.04, 1.04, 1.05] },
+];
+const koi = [];
+basins.forEach((b, i) => {
+  for (let k = 0; k < 2; k++) {
+    const c = KOI_COLORS[(i * 2 + k) % KOI_COLORS.length];
+    const g = new THREE.Group();
+    let add = (geo, mat, s, p) => {
+      const m = new THREE.Mesh(geo, mat);
+      if (s) m.scale.set(...s);
+      if (p) m.position.set(...p);
+      m.userData.nmat = NORMAL; m.castShadow = false; m.receiveShadow = true;
+      solids.push(m);
+      return m;
+    };
+    const len = rand(0.9, 1.1), meshes = [];
+    const add0 = add;
+    add = (...a) => { const mm = add0(...a); meshes.push(mm); return mm; };
+    g.add(add(KOI_BODY, hatchMat({ tint: c.body, inkK: 0.45 }), [0.2 * len, 0.045, 0.07 * len]));
+    if (c.spot) g.add(add(KOI_BODY, hatchMat({ tint: c.spot, inkK: 0.45 }), [0.08 * len, 0.047, 0.055 * len], [0.06 * len, 0.002, rand(-0.01, 0.01)]));
+    const tail = new THREE.Group();
+    tail.position.x = -0.18 * len;
+    tail.add(add(KOI_TAIL, hatchMat({ tint: c.body, inkK: 0.45, side: THREE.DoubleSide }), [len, 1, len]));
+    g.add(tail);
+    const m = S / 2 - RW - 0.25;
+    const fish = { b, g, tail, meshes, x: b.x + rand(-m, m), y: b.waterY + 0.012, z: b.z + rand(-m, m), a: rand(0, Math.PI * 2), speed: 0, cruise: rand(0.3, 0.42),
+      phase: rand(0, 6), target: null, retarget: 0, m, state: "pool", dwell: rand(1, 14), pitch: 0, s: 0, vy: 0, vz: 0, off: 0, wig: 0.15, lined: false, leapAt: -1 };
+    g.rotation.order = "YZX";
+    g.position.set(fish.x, fish.y, fish.z);
+    scene.add(g);
+    koi.push(fish);
+  }
+});
+
+function setSeam(f, on) {
+  for (const m of f.meshes) { m.material.userData.own.uSeam.value = on ? SEAM : NOSEAM; m.userData.nmat = on ? NORMAL_SEAM : NORMAL; }
+}
+
+// A koi lingers in its pool, heads for the outlet, rides the trough and drops into the next pool.
+function stepKoi(f, dt) {
+  f.phase += dt * (5 + f.speed * 8);
+  f.tail.rotation.y = Math.sin(f.phase) * 0.45;
+  if (f.state === "river") {
+    const r = rivers[f.b.i];
+    f.speed += (r.current - f.speed) * Math.min(1, dt * 2);
+    f.s += f.speed * dt;
+    // Drift from wherever it came in toward a gentle weave down the middle.
+    f.off += (Math.sin(f.phase * 0.35) * 0.07 - f.off) * Math.min(1, dt * 2.5);
+    const along = r.c0 + r.dir * f.s, side = r.cross + f.off;
+    if (r.axis === "x") { f.x = along; f.z = side; } else { f.x = side; f.z = along; }
+    f.y = r.wl + 0.012;
+    f.a += clamp(wrapAngle(r.angle - f.a), -3 * dt, 3 * dt);
+    if (f.leapAt >= 0 && f.s >= f.leapAt) { f.state = "leap"; f.vy = 2.7; f.vz = 1.2; f.leapAt = -1; }
+    else if (r.dir * (along - r.c1) >= 0) { f.state = "fall"; f.vy = 0; }
+  } else if (f.state === "leap") {
+    // Now and then a koi in the front trough gets ideas, clears the near lip, and is
+    // never seen again. It carries a little of the current, turns toward the edge,
+    // noses up, then down, and falls out of the picture.
+    const r = rivers[f.b.i];
+    f.a += clamp(wrapAngle(Math.PI / 2 - f.a), -7 * dt, 7 * dt);
+    f.speed *= Math.max(0, 1 - dt * 1.5);
+    f.x += r.dir * f.speed * dt;
+    f.z += f.vz * dt;
+    f.vy -= 7 * dt;
+    f.y += f.vy * dt;
+    f.pitch += ((f.vy > 0 ? 0.7 : -1.2) - f.pitch) * Math.min(1, dt * 4);
+    if (f.y < -5) {
+      // Gone into the paper. It washes up later under the fall into the next pool.
+      const b = basins[r.next];
+      f.b = b; f.x = b.rip.value.x; f.z = b.rip.value.y; f.y = b.waterY + 0.012;
+      f.state = "pool"; f.dwell = rand(10, 20); f.target = null; f.lined = false; f.speed = 0.3; f.pitch = 0; f.vz = 0;
+    }
+  } else if (f.state === "fall") {
+    const r = rivers[f.b.i];
+    if (r.axis === "x") f.x += r.dir * 0.45 * dt; else f.z += r.dir * 0.45 * dt;
+    f.vy -= 7 * dt;
+    f.y += f.vy * dt;
+    f.pitch = Math.max(-1.1, f.pitch - dt * 4);
+    if (f.y <= r.tw + 0.012) {
+      // Landing. Out of the last trough, the ghost basin is the first basin, one view line away.
+      if (r.seam) { f.x += SHIFT; f.z += SHIFT; setSeam(f, false); }
+      f.b = basins[r.next];
+      f.y = f.b.waterY + 0.012;
+      f.state = "pool"; f.dwell = rand(6, 14); f.target = null; f.lined = false; f.speed = 0.5;
+    }
+  } else {
+    const b = f.b, m = f.m, out = b.out;
+    f.dwell -= dt;
+    if (f.state === "pool" && f.dwell <= 0) { f.state = "leave"; f.target = null; f.lined = false; }
+    f.pitch += (0 - f.pitch) * Math.min(1, dt * 5);
+    const leaving = f.state === "leave";
+    const exitAlong = (out.axis === "x" ? b.x : b.z) + out.dir * (S / 2 - RW);
+    const exit = out.axis === "x" ? { x: exitAlong, z: b.z } : { x: b.x, z: exitAlong };
+    f.retarget -= dt;
+    if (leaving) {
+      // Line up in front of the outlet first, so it swims in straight.
+      const back = exitAlong - out.dir * 0.45;
+      const approach = out.axis === "x" ? { x: back, z: b.z } : { x: b.x, z: back };
+      if (!f.lined && Math.hypot(approach.x - f.x, approach.z - f.z) < 0.15) f.lined = true;
+      f.target = f.lined ? exit : approach;
+    }
+    else if (!f.target || f.retarget <= 0 || Math.hypot(f.target.x - f.x, f.target.z - f.z) < 0.1) {
+      f.target = { x: b.x + rand(-m, m), z: b.z + rand(-m, m) };
+      f.retarget = rand(3, 7);
+    }
+    let sx = f.target.x - f.x, sz = f.target.z - f.z;
+    const sd = Math.hypot(sx, sz) || 1; sx /= sd; sz /= sd;
+    for (const o of koi) {
+      if (o === f || o.b !== b || o.state === "river" || o.state === "fall" || o.state === "leap") continue;
+      const d = Math.hypot(f.x - o.x, f.z - o.z);
+      if (d > 0 && d < 0.4) { const k = (1 - d / 0.4) * 1.4; sx += ((f.x - o.x) / d) * k; sz += ((f.z - o.z) / d) * k; }
+    }
+    if (!leaving) {
+      if (Math.abs(f.x - b.x) > m * 0.85) sx -= Math.sign(f.x - b.x) * 1.5;
+      if (Math.abs(f.z - b.z) > m * 0.85) sz -= Math.sign(f.z - b.z) * 1.5;
+    }
+    f.a += clamp(wrapAngle(Math.atan2(sz, sx) - f.a), -2.4 * dt, 2.4 * dt);
+    f.speed += ((leaving ? (f.lined ? 0.45 : 0.55) : f.cruise) - f.speed) * Math.min(1, dt * 2);
+    const heading = f.a + Math.sin(f.phase) * 0.15;
+    f.x += Math.cos(heading) * f.speed * dt;
+    f.z += Math.sin(heading) * f.speed * dt;
+    // Stay in the pool; a koi on its way out may swim into the outlet.
+    const lim = S / 2 - RW - 0.06;
+    const mx = leaving && out.axis === "x" ? lim : m, mz = leaving && out.axis === "z" ? lim : m;
+    f.x = clamp(f.x, b.x - mx, b.x + mx);
+    f.z = clamp(f.z, b.z - mz, b.z + mz);
+    if (leaving && f.lined && Math.hypot(exit.x - f.x, exit.z - f.z) < 0.2) {
+      const r = rivers[b.i];
+      f.state = "river";
+      // Only the front trough tempts them, about one ride in four, somewhere in the middle.
+      f.leapAt = r.i === 2 && Math.random() < 0.25 ? rand(0.3, 0.7) * r.len : -1;
+      f.s = r.dir * ((out.axis === "x" ? f.x : f.z) - r.c0);
+      f.off = (out.axis === "x" ? f.z : f.x) - r.cross;
+      if (r.seam) setSeam(f, true);
+    }
+  }
+  f.g.position.set(f.x, f.y, f.z);
+  f.wig += ((f.state === "pool" || f.state === "leave" ? 0.15 : 0.08) - f.wig) * Math.min(1, dt * 2);
+  f.g.rotation.set(0, -(f.a + Math.sin(f.phase) * f.wig), f.pitch);
+}
+
+// ---------------------------------------------------------------------------
+// Light, camera, passes.
+// ---------------------------------------------------------------------------
+const center = new THREE.Vector3((A + (A - B)) / 2 * 0.5 + A / 4, TOP - 2 * DROP, A / 2);
+scene.add(new THREE.AmbientLight(0xffffff, Math.PI * 0.36));
+const sun = new THREE.DirectionalLight(0xffffff, Math.PI * 0.78);
+sun.position.copy(center).add(new THREE.Vector3(-4.5, 12, 8.5));
+sun.target.position.copy(center);
+scene.add(sun, sun.target);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -11, right: 11, top: 11, bottom: -11, near: 1, far: 50 });
+sun.shadow.bias = -0.0006;
+sun.shadow.normalBias = 0.02;
+
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 120);
+camera.position.copy(center).add(new THREE.Vector3(40, 40, 40));
+camera.up.set(0, 1, 0);
+camera.lookAt(center);
+camera.updateMatrixWorld();
+
+// Frame the loop; the lower towers run off into the paper.
+const frame = (() => {
+  const pts = [], v = new THREE.Vector3(), yMin = basins[3].top - WH - 1.2;
+  for (const m of solids) {
+    const bb = new THREE.Box3().setFromObject(m);
+    for (const x of [bb.min.x, bb.max.x]) for (const y of [bb.min.y, bb.max.y]) for (const z of [bb.min.z, bb.max.z]) {
+      v.set(x, Math.max(y, yMin), z).applyMatrix4(camera.matrixWorldInverse);
+      pts.push([v.x, v.y]);
+    }
+  }
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  return { x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+})();
+
+let rtColor, rtNormal;
+const post = new THREE.ShaderMaterial({
+  uniforms: {
+    tColor: { value: null }, tNormal: { value: null }, tDepth: { value: null },
+    uTexel: { value: new THREE.Vector2() }, uPaper: shared.uPaper, uInk: shared.uInk,
+  },
+  vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: `
+    uniform sampler2D tColor; uniform sampler2D tNormal; uniform sampler2D tDepth;
+    uniform vec2 uTexel; uniform vec3 uPaper; uniform vec3 uInk;
+    varying vec2 vUv;
+    void main() {
+      vec3 c = texture2D(tColor, vUv).rgb;
+      vec3 n0 = texture2D(tNormal, vUv).rgb;
+      float d0 = texture2D(tDepth, vUv).r;
+      float e = 0.0;
+      for (int i = 0; i < 4; i++) {
+        vec2 o = i == 0 ? vec2(uTexel.x, 0.0) : i == 1 ? vec2(-uTexel.x, 0.0) : i == 2 ? vec2(0.0, uTexel.y) : vec2(0.0, -uTexel.y);
+        vec3 n = texture2D(tNormal, vUv + o).rgb;
+        float d = texture2D(tDepth, vUv + o).r;
+        e = max(e, smoothstep(0.22, 0.42, length(n - n0)));
+        e = max(e, smoothstep(0.0015, 0.003, abs(d - d0)));
+      }
+      if (d0 > 0.99999 && length(c - uPaper) > 0.0 && c.g < 0.5) c = uPaper;
+      c = mix(c, uInk, e * 0.9);
+      c = mix(uPaper, c, smoothstep(0.0, 0.3, vUv.y));
+      gl_FragColor = vec4(c, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+const postScene = new THREE.Scene();
+postScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), post));
+const postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth, hgt = canvas.clientHeight;
+  if (!w || !hgt) return;
+  renderer.setPixelRatio(dpr);
+  renderer.setSize(w, hgt, false);
+  const W = Math.round(w * dpr), H = Math.round(hgt * dpr);
+  rtColor?.dispose(); rtNormal?.dispose();
+  rtColor = new THREE.WebGLRenderTarget(W, H, { samples: 4 });
+  rtNormal = new THREE.WebGLRenderTarget(W, H, { depthTexture: new THREE.DepthTexture(W, H) });
+  post.uniforms.tColor.value = rtColor.texture;
+  post.uniforms.tNormal.value = rtNormal.texture;
+  post.uniforms.tDepth.value = rtNormal.depthTexture;
+  post.uniforms.uTexel.value.set(1 / W, 1 / H);
+  // Fit the frame to the canvas, keeping square pixels.
+  const fw = frame.x1 - frame.x0, fh = frame.y1 - frame.y0, cx = (frame.x0 + frame.x1) / 2, cy = (frame.y0 + frame.y1) / 2;
+  const aspect = w / hgt, pad = 1.08;
+  let vw = fw * pad, vh = fh * pad;
+  if (vw / vh > aspect) vh = vw / aspect; else vw = vh * aspect;
+  camera.left = cx - vw / 2; camera.right = cx + vw / 2;
+  camera.top = cy + vh / 2 + vh * 0.04; camera.bottom = cy - vh / 2 + vh * 0.04;
+  camera.updateProjectionMatrix();
+  shared.uPx.value = H / vh;
+  shared.uDpr.value = dpr;
+  shared.uLine.value = 5.4 * dpr;
+  render();
+}
+
+const paperColor = new THREE.Color().setRGB(...PAPER, THREE.LinearSRGBColorSpace);
+function updateWater() {
+  for (const b of basins) {
+    const slots = b.poolMat.uniforms.uKoi.value;
+    let n = 0;
+    for (const f of koi) if (n < 8 && f.b === b && (f.state === "pool" || f.state === "leave")) slots[n++].set(f.x, f.z, clamp(f.speed / 0.45, 0, 1.2), 1);
+    while (n < 8) slots[n++].w = 0;
+  }
+  for (const r of rivers) {
+    const slots = r.runMat.uniforms.uKoi.value;
+    let n = 0;
+    for (const f of koi) if (n < 8 && f.state === "river" && f.b.i === r.i)
+      slots[n++].set((r.axis === "x" ? f.x : f.z) * r.dir, r.axis === "x" ? f.z : f.x, 1, 1);
+    while (n < 8) slots[n++].w = 0;
+  }
+}
+function render() {
+  if (!rtColor) return;
+  updateWater();
+  renderer.setClearColor(paperColor, 1);
+  camera.layers.enableAll();
+  renderer.setRenderTarget(rtColor);
+  renderer.render(scene, camera);
+  // Outline pass. Water surfaces count as solid here, so nothing under them gets outlined;
+  // falling water is left out.
+  for (const m of [...solids, ...waters]) {
+    if (m.userData.nmat) { m.userData.mat = m.material; m.material = m.userData.nmat; } else m.visible = false;
+  }
+  renderer.setClearColor(0x000000, 1);
+  renderer.setRenderTarget(rtNormal);
+  renderer.render(scene, camera);
+  for (const m of [...solids, ...waters]) {
+    if (m.userData.nmat) m.material = m.userData.mat; else m.visible = true;
+  }
+  renderer.setRenderTarget(null);
+  renderer.render(postScene, postCam);
+}
+
+let last = performance.now(), running = false, visible = true, raf = 0;
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  shared.uTime.value += dt;
+  for (const f of koi) stepKoi(f, dt);
+  render();
+  raf = requestAnimationFrame(tick);
+}
+function start() { if (!running && !reduce && visible && !document.hidden) { running = true; last = performance.now(); raf = requestAnimationFrame(tick); } }
+function stop() { running = false; cancelAnimationFrame(raf); }
+
+for (let i = 0; i < 60; i++) for (const f of koi) stepKoi(f, 1 / 30);
+shared.uTime.value = 3;
+new ResizeObserver(resize).observe(canvas);
+new IntersectionObserver(([e]) => { visible = e.isIntersecting; visible ? start() : stop(); }).observe(canvas);
+document.addEventListener("visibilitychange", () => (document.hidden ? stop() : start()));
+resize();
+canvas.classList.add("ready");
+start();
+</script>
+</body>
+</html>

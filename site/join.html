@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join a lembas circle</title>
+<meta name="description" content="Open your invite to a lembas circle: download the app, then join.">
+<meta name="robots" content="noindex">
+<!-- The invite rides in the URL fragment, which never leaves the browser. Nothing here
+     may send it anywhere: no referrer, no scripts or requests beyond this page, and the
+     invite is never written into an attribute a stylesheet could match. -->
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="theme-color" content="#ECE6D8">
+<link rel="icon" type="image/png" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #ECE6D8;
+    --ink: #2A251E;
+    --muted: #5A544A;
+    --dim: #857E70;
+    --chip: #E3DCCB;
+    --line: rgba(42, 37, 30, 0.2);
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "Geist", system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 24px;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, p { margin: 0; }
+  a { color: inherit; }
+  [hidden] { display: none !important; }
+  :focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  .page {
+    min-height: 100vh; min-height: 100svh;
+    display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr auto; gap: 24px;
+    padding: 16px;
+  }
+  @media (min-width: 768px) { .page { padding: 24px; } }
+
+  .top { display: flex; justify-content: space-between; align-items: center; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-radius: 9999px;
+    background: var(--chip); border: 1px solid rgba(42, 37, 30, 0.08);
+    font-size: 14px; line-height: 20px; font-weight: 600; text-decoration: none;
+    transition: background-color 300ms var(--ease), border-color 300ms var(--ease);
+  }
+  .chip img { width: 20px; height: 20px; border-radius: 6px; }
+  a.chip:hover { background: #D9D1BE; border-color: rgba(42, 37, 30, 0.16); }
+
+  main { align-self: center; justify-self: center; width: 100%; max-width: 480px; padding: 32px 0; }
+  .view { text-align: center; }
+  .view > img { display: block; margin: 0 auto 24px; border-radius: 16px; }
+  h1 {
+    font-size: 36px; line-height: 40px; font-weight: 600; letter-spacing: -0.02em; text-wrap: balance;
+    overflow-wrap: anywhere;
+    background: linear-gradient(90deg, #000000, #666666);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .lead { margin-top: 16px; font-size: 18px; line-height: 28px; color: var(--muted); text-wrap: pretty; }
+
+  .steps { display: grid; gap: 12px; margin: 32px 0 0; padding: 0; list-style: none; text-align: left; }
+  .step {
+    display: flex; align-items: center; gap: 16px;
+    padding: 16px; border-radius: 16px; border: 1px solid var(--line);
+  }
+  .num {
+    flex: none; width: 32px; height: 32px; border-radius: 9999px;
+    display: grid; place-items: center;
+    background: var(--chip); font-size: 14px; line-height: 20px; font-weight: 600;
+  }
+  .what { flex: 1; min-width: 0; }
+  .what h2 { font-size: 16px; line-height: 24px; font-weight: 600; }
+  .what p { font-size: 14px; line-height: 20px; color: var(--muted); text-wrap: pretty; }
+
+  .btn {
+    flex: none; display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border: 0; border-radius: 8px; cursor: pointer;
+    background: var(--ink); color: var(--paper);
+    font: inherit; font-weight: 600; text-decoration: none;
+    transition: background-color 300ms var(--ease), transform 300ms var(--ease);
+  }
+  .btn:hover { background: #3D362C; transform: translateY(-2px); }
+  .btn:active { transform: scale(0.98); }
+  .btn svg { width: 20px; height: 20px; }
+  .btn.quiet { background: var(--chip); color: var(--ink); font-size: 14px; line-height: 20px; }
+  .btn.quiet:hover { background: #D9D1BE; }
+
+  .fine { margin-top: 16px; font-size: 14px; line-height: 20px; color: var(--dim); text-wrap: pretty; }
+  .notice {
+    margin-top: 24px; padding: 12px 16px; border-radius: 12px;
+    background: var(--chip); font-size: 14px; line-height: 20px; color: var(--ink); text-wrap: pretty;
+  }
+
+  .paste { margin-top: 32px; text-align: left; }
+  .paste label { display: block; margin-bottom: 8px; font-size: 14px; line-height: 20px; color: var(--muted); }
+  .field {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 8px 8px 16px; border-radius: 12px; border: 1px solid var(--line);
+  }
+  .field output {
+    flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    font-family: "Geist Mono", ui-monospace, monospace; font-size: 12px; line-height: 16px; color: var(--muted);
+  }
+
+  .view .btn.home { margin-top: 32px; }
+
+  .foot {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 16px;
+    font-size: 12px; line-height: 16px; color: var(--dim);
+  }
+  .foot a { text-decoration: none; transition: color 300ms var(--ease); }
+  .foot a:hover { color: var(--ink); }
+
+  .rise { opacity: 0; transform: translateY(32px); animation: rise 800ms var(--ease) forwards; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    .rise { animation: fade 300ms linear forwards; transform: none; }
+    @keyframes fade { to { opacity: 1; } }
+    .btn, .chip { transition: none; }
+    .btn:hover { transform: none; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="top">
+    <a class="chip" href="./"><img src="logo.png" alt="" width="20" height="20">lembas</a>
+    <a class="chip" href="https://github.com/bodino/lembas">GitHub</a>
+  </header>
+
+  <main id="main">
+    <!-- A valid invite: download, then join. -->
+    <section class="view" id="invited" hidden>
+      <img src="logo.png" alt="lembas logo" width="64" height="64">
+      <h1 id="title">You're invited to a lembas circle</h1>
+      <p class="lead">A circle is a few friends whose Macs back each other up. When one of you hits a Claude limit, a friend's spare capacity keeps you going.</p>
+
+      <p class="notice" id="not-mac" hidden>lembas is a Mac app. Open this link on your Mac to join.</p>
+
+      <ol class="steps">
+        <li class="step">
+          <span class="num" aria-hidden="true">1</span>
+          <div class="what">
+            <h2>Download lembas</h2>
+            <p>Unzip it, then open it.</p>
+          </div>
+          <a class="btn" href="https://github.com/bodino/lembas/releases/latest/download/lembas.zip">
+            <svg viewBox="0 0 256 256" fill="currentColor" aria-hidden="true"><path d="M224 144v64a8 8 0 0 1-8 8H40a8 8 0 0 1-8-8v-64a8 8 0 0 1 16 0v56h160v-56a8 8 0 0 1 16 0Zm-101.66 5.66a8 8 0 0 0 11.32 0l40-40a8 8 0 0 0-11.32-11.32L136 124.69V32a8 8 0 0 0-16 0v92.69L93.66 98.34a8 8 0 0 0-11.32 11.32Z"/></svg>
+            Download
+          </a>
+        </li>
+        <li class="step">
+          <span class="num" aria-hidden="true">2</span>
+          <div class="what">
+            <h2>Join the circle</h2>
+            <p>Opens lembas with your invite filled in.</p>
+          </div>
+          <button class="btn" id="join" type="button">Join</button>
+        </li>
+      </ol>
+
+      <p class="fine">First launch: macOS asks you to allow it under System Settings › Privacy &amp; Security › Open Anyway.</p>
+      <p class="fine" id="terms">Needs macOS 26 or later. The invite works once.</p>
+
+      <div class="paste">
+        <label id="paste-label">If Join does nothing, copy the invite and paste it into lembas.</label>
+        <div class="field">
+          <output id="link" aria-labelledby="paste-label"></output>
+          <button class="btn quiet" id="copy" type="button">Copy</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- An invite past its date. -->
+    <section class="view" id="expired" hidden>
+      <img src="logo.png" alt="lembas logo" width="64" height="64">
+      <h1>This invite has expired</h1>
+      <p class="lead">Invites last seven days. Ask your friend for a new one.</p>
+      <a class="btn home" href="./">About lembas</a>
+    </section>
+
+    <!-- No invite in the link, or one that doesn't read as an invite. -->
+    <section class="view" id="missing">
+      <img src="logo.png" alt="lembas logo" width="64" height="64">
+      <h1>This link has no invite in it</h1>
+      <p class="lead">It may have been cut short when it was copied. Ask your friend to send it again, or paste what you have straight into lembas.</p>
+      <noscript><p class="notice">This page needs JavaScript to read the invite. Without it, paste the whole link into lembas instead.</p></noscript>
+      <a class="btn home" href="./">About lembas</a>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <a href="https://github.com/bodino/lembas">Source on GitHub</a>
+    <a href="https://github.com/bodino/lembas/blob/main/LICENSE">MIT License</a>
+    <span>Not made or endorsed by Anthropic</span>
+  </footer>
+</div>
+
+<script>
+  // The link is …/join#invite=<base64url JSON>&from=<name>. The invite is the same
+  // payload as lembas://join/<payload>; the name is only for the greeting (anyone can
+  // write any name there, and lembas itself never trusts it).
+  (() => {
+    const show = (id) => {
+      for (const v of document.querySelectorAll(".view")) v.hidden = v.id !== id;
+      document.getElementById(id).classList.add("rise");
+    };
+
+    const params = new URLSearchParams(location.hash.slice(1));
+    const payload = params.get("invite") || "";
+    let invite = null;
+    if (/^[A-Za-z0-9_-]{16,4096}$/.test(payload)) {
+      try {
+        const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+        const parsed = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)));
+        if (parsed && typeof parsed === "object" && Number.isFinite(parsed.expires) && parsed.circle && parsed.inviter && parsed.secret) invite = parsed;
+      } catch { /* not an invite */ }
+    }
+    if (!invite) return show("missing");
+    if (invite.expires * 1000 < Date.now()) return show("expired");
+
+    const appLink = "lembas://join/" + payload;
+
+    // Shown as text only: letters, numbers, spaces and a few name marks, 48 at most.
+    const from = (params.get("from") || "").replace(/[^\p{L}\p{N} .'_-]/gu, "").trim().slice(0, 48);
+    if (from) {
+      document.getElementById("title").textContent = `${from} invited you to their circle`;
+      document.title = `${from} invited you to lembas`;
+    }
+
+    const until = new Date(invite.expires * 1000).toLocaleDateString(undefined, { day: "numeric", month: "long" });
+    document.getElementById("terms").textContent = `Needs macOS 26 or later. The invite works once, until ${until}.`;
+
+    // An iPad says it's a Mac but has a touch screen.
+    const mac = /Mac/.test(navigator.platform || navigator.userAgent) && !(navigator.maxTouchPoints > 1);
+    document.getElementById("not-mac").hidden = mac;
+
+    document.getElementById("link").textContent = appLink;
+    document.getElementById("join").addEventListener("click", () => { location.href = appLink; });
+
+    const copy = document.getElementById("copy");
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(appLink);
+        copy.textContent = "Copied";
+      } catch {
+        // No clipboard access: select the text so ⌘C works.
+        getSelection().selectAllChildren(document.getElementById("link"));
+        copy.textContent = "Press ⌘C";
+      }
+      setTimeout(() => { copy.textContent = "Copy"; }, 2000);
+    });
+
+    show("invited");
+  })();
+</script>
+</body>
+</html>

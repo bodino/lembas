@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Page not found · lembas</title>
+<meta name="robots" content="noindex">
+<link rel="icon" type="image/png" href="/lembas/logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;600&family=Geist+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root { --bg: #ECE6D8; --text: #2A251E; --muted: #5A544A; --cream: #2A251E; --leaf: #5A544A; --ease: cubic-bezier(0.22, 1, 0.36, 1); }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px 16px;
+    background: var(--bg); color: var(--text);
+    font-family: "Geist", system-ui, sans-serif; font-size: 16px; line-height: 24px;
+    -webkit-font-smoothing: antialiased; text-align: center;
+  }
+  main { max-width: 680px; }
+  img { margin: 0 auto 32px; border-radius: 16px; }
+  .code { font-family: "Geist Mono", monospace; font-size: 14px; line-height: 20px; color: var(--leaf); }
+  h1 {
+    margin: 16px 0 0; font-size: 36px; line-height: 40px; font-weight: 600; text-wrap: balance;
+    background: linear-gradient(90deg, #000000, #666666); -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  p { margin: 16px 0 0; color: var(--muted); text-wrap: pretty; }
+  a.btn {
+    display: inline-block; margin-top: 32px; padding: 8px 12px; border-radius: 8px;
+    background: var(--cream); color: var(--bg); font-weight: 600; text-decoration: none;
+    transition: background-color 300ms var(--ease), transform 300ms var(--ease);
+  }
+  a.btn:hover { background: #3D362C; transform: translateY(-2px); }
+  a.btn:active { transform: scale(0.98); }
+  a.btn:focus-visible { outline: 2px solid var(--leaf); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { a.btn { transition: none; } a.btn:hover { transform: none; } }
+</style>
+</head>
+<body>
+<main>
+  <img src="/lembas/logo.png" alt="lembas logo" width="64" height="64">
+  <div class="code">404</div>
+  <h1>This page wandered off</h1>
+  <p>The link may be old or mistyped. Everything about lembas is on the home page.</p>
+  <a class="btn" href="/lembas/">Back to lembas</a>
+</main>
+</body>
+</html>
