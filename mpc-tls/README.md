@@ -1,25 +1,35 @@
-# The spliced token record: helper for borrowed requests
+# lembas-mpc: the peer and its cryptography
 
-See `../docs/mpc-tls.md` for the design and findings.
+The Rust half of lembas: one binary, `lembas-mpc`, that each Mac's agent runs as its
+**peer**. The design is in [`../docs/mpc-tls.md`](../docs/mpc-tls.md) (the spliced token
+record and the limit proof) and [`../docs/p2p.md`](../docs/p2p.md) (circles and peers).
 
 ## What is here
 
-- `lembas-mpc/` — a standalone Cargo project on pinned git dependencies (TLSNotary's
-  multiplexer and test server, mpz for the zero-knowledge VM and oblivious transfer;
-  no fork, no patch). `src/splice.rs` has the primitives (the borrower is an
-  ordinary TLS 1.2 client over a relay through the pool; the pool inserts one record
-  per request, the one carrying the token, with its keystream proven in zero knowledge
-  by the borrower and its tag from the borrower's GHASH terms plus one share conversion
-  per token block), `src/session.rs` the protocol (one session, many connections, many
-  requests, one setup), `src/local.rs` the borrower's local HTTP proxy, `src/record.rs`
-  the local TLS 1.2 AES-GCM record layer, `src/lib.rs` the template policy and the link
-  plumbing, `src/main.rs` the `demo` binary (everything in one process, with checks),
-  `src/bin/lembas-mpc.rs` the `lembas-mpc` binary (pool, borrower, proxy, chat).
-- `requests/` — the request templates used so far: `echo.*` for tlsn's test server,
-  `messages.*` and `stream.json` for `api.anthropic.com` with a subscription token.
-  A template is the whole request head with the Authorization line last; `{token}` is
-  where the pool's bearer token goes, `{body_len}` the body length, `{host}` the
-  server.
+`lembas-mpc/` is a standalone Cargo project on pinned git dependencies: TLSNotary's
+multiplexer and test server, mpz for the zero-knowledge VM and oblivious transfer, iroh
+for the network.
+
+| File | What |
+|---|---|
+| `src/peer.rs` | the peer: iroh endpoint, join / sync / limit / borrow streams, the lending gate, presence, the week's ledger |
+| `src/circle.rs` | the circle: signed memberships and removals, invite links |
+| `src/splice.rs` | the splice's primitives: the keystream proven in zero knowledge, the tag by share conversion, the TLS client |
+| `src/session.rs` | the borrowing protocol: one session, many connections, many requests, one setup |
+| `src/limit.rs` | the limit proof |
+| `src/record.rs` | the TLS 1.2 AES-GCM record layer the borrower runs after the handshake |
+| `src/local.rs` | the borrower's local HTTP proxy |
+| `src/lib.rs` | the template policy and the link plumbing |
+| `src/bin/lembas-mpc.rs` | the `lembas-mpc` binary |
+| `src/main.rs` | the `demo` binary: both sides and an echo server in one process, with checks |
+
+In the code the lender's side of a borrow is called `pool` (`run_pool`, the `pool`
+command below): the side that holds the token.
+
+`requests/` has request templates for the test commands: `echo.*` for tlsn's test
+server, `messages.*` and `stream.json` for `api.anthropic.com`. A template is the whole
+request head with the Authorization line last; `{token}` is where the lender's bearer
+token goes, `{body_len}` the body length, `{host}` the server.
 
 ## Build
 
@@ -32,50 +42,67 @@ cargo build --release
 cargo test --release
 ```
 
-(The earlier versions were a patch on a TLSNotary checkout; `git log -- mpc-tls` has
-them.)
+`./build.sh` at the repo root builds this for both architectures and puts it in the app
+bundle; nothing here needs to be run by hand to use lembas.
 
-## In-process demo
+## Inside lembas
+
+The agent runs one peer per Mac and drives it over JSON lines:
+
+```sh
+lembas-mpc peer --dir <Application Support/lembas/…/peer> --name <you> \
+  --token-file ~/.config/lembas-login.json --control --socket <dir>/sock
+```
+
+`--control` takes commands on stdin (`status`, `found`, `invite`, `join`, `lend`,
+`policy`, `away`, `remove`, `sync`, `report`, `spent`) and answers on stdout, with a
+`status` event every half minute. The socket serves borrowed requests: the agent sends
+each one as plain HTTP and reads the response as Anthropic sent it.
+
+## Two peers by hand
+
+On one Mac, each with a subscription token in `LEMBAS_TOKEN`:
+
+```sh
+./target/release/lembas-mpc peer --dir a --name Alice --found --invite --control
+./target/release/lembas-mpc peer --dir b --name Bob --join lembas://join/… --control --listen 127.0.0.1:8789
+curl http://127.0.0.1:8789/v1/messages …
+```
+
+Alice lends only while away and only to a borrower that proved its limit, so for a
+test on accounts that are not exhausted: send `{"cmd":"away","away":true}` to Alice and
+lower the thresholds with `--borrow-at`, `--away5h` and `--week`. `--no-relay` keeps
+everything on direct addresses.
+
+## The limit proof alone
+
+```sh
+./target/release/lembas-mpc limit-verify                    # the lender's side, on 127.0.0.1:7701
+LEMBAS_TOKEN=… ./target/release/lembas-mpc limit-prove      # the borrower's side
+```
+
+The verifier prints the usage it was shown and the bytes and time per phase.
+
+## The splice alone
+
+`demo` runs a lender, a borrower and tlsn's echo server in one process:
 
 ```sh
 ./target/release/demo                                  # one session, 6 requests, 3 at a time
 ./target/release/demo --requests 60 --concurrency 4 --body 1024
-./target/release/demo --refuse-first 2 --requests 6    # the pool has no lender for the first two
-./target/release/demo --evil-rewrite       # pool edits a header byte: the server rejects the record
-./target/release/demo --evil-server        # pool connects to the wrong server: the borrower refuses
+./target/release/demo --refuse-first 2 --requests 6    # the lender refuses the first two
+./target/release/demo --evil-rewrite       # lender edits a header byte: the server rejects the record
+./target/release/demo --evil-server        # lender connects to the wrong server: the borrower refuses
 ./target/release/demo --bench 64 --bench-batch medium   # only the proofs: memory and bytes per request
 ```
 
-The demo runs the pool, the borrower and tlsn's echo server in one process: one
-session, requests in parallel over connections that are reused (every third request
-asks the server to close, so the next opens a new one), each body echoed back, the
-token never on the pool↔borrower link.
+Requests run in parallel over connections that are reused (every third request asks
+the server to close, so the next opens a new one), each body is echoed back, and the
+token never appears on the link. Typical numbers on one Mac: about 100 ms and 0.9 MB
+each way to set a session up, then 20 ms of proving and a few tens of KB per request.
 
-Typical numbers on one Mac: about 100 ms and 0.9 MB each way to set a session up, then
-20 ms of proving and a few tens of KB per request.
-
-## Chat
-
-```sh
-mpc-tls/chat.sh            # starts a pool with your token from state.json, opens the chat
-```
-
-The conversation is one session; every message you type is one borrowed request on
-it, with the connection reused when the server allows. `lembas-mpc chat --pool
-host:port` talks to a pool you started yourself.
-
-## Inside lembas
-
-`./build.sh` at the repo root builds this helper (both architectures) into the app and
-into `build/lembas-mpc` for the pool; nothing here needs to be run by hand. The pool
-spawns `pool --stdio --control-fd 3` per member session and lends a token per request
-over fd 3; the agent spawns `proxy --stdio --listen 127.0.0.1:0 --port-file …` once and
-sends each request to the local port as plain HTTP. See "In lembas" in
-`../docs/mpc-tls.md`.
-
-## Two processes
-
-Against tlsn's echo server, three terminals:
+As two processes over TCP (for local testing only: the link has no authentication
+here, where a peer's has iroh's), against the echo server:
 
 ```sh
 ./target/release/lembas-mpc fixture --listen 127.0.0.1:7443
@@ -85,23 +112,15 @@ LEMBAS_TOKEN=$(python3 -c "print('x'*108)") ./target/release/lembas-mpc pool \
   --template requests/echo.http --body requests/echo.json --roots fixture
 ```
 
-Against `api.anthropic.com` with a subscription token (`sk-ant-oat01-…`, as stored
-in the pool's ledger):
+or against `api.anthropic.com` with a subscription token:
 
 ```sh
 LEMBAS_TOKEN=… ./target/release/lembas-mpc pool          # defaults: api.anthropic.com
 ./target/release/lembas-mpc borrower --template requests/messages.http --body requests/messages.json
-./target/release/lembas-mpc borrower --template requests/messages.http --body requests/stream.json
+./target/release/lembas-mpc chat                         # a conversation, one borrowed request per message
 ```
 
 The borrower prints the raw HTTP response as it arrives and verifies the server's
-certificate itself (`--roots`, Mozilla's by default). The pool checks the borrower's
-template: the token span must be exactly the value of an `Authorization: Bearer`
-header, the last header line of the whole head, block aligned and sized for the token
-(108 bytes rounded up to 112), `Host` must be the server the pool connects to,
-`Content-Length` is the only framing header; and on each connection a token record
-must begin a fresh request (the first application data, then exactly the body's
-length between records). The pool refuses to lend a credential of any length but 108 bytes, and the
-borrower refuses a pool that announces any other length; see `TOKEN_LEN` in `lib.rs`
-for why. The pool↔borrower stream must run over an authenticated channel in
-production; the TCP port here is for local testing.
+certificate itself (`--roots`, Mozilla's by default). The lender's side checks the
+template and refuses a credential of any length but 108 bytes; see `check_template` and
+`TOKEN_LEN` in `lib.rs`, and "Policy" in the design document.
