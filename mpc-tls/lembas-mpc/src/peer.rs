@@ -20,6 +20,10 @@
 //! Borrowing is the other way round: the local HTTP proxy picks a lender from
 //! the presence it heard, proves its limit to that lender if it has not
 //! lately, and runs the borrower's side of a session over a borrow stream.
+//!
+//! A Mac can be in more than one circle: the one it founded or joined first,
+//! which its invites are to, and any it joined later on a friend's invite.
+//! Lending and borrowing go by being in a circle together, whichever it is.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -46,7 +50,7 @@ use crate::{
     limit::{self, Usage},
     link,
     local::{LocalListener, serve_client_for},
-    session::{Connector, Lease, Session, TokenSource, run_pool},
+    session::{Connector, Lease, RequestRule, Session, TokenSource, run_pool},
 };
 
 /// The protocol every peer speaks.
@@ -65,8 +69,12 @@ pub const PROOF_MAX_SECS: u64 = 6 * 3600;
 const MAX_MESSAGE: usize = 1 << 20;
 /// Ledger entries older than this are dropped; the app shows a week.
 const LEDGER_KEEP_SECS: u64 = 8 * 24 * 3600;
+/// This Mac's own spend is kept per this many seconds.
+const OWN_BUCKET_SECS: u64 = 300;
 /// Most a single borrowed request may be reported to have cost, in dollars.
 const MAX_REPORT_USD: f64 = 10.0;
+/// And one of this Mac's own.
+const MAX_OWN_USD: f64 = 100.0;
 const STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a stream is for: its first byte.
@@ -125,6 +133,16 @@ pub struct LedgerEntry {
     pub borrower: PublicKey,
     pub usd: f64,
     pub model: String,
+}
+
+/// What this Mac's own requests cost, as its agent metered them: dollars per
+/// five minutes. It never leaves this Mac; it is the other half of the
+/// friends' share of a window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OwnSpend {
+    /// When metering began: nothing is known of what was spent before.
+    since: u64,
+    buckets: BTreeMap<u64, f64>,
 }
 
 /// One sync exchange, each way.
@@ -191,6 +209,18 @@ pub struct ApiTarget {
     /// The usage endpoint answers JSON with windows; a test server does not,
     /// and any 200 then passes as a limit.
     pub require_usage: bool,
+    /// The requests this Mac lends its login to; `None` lends to any.
+    pub lendable: Option<RequestRule>,
+}
+
+/// What a friend may borrow a login for: a model call, or the count of its
+/// tokens. The login also opens its owner's profile and usage, and those stay
+/// the owner's.
+pub fn model_request(line: &str) -> bool {
+    let mut parts = line.split(' ');
+    let (Some(method), Some(target)) = (parts.next(), parts.next()) else { return false };
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
+    method == "POST" && matches!(path, "/v1/messages" | "/v1/messages/count_tokens")
 }
 
 impl ApiTarget {
@@ -201,6 +231,7 @@ impl ApiTarget {
             usage_path: limit::USAGE_PATH.into(),
             roots: crate::mozilla_roots(),
             require_usage: true,
+            lendable: Some(model_request),
         }
     }
 }
@@ -230,7 +261,11 @@ pub struct Proof {
 
 #[derive(Default)]
 struct State {
-    circle: Option<Circle>,
+    /// The circles this Mac is in. The first is its own: the one it founded
+    /// or joined first, and the one its invites are to. The others it joined
+    /// later, on an invite from someone in them. The app shows the people of
+    /// all of them as one list.
+    circles: Vec<Circle>,
     settings: Settings,
     /// Invites handed out: secret and expiry.
     invites: Vec<([u8; 16], u64)>,
@@ -241,6 +276,22 @@ struct State {
     proved: BTreeMap<PublicKey, u64>,
     my_usage: Option<(Usage, u64)>,
     ledger: Vec<LedgerEntry>,
+    own: OwnSpend,
+}
+
+impl State {
+    /// Whether `who` is in a circle with this Mac.
+    fn knows(&self, who: &PublicKey) -> bool {
+        self.circles.iter().any(|c| c.is_member(who))
+    }
+
+    fn name_of(&self, who: &PublicKey) -> String {
+        self.circles
+            .iter()
+            .find_map(|c| c.memberships.get(who))
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| who.fmt_short().to_string())
+    }
 }
 
 /// A borrowing session with one lender.
@@ -266,6 +317,7 @@ pub struct Peer {
 pub struct Status {
     pub me: PublicKey,
     pub name: String,
+    /// This Mac's own circle, if it is in any.
     pub circle: Option<CircleId>,
     pub away: bool,
     pub lending: bool,
@@ -276,6 +328,9 @@ pub struct Status {
     pub borrowed_week: f64,
     pub lent_5h: f64,
     pub borrowed_5h: f64,
+    /// The friends' part of each window's utilization, in points (estimate).
+    pub lent_five_hour: Option<f64>,
+    pub lent_seven_day: Option<f64>,
     pub members: Vec<MemberStatus>,
 }
 
@@ -311,13 +366,19 @@ impl Peer {
 
         let mut state = State::default();
         if let Ok(text) = std::fs::read(cfg.dir.join("circle.json")) {
-            state.circle = serde_json::from_slice(&text).ok();
+            state.circles.extend(serde_json::from_slice::<Circle>(&text).ok());
+        }
+        if let Ok(text) = std::fs::read(cfg.dir.join("joined.json")) {
+            state.circles.extend(serde_json::from_slice::<Vec<Circle>>(&text).unwrap_or_default());
         }
         if let Ok(text) = std::fs::read(cfg.dir.join("settings.json")) {
             state.settings = serde_json::from_slice(&text).unwrap_or_default();
         }
         if let Ok(text) = std::fs::read(cfg.dir.join("ledger.json")) {
             state.ledger = serde_json::from_slice(&text).unwrap_or_default();
+        }
+        if let Ok(text) = std::fs::read(cfg.dir.join("own.json")) {
+            state.own = serde_json::from_slice(&text).unwrap_or_default();
         }
         let peer = Arc::new(Self {
             endpoint,
@@ -396,10 +457,20 @@ impl Peer {
     }
 
     fn persist(&self, state: &State) {
-        if let Some(c) = &state.circle
+        if let Some(c) = state.circles.first()
             && let Ok(json) = serde_json::to_vec_pretty(c)
         {
             let _ = std::fs::write(self.cfg.dir.join("circle.json"), json);
+        }
+        // The circles joined later, in a file of their own: `circle.json`
+        // stays what it was before a Mac could be in more than one.
+        let joined = self.cfg.dir.join("joined.json");
+        if state.circles.len() > 1 {
+            if let Ok(json) = serde_json::to_vec_pretty(&state.circles[1..]) {
+                let _ = std::fs::write(joined, json);
+            }
+        } else {
+            let _ = std::fs::remove_file(joined);
         }
         if let Ok(json) = serde_json::to_vec_pretty(&state.settings) {
             let _ = std::fs::write(self.cfg.dir.join("settings.json"), json);
@@ -433,13 +504,56 @@ impl Peer {
         (lent, borrowed, lent_to, borrowed_from)
     }
 
+    /// The agent metered a request on this Mac's own login.
+    pub fn spent(&self, usd: f64) -> Result<()> {
+        ensure!(usd.is_finite() && usd >= 0.0, "a cost in dollars");
+        let t = now();
+        let mut st = self.state.lock().unwrap();
+        if st.own.since == 0 {
+            st.own.since = t;
+        }
+        *st.own.buckets.entry(t - t % OWN_BUCKET_SECS).or_insert(0.0) += usd.min(MAX_OWN_USD);
+        let keep = t.saturating_sub(LEDGER_KEEP_SECS);
+        st.own.buckets.retain(|at, _| *at >= keep);
+        if let Ok(json) = serde_json::to_vec(&st.own) {
+            let _ = std::fs::write(self.cfg.dir.join("own.json"), json);
+        }
+        Ok(())
+    }
+
+    /// The friends' part of a window's utilization, in points: the utilization
+    /// split by dollars, theirs (the ledger) against this Mac's own (its
+    /// agent's meter), since the window began. An estimate. Use outside lembas
+    /// (claude.ai, the desktop app) isn't seen, so it reads high then. Where
+    /// the meter is younger than the window, the split since the meter began
+    /// stands for the whole window; before there is a meter, nothing is known.
+    fn lent_share(state: &State, me: &PublicKey, window: &str, span: u64) -> Option<f64> {
+        let (usage, _) = state.my_usage.as_ref()?;
+        let utilization = *usage.windows.get(window)?;
+        if state.own.since == 0 {
+            return None;
+        }
+        let t = now();
+        let began = match usage.resets_at.get(window).and_then(|s| parse_rfc3339(s)) {
+            Some(resets) if resets > t => resets.saturating_sub(span),
+            _ => t.saturating_sub(span),
+        };
+        let since = began.max(state.own.since);
+        let lent: f64 = state.ledger.iter().filter(|e| e.lender == *me && e.at >= since).map(|e| e.usd).sum();
+        let own: f64 = state.own.buckets.iter().filter(|(at, _)| **at + OWN_BUCKET_SECS > since).map(|(_, usd)| *usd).sum();
+        if lent <= 0.0 {
+            return Some(0.0);
+        }
+        Some((utilization.clamp(0.0, 100.0) * lent / (lent + own) * 10.0).round() / 10.0)
+    }
+
     /// The borrower's agent metered a borrowed request: into the book, and to
     /// the lender on the next sync (started now).
     pub async fn report(self: &Arc<Self>, lender: PublicKey, usd: f64, model: String) -> Result<()> {
         ensure!(usd.is_finite() && (0.0..=MAX_REPORT_USD).contains(&usd), "a cost between 0 and {MAX_REPORT_USD} dollars");
         {
             let mut st = self.state.lock().unwrap();
-            ensure!(st.circle.as_ref().is_some_and(|c| c.is_member(&lender)), "not a member");
+            ensure!(st.knows(&lender), "not a member");
             st.ledger.push(LedgerEntry {
                 id: rand::random(),
                 at: now(),
@@ -464,17 +578,18 @@ impl Peer {
     /// Founds a circle, if this Mac is in none.
     pub fn found(&self) -> Result<CircleId> {
         let mut st = self.state.lock().unwrap();
-        ensure!(st.circle.is_none(), "already in a circle");
+        ensure!(st.circles.is_empty(), "already in a circle");
         let circle = Circle::found(&self.secret, &self.cfg.name)?;
         let id = circle.id;
-        st.circle = Some(circle);
+        st.circles.push(circle);
         self.persist(&st);
         Ok(id)
     }
 
-    /// An invite link; the inviter lends to whoever joins with it.
+    /// An invite link, to this Mac's own circle; the inviter lends to whoever
+    /// joins with it.
     pub async fn invite(&self) -> Result<String> {
-        let circle = self.state.lock().unwrap().circle.as_ref().map(|c| c.id).context("not in a circle")?;
+        let circle = self.state.lock().unwrap().circles.first().map(|c| c.id).context("not in a circle")?;
         if self.cfg.relay {
             let _ = tokio::time::timeout(Duration::from_secs(10), self.endpoint.online()).await;
         }
@@ -493,10 +608,17 @@ impl Peer {
         .to_link())
     }
 
-    /// Joins the circle an invite link points to.
+    /// Joins the circle an invite link points to. A Mac already in a circle
+    /// keeps it and is in both: its people are those of every circle it is
+    /// in, and its own invites stay to its first.
     pub async fn join(self: &Arc<Self>, link: &str) -> Result<()> {
-        ensure!(self.state.lock().unwrap().circle.is_none(), "already in a circle");
         let invite = Invite::from_link(link)?;
+        let me = self.id();
+        ensure!(invite.inviter != me, "that invite is your own");
+        ensure!(
+            !self.state.lock().unwrap().circles.iter().any(|c| c.id == invite.circle && c.is_member(&me)),
+            "already in that circle"
+        );
         let mut addr = EndpointAddr::new(invite.inviter);
         if let Some(relay) = &invite.relay
             && let Ok(url) = relay.parse()
@@ -528,7 +650,13 @@ impl Peer {
                 let circle = Circle::from_state(invite.circle, &state)?;
                 ensure!(circle.is_member(&self.id()), "the inviter's circle does not have us in it");
                 let mut st = self.state.lock().unwrap();
-                st.circle = Some(circle);
+                match st.circles.iter_mut().find(|c| c.id == invite.circle) {
+                    // Invited back after a removal.
+                    Some(have) => {
+                        have.merge(&state);
+                    }
+                    None => st.circles.push(circle),
+                }
                 // Whoever invited us lends to us; we lend back by default.
                 st.settings.lend_to.insert(invite.inviter, true);
                 self.persist(&st);
@@ -559,18 +687,37 @@ impl Peer {
         self.persist(&st);
     }
 
-    /// Removes someone from the circle, as far as this Mac is concerned, and
-    /// tells the others.
+    /// Removes someone from every circle this Mac shares with them, and
+    /// tells the others. Nobody removes a circle's founder: from a circle
+    /// joined on a later invite this Mac takes itself out instead, and
+    /// forgets that circle once the others have been told.
     pub async fn remove(&self, member: PublicKey) -> Result<()> {
+        let me = self.id();
+        ensure!(member != me, "that is this Mac");
+        let mut left = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
-            let circle = st.circle.as_mut().context("not in a circle")?;
-            let removal = Removal::sign(circle.id, &self.secret, member);
-            ensure!(circle.add_removal(&removal), "cannot remove them");
+            let mut removed = false;
+            for (i, circle) in st.circles.iter_mut().enumerate() {
+                if !circle.is_member(&member) {
+                    continue;
+                }
+                if circle.add_removal(&Removal::sign(circle.id, &self.secret, member)) {
+                    removed = true;
+                } else if i > 0 && circle.add_removal(&Removal::sign(circle.id, &self.secret, me)) {
+                    left.push(circle.id);
+                }
+            }
+            ensure!(removed || !left.is_empty(), "cannot remove them");
             st.settings.lend_to.insert(member, false);
             self.persist(&st);
         }
         self.sync_all().await;
+        if !left.is_empty() {
+            let mut st = self.state.lock().unwrap();
+            st.circles.retain(|c| !left.contains(&c.id));
+            self.persist(&st);
+        }
         Ok(())
     }
 
@@ -579,30 +726,29 @@ impl Peer {
         let me = self.id();
         let (lent_week, borrowed_week, lent_to, borrowed_from) = Self::sums(&st, &me, 7 * 24 * 3600);
         let (lent_5h, borrowed_5h, _, _) = Self::sums(&st, &me, 5 * 3600);
+        // The people of every circle, each once.
+        let mut seen = std::collections::BTreeSet::from([me]);
         let members = st
-            .circle
-            .as_ref()
-            .map(|c| {
-                c.members()
-                    .filter(|m| m.member != self.id())
-                    .map(|m| MemberStatus {
-                        id: m.member,
-                        name: m.name.clone(),
-                        lend_to: st.settings.lend_to.get(&m.member).copied(),
-                        lend_while_working: st.settings.lend_while_working.get(&m.member).copied().unwrap_or(false),
-                        presence: st.presence.get(&m.member).cloned(),
-                        proof: st.proofs.get(&m.member).cloned(),
-                        proved_until: st.proved.get(&m.member).copied(),
-                        lent_week: lent_to.get(&m.member).copied().unwrap_or(0.0),
-                        borrowed_week: borrowed_from.get(&m.member).copied().unwrap_or(0.0),
-                    })
-                    .collect()
+            .circles
+            .iter()
+            .flat_map(|c| c.members())
+            .filter(|m| seen.insert(m.member))
+            .map(|m| MemberStatus {
+                id: m.member,
+                name: m.name.clone(),
+                lend_to: st.settings.lend_to.get(&m.member).copied(),
+                lend_while_working: st.settings.lend_while_working.get(&m.member).copied().unwrap_or(false),
+                presence: st.presence.get(&m.member).cloned(),
+                proof: st.proofs.get(&m.member).cloned(),
+                proved_until: st.proved.get(&m.member).copied(),
+                lent_week: lent_to.get(&m.member).copied().unwrap_or(0.0),
+                borrowed_week: borrowed_from.get(&m.member).copied().unwrap_or(0.0),
             })
-            .unwrap_or_default();
+            .collect();
         Status {
             me: self.id(),
             name: self.cfg.name.clone(),
-            circle: st.circle.as_ref().map(|c| c.id),
+            circle: st.circles.first().map(|c| c.id),
             away: st.settings.away,
             lending: self.token().is_some(),
             usage: st.my_usage.as_ref().map(|(u, _)| u.clone()),
@@ -611,6 +757,8 @@ impl Peer {
             borrowed_week,
             lent_5h,
             borrowed_5h,
+            lent_five_hour: Self::lent_share(&st, &me, "five_hour", 5 * 3600),
+            lent_seven_day: Self::lent_share(&st, &me, "seven_day", 7 * 24 * 3600),
             members,
         }
     }
@@ -666,8 +814,7 @@ impl Peer {
     /// Whether to lend to `who` for one request right now.
     fn lending_gate(&self, who: &PublicKey) -> Result<String, String> {
         let st = self.state.lock().unwrap();
-        let circle = st.circle.as_ref().ok_or("not in a circle")?;
-        if !circle.is_member(who) {
+        if !st.knows(who) {
             return Err("not a member".into());
         }
         if !st.settings.lend_to.get(who).copied().unwrap_or(false) {
@@ -716,13 +863,7 @@ impl Peer {
         mut recv: iroh::endpoint::RecvStream,
     ) -> Result<()> {
         let role = Role::from_byte(tokio::time::timeout(STREAM_TIMEOUT, recv.read_u8()).await??)?;
-        let is_member = self
-            .state
-            .lock()
-            .unwrap()
-            .circle
-            .as_ref()
-            .is_some_and(|c| c.is_member(&remote));
+        let is_member = self.state.lock().unwrap().knows(&remote);
         match role {
             Role::Join => {
                 let req: JoinRequest = tokio::time::timeout(STREAM_TIMEOUT, recv_json(&mut recv)).await??;
@@ -798,7 +939,7 @@ impl Peer {
                     })
                 });
                 let connector = tcp_connector(self.cfg.api.server.clone());
-                let stats = run_pool(l.mpc, l.up, l.down, connector, &self.cfg.api.server_name, tokens, None, None).await;
+                let stats = run_pool(l.mpc, l.up, l.down, connector, &self.cfg.api.server_name, tokens, self.cfg.api.lendable, None, None).await;
                 drop(l.session);
                 let _ = l.close.send(());
                 let _ = tokio::time::timeout(Duration::from_secs(5), driver).await;
@@ -818,7 +959,7 @@ impl Peer {
                 reason: "unknown or expired invite".into(),
             };
         };
-        let Some(circle) = st.circle.as_ref() else {
+        let Some(circle) = st.circles.first() else {
             return JoinReply::Refused {
                 reason: "not in a circle".into(),
             };
@@ -837,7 +978,7 @@ impl Peer {
             }
         };
         st.invites.remove(i);
-        let circle = st.circle.as_mut().unwrap();
+        let circle = &mut st.circles[0];
         if !circle.add_membership(&membership) {
             return JoinReply::Refused {
                 reason: "membership not accepted".into(),
@@ -854,8 +995,8 @@ impl Peer {
     /// Merges what a member sent and returns what to send back.
     fn take_sync(&self, remote: PublicKey, theirs: SyncMsg) -> Result<SyncMsg> {
         let mut st = self.state.lock().unwrap();
-        let circle = st.circle.as_mut().context("not in a circle")?;
-        ensure!(circle.id == theirs.circle, "another circle");
+        let circle = st.circles.iter_mut().find(|c| c.id == theirs.circle).context("another circle")?;
+        ensure!(circle.is_member(&remote), "sync from a non-member of that circle");
         let changed = circle.merge(&theirs.state);
         let state = circle.state();
         let id = circle.id;
@@ -913,13 +1054,7 @@ impl Peer {
     }
 
     fn name_of(&self, who: &PublicKey) -> String {
-        self.state
-            .lock()
-            .unwrap()
-            .circle
-            .as_ref()
-            .map(|c| c.name_of(who))
-            .unwrap_or_else(|| who.fmt_short().to_string())
+        self.state.lock().unwrap().name_of(who)
     }
 
     // ---- streams this Mac opens --------------------------------------------
@@ -948,12 +1083,10 @@ impl Peer {
 
     /// Syncs with every member once.
     pub async fn sync_all(&self) {
-        let members: Vec<PublicKey> = {
+        let members: std::collections::BTreeSet<PublicKey> = {
             let st = self.state.lock().unwrap();
-            st.circle
-                .as_ref()
-                .map(|c| c.members().map(|m| m.member).filter(|m| *m != self.id()).collect())
-                .unwrap_or_default()
+            let me = self.id();
+            st.circles.iter().flat_map(|c| c.members()).map(|m| m.member).filter(|m| *m != me).collect()
         };
         for m in members {
             if let Err(e) = self.sync_with(m).await {
@@ -962,10 +1095,24 @@ impl Peer {
         }
     }
 
+    /// Syncs with one member: once for each circle shared with them, since a
+    /// sync carries one circle.
     pub async fn sync_with(&self, member: PublicKey) -> Result<()> {
+        let shared: Vec<CircleId> = {
+            let st = self.state.lock().unwrap();
+            st.circles.iter().filter(|c| c.is_member(&member)).map(|c| c.id).collect()
+        };
+        ensure!(!shared.is_empty(), "no circle shared with them");
+        for circle in shared {
+            self.sync_in(circle, member).await?;
+        }
+        Ok(())
+    }
+
+    async fn sync_in(&self, circle: CircleId, member: PublicKey) -> Result<()> {
         let mine = {
             let st = self.state.lock().unwrap();
-            let circle = st.circle.as_ref().context("not in a circle")?;
+            let circle = st.circles.iter().find(|c| c.id == circle).context("not in that circle")?;
             SyncMsg {
                 circle: circle.id,
                 state: circle.state(),
@@ -1061,7 +1208,7 @@ impl Peer {
                     && p.lending
                     && p.room
                     && p.at + PRESENCE_TTL_SECS > t
-                    && st.circle.as_ref().is_some_and(|c| c.is_member(id))
+                    && st.knows(id)
             })
             .min_by(|(_, a), (_, b)| {
                 a.five_hour
@@ -1274,6 +1421,157 @@ mod tests {
         assert_eq!(parse_rfc3339("nope"), None);
     }
 
+    #[test]
+    fn only_model_requests_are_lendable() {
+        for line in [
+            "POST /v1/messages HTTP/1.1",
+            "POST /v1/messages?beta=true HTTP/1.1",
+            "POST /v1/messages/count_tokens?beta=true HTTP/1.1",
+        ] {
+            assert!(model_request(line), "{line}");
+        }
+        for line in [
+            "GET /api/oauth/profile HTTP/1.1",
+            "GET /api/oauth/usage HTTP/1.1",
+            "GET /v1/messages HTTP/1.1",
+            "POST /v1/messages/batches HTTP/1.1",
+            "POST /v1/files HTTP/1.1",
+            "POST /v1/messages/../../api/oauth/profile HTTP/1.1",
+            "POST /v1/messages%2f..%2f..%2fapi/oauth/profile HTTP/1.1",
+            "POST /v1/messages#/api/oauth/profile HTTP/1.1",
+            "POST https://api.anthropic.com/v1/messages HTTP/1.1",
+            "POST //v1/messages HTTP/1.1",
+            "post /v1/messages HTTP/1.1",
+            "",
+        ] {
+            assert!(!model_request(line), "{line}");
+        }
+    }
+
+    /// A window's utilization splits by dollars: the friends' against this
+    /// Mac's own, since the window or the meter began, whichever is later.
+    #[test]
+    fn friends_share_of_a_window() {
+        let key = |n: u8| SecretKey::from_bytes(&[n; 32]).public();
+        let (me, friend) = (key(1), key(2));
+        let t = now();
+        let lent = |at: u64, usd: f64| LedgerEntry { id: at, at, lender: me, borrower: friend, usd, model: String::new() };
+        let mut st = State::default();
+        st.my_usage = Some((
+            Usage {
+                windows: BTreeMap::from([("five_hour".into(), 40.0), ("seven_day".into(), 10.0)]),
+                resets_at: BTreeMap::new(),
+                locked: false,
+            },
+            t,
+        ));
+        st.ledger = vec![lent(t - 600, 1.0)];
+        let share = |st: &State, w: &str, span: u64| Peer::lent_share(st, &me, w, span);
+        // No meter yet: unknown, not "all of it".
+        assert_eq!(share(&st, "five_hour", 5 * 3600), None);
+        // $1 theirs against $3 mine: a quarter of each window.
+        st.own = OwnSpend { since: t - 8 * 24 * 3600, buckets: BTreeMap::from([(t - t % OWN_BUCKET_SECS, 3.0)]) };
+        assert_eq!(share(&st, "five_hour", 5 * 3600), Some(10.0));
+        assert_eq!(share(&st, "seven_day", 7 * 24 * 3600), Some(2.5));
+        // Lending the other way and before the window don't count.
+        st.ledger.push(LedgerEntry { id: 2, at: t - 60, lender: friend, borrower: me, usd: 9.0, model: String::new() });
+        st.ledger.push(lent(t - 6 * 3600, 2.0));
+        assert_eq!(share(&st, "five_hour", 5 * 3600), Some(10.0));
+        assert_eq!(share(&st, "seven_day", 7 * 24 * 3600), Some(5.0));
+        // A window that began an hour ago, by its reset time: the loan before it is out.
+        st.ledger = vec![lent(t - 2 * 3600, 1.0)];
+        let usage = &mut st.my_usage.as_mut().unwrap().0;
+        usage.resets_at.insert("five_hour".into(), "2999-01-01T00:00:00Z".into());
+        let resets = parse_rfc3339("2999-01-01T00:00:00Z").unwrap();
+        assert_eq!(Peer::lent_share(&st, &me, "five_hour", resets - (t - 3600)), Some(0.0));
+        // A meter younger than the window: only what it saw is split.
+        st.own.since = t - 3600;
+        assert_eq!(share(&st, "seven_day", 7 * 24 * 3600), Some(0.0));
+        // No such window.
+        assert_eq!(share(&st, "seven_day_opus", 7 * 24 * 3600), None);
+    }
+
+    /// Someone already in a circle takes an invite to another: Bob, in
+    /// Alice's, joins Carol's too. He has the people of both, his own invites
+    /// stay to the first, and removing Carol, whose circle it is, takes him
+    /// out of it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mac_in_two_circles() {
+        let api = ApiTarget {
+            server: "127.0.0.1:1".into(),
+            server_name: "localhost".into(),
+            usage_path: "/".into(),
+            roots: crate::fixture_roots().unwrap(),
+            require_usage: false,
+            lendable: None,
+        };
+        let tmp = std::env::temp_dir().join(format!("lembas-circles-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mk = |who: &str| PeerConfig {
+            dir: tmp.join(who),
+            name: who.to_string(),
+            token: None,
+            token_file: None,
+            api: api.clone(),
+            relay: false,
+            bind: Some("127.0.0.1:0".parse().unwrap()),
+        };
+        let alice = Peer::start(mk("Alice")).await.unwrap();
+        let bob = Peer::start(mk("Bob")).await.unwrap();
+        let carol = Peer::start(mk("Carol")).await.unwrap();
+        let names = |p: &Peer| p.status().members.iter().map(|m| m.name.clone()).collect::<Vec<_>>();
+        let first = alice.found().unwrap();
+        bob.join(&alice.invite().await.unwrap()).await.unwrap();
+        let second = carol.found().unwrap();
+        assert!(bob.found().is_err(), "one circle of one's own");
+
+        bob.join(&carol.invite().await.unwrap()).await.unwrap();
+        assert_eq!(names(&bob), ["Alice", "Carol"]);
+        assert_eq!(names(&alice), ["Bob"]);
+        assert_eq!(names(&carol), ["Bob"]);
+        assert!(carol.status().members.iter().all(|m| m.lend_to == Some(true)));
+        assert!(bob.status().members.iter().all(|m| m.lend_to == Some(true)));
+        // Each side takes him for a member, and they stay strangers.
+        assert!(alice.lending_gate(&bob.id()).unwrap_err().contains("prove your limit"));
+        assert!(carol.lending_gate(&bob.id()).unwrap_err().contains("prove your limit"));
+        assert!(alice.lending_gate(&carol.id()).unwrap_err().contains("not a member"));
+        bob.sync_with(alice.id()).await.unwrap();
+        bob.sync_with(carol.id()).await.unwrap();
+        assert!(alice.sync_with(carol.id()).await.is_err());
+
+        // His own circle is still the first, and what he invites to.
+        assert_eq!(bob.status().circle, Some(first));
+        assert_eq!(Invite::from_link(&bob.invite().await.unwrap()).unwrap().circle, first);
+        // An invite to a circle he is in is not spent.
+        let again = carol.invite().await.unwrap();
+        let err = bob.join(&again).await.unwrap_err();
+        assert!(format!("{err:#}").contains("already in that circle"), "{err:#}");
+        assert!(bob.join(&bob.invite().await.unwrap()).await.is_err(), "his own invite");
+
+        // On disk: the first where it always was, the rest beside it.
+        let read = |file: &str| std::fs::read(tmp.join("Bob").join(file));
+        assert_eq!(serde_json::from_slice::<Circle>(&read("circle.json").unwrap()).unwrap().id, first);
+        let joined: Vec<Circle> = serde_json::from_slice(&read("joined.json").unwrap()).unwrap();
+        assert_eq!(joined.iter().map(|c| c.id).collect::<Vec<_>>(), [second]);
+
+        // Nobody removes a founder, so removing Carol is leaving her circle;
+        // Alice, the founder of his own, stays.
+        bob.remove(carol.id()).await.unwrap();
+        assert_eq!(names(&bob), ["Alice"]);
+        assert!(names(&carol).is_empty());
+        assert!(read("joined.json").is_err());
+        assert!(carol.lending_gate(&bob.id()).unwrap_err().contains("not a member"));
+        assert!(bob.remove(alice.id()).await.is_err());
+        assert_eq!(names(&bob), ["Alice"]);
+
+        // And Carol can have him back.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        bob.join(&again).await.unwrap();
+        assert_eq!(names(&bob), ["Alice", "Carol"]);
+        assert_eq!(names(&carol), ["Bob"]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// Two Macs on one machine: Alice founds a circle and invites Bob; Bob
     /// joins, proves his limit to Alice and borrows from her, all over iroh
     /// with the test server standing in for the API.
@@ -1295,6 +1593,7 @@ mod tests {
             usage_path: "/".into(),
             roots: crate::fixture_roots().unwrap(),
             require_usage: false,
+            lendable: Some(|line| line.starts_with("POST /echo ")),
         };
         let tmp = std::env::temp_dir().join(format!("lembas-peer-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1336,6 +1635,19 @@ mod tests {
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("hello"), "{text}");
         assert!(!text.contains(&token));
+
+        // Alice lends her login to /echo and nothing else it opens: refused,
+        // and the session carries on.
+        for line in ["GET /echo", "POST /", "POST /echo/../profile"] {
+            let other = template.replace("POST /echo", line);
+            let mut out = Vec::new();
+            let err = session.request(&other, b"hello".to_vec(), &mut out, |_| {}).await.unwrap_err();
+            assert!(format!("{err:#}").contains("only model requests"), "{line}: {err:#}");
+            assert!(out.is_empty(), "{line}");
+        }
+        let mut out = Vec::new();
+        let response = session.request(template, b"still".to_vec(), &mut out, |_| {}).await.unwrap();
+        assert_eq!(response.status, Some(200));
 
         // Alice stops lending to Bob: refused again, on the same session.
         alice.set_lend(bob.id(), false, false);

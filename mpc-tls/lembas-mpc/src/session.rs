@@ -176,6 +176,11 @@ pub struct Lease {
 pub type TokenSource =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Option<Lease>>> + Send>> + Send + Sync>;
 
+/// Which requests the pool lends its token to, by request line (`POST
+/// /v1/messages HTTP/1.1`). The borrower writes that line, and the token
+/// opens more than model calls.
+pub type RequestRule = fn(&str) -> bool;
+
 /// A token source lending the same credential to every request.
 pub fn fixed_token(token: String) -> TokenSource {
     let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -445,6 +450,7 @@ pub async fn run_pool<S>(
     connect: Connector<S>,
     server_name: &str,
     tokens: TokenSource,
+    lendable: Option<RequestRule>,
     on_spliced: Option<OnSpliced>,
     tamper: Tamper,
 ) -> Result<PoolStats>
@@ -688,6 +694,15 @@ where
                         check_template(&header, TOKEN_LEN, &server_name).context("borrower's header rejected")?;
                         let body_len = check_trailer(&header, &[]).context("borrower's header rejected")?;
                         c.gate.accept_splice(seq, &nonce)?;
+                        // Refused like a request nobody will lend to: the
+                        // session goes on.
+                        let line = header.template.split(|b| *b == b'\r').next().and_then(|l| std::str::from_utf8(l).ok());
+                        let lease: Pin<Box<dyn Future<Output = Result<Option<Lease>>> + Send>> =
+                            if lendable.is_none_or(|rule| line.is_some_and(rule)) {
+                                tokens()
+                            } else {
+                                Box::pin(async { Err(anyhow::anyhow!("only model requests can be borrowed")) })
+                            };
                         let (tag_tx, tag_rx) = oneshot::channel();
                         c.pending_tag = Some(tag_tx);
                         jobs_tx
@@ -697,7 +712,7 @@ where
                                 seq,
                                 nonce,
                                 request_len: body_len,
-                                lease: tokens(),
+                                lease,
                                 tag_rx,
                                 conn_state: (c.to_server.clone(), c.pending.clone()),
                             })

@@ -189,6 +189,9 @@ final class Store: ObservableObject {
 
   @Published var saveError: String?
   @Published var canInvite = false
+  // Accept an Invite, once in a circle: whether the page is up, and what is in its field.
+  @Published var accepting = false
+  @Published var acceptInvite = ""
 
   private var refreshing = false
   private var refreshAgain = false
@@ -249,15 +252,17 @@ final class Store: ObservableObject {
   }
 
   // lembas://join?invite=<link> from an invite page. Any website can open such a link,
-  // so it only fills in the code: the person still sees which pool it is and presses
-  // Join. Ignored while already in a pool.
+  // so it only fills in the code: the person still presses Join. Already in a circle,
+  // it fills in Accept an Invite instead.
   func handleInviteLink(_ url: URL) {
     guard url.scheme == "lembas", url.host == "join" else { return }
     let invite = url.path.count > 1 ? url.absoluteString
       : URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "invite" })?.value
     guard let invite else { return }
     guard config == nil || !inCircle else {
-      saveError = "You're already in a circle. Leave it first to join another."
+      acceptInvite = invite
+      accepting = true
+      SetupWindow.show()
       return
     }
     setupInvite = invite
@@ -265,10 +270,53 @@ final class Store: ObservableObject {
     SetupWindow.show()
   }
 
-  // The invite link in a pasted message, if any.
-  var inviteLink: String? {
-    setupInvite.split(whereSeparator: \.isWhitespace).map(String.init).last { $0.hasPrefix("lembas://join/") }
+  // An invite from someone else, taken while already in a circle: this Mac joins theirs
+  // too and keeps its own. The people of both show as one list; its own invites stay to
+  // the circle it had first.
+  func accept() async throws {
+    guard let link = Self.inviteLink(in: acceptInvite) else { return }
+    _ = try await command(["cmd": "join", "link": link])
+    acceptInvite = ""
+    await refresh()
   }
+
+  // An invite as the peer makes and reads it, and the page people open it on
+  // (site/join.html): the same payload in the page's fragment, which a browser never
+  // sends, so whoever hosts the page doesn't see invites.
+  nonisolated static let invitePrefix = "lembas://join/"
+  nonisolated static let invitePage = "https://bodino.github.io/lembas/join"
+
+  // The link to send: the invite page carrying the peer's link, and the inviter's name
+  // for the page's greeting (the app never reads the name back).
+  nonisolated static func webInvite(_ link: String, from name: String?) -> String {
+    guard link.hasPrefix(invitePrefix) else { return link }
+    var page = invitePage + "#invite=" + link.dropFirst(invitePrefix.count)
+    let plain = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+    if let name, !name.isEmpty, let encoded = prettyName(name).addingPercentEncoding(withAllowedCharacters: plain) {
+      page += "&from=" + encoded
+    }
+    return page
+  }
+
+  // The peer's link in one pasted word: the word itself, or the one an invite page's
+  // link carries. Read from the text alone; the page is never fetched.
+  nonisolated static func appInvite(_ word: String) -> String? {
+    if word.hasPrefix(invitePrefix) { return word }
+    let parts = word.split(separator: "#", maxSplits: 1)
+    guard word.hasPrefix("https://"), parts.count == 2,
+          let payload = parts[1].split(separator: "&").first(where: { $0.hasPrefix("invite=") })?.dropFirst("invite=".count),
+          !payload.isEmpty,
+          payload.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") })
+    else { return nil }
+    return invitePrefix + payload
+  }
+
+  // The invite link in a pasted message, if any.
+  nonisolated static func inviteLink(in text: String) -> String? {
+    text.split(whereSeparator: \.isWhitespace).reversed().lazy.compactMap { appInvite(String($0)) }.first
+  }
+
+  var inviteLink: String? { Self.inviteLink(in: setupInvite) }
 
   var inviteSummary: String? { inviteLink == nil ? nil : "An invite to a friend's circle" }
 
@@ -415,8 +463,8 @@ final class Store: ObservableObject {
         utilizationFiveHour = nil
         utilizationSevenDay = nil
       }
-      lentFiveHour = nil
-      lentSevenDay = nil
+      lentFiveHour = (st["lent_five_hour"] as? NSNumber)?.doubleValue
+      lentSevenDay = (st["lent_seven_day"] as? NSNumber)?.doubleValue
       borrowedWeekTotal = number(st["lent_week"])
       borrowed5h = number(st["lent_5h"])
       borrowedByMeWeekTotal = number(st["borrowed_week"])
@@ -860,12 +908,12 @@ final class Store: ObservableObject {
     }
   }
 
-  // Anyone in the circle: a one-time link to send. Whoever joins with it is lent to
-  // by this Mac from the start; everyone else decides for themselves.
+  // Anyone in the circle: a one-time link to send, as its invite page. Whoever joins
+  // with it is lent to by this Mac from the start; everyone else decides for themselves.
   func invite() async throws -> String {
     let obj = try await command(["cmd": "invite"]) as? [String: Any]
     await refresh()
-    return obj?["link"] as? String ?? ""
+    return Self.webInvite(obj?["link"] as? String ?? "", from: me)
   }
 
   // Keeps the numbers current while the app runs; also retries an unreachable pool.
@@ -890,7 +938,7 @@ struct SetupView: View {
       PopoverHeader()
       Spacer(minLength: 12)
       Hero(icon: "person.2.fill", title: "Your circle",
-           subtitle: "Friends whose Macs back each other up. Paste an invite, or start a circle of your own.")
+           subtitle: "Friends who share unused Claude quota. Paste an invite, or start a circle of your own.")
 
       TextField("Your name", text: $store.setupName)
         .textFieldStyle(.plain)
@@ -1193,6 +1241,7 @@ struct UsageBar: View {
   let percent: Double?
   var lent: Double? = nil // the part of `percent` friends used, drawn in its own color
   var labelWidth: CGFloat = 34
+
   var body: some View {
     HStack(spacing: 8) {
       Text(label)
@@ -1362,7 +1411,7 @@ struct PersonDetail: View {
           .controlSize(.large)
         } else {
           Button { confirmingRemove = true } label: {
-            Label("Remove from Circle", systemImage: "person.badge.minus")
+            Label("Remove Friend", systemImage: "person.badge.minus")
               .font(Typography.title)
               .foregroundStyle(.red)
               .frame(maxWidth: .infinity)
@@ -1412,36 +1461,6 @@ struct InviteView: View {
         }
       }
 
-      ZStack {
-        if let code {
-          Text(code)
-            .font(Typography.body.monospaced())
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .textSelection(.enabled)
-            .padding(.horizontal, Spacing.card)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .transition(.opacity)
-        } else {
-          Text("Nobody joins until they use it.")
-            .font(Typography.caption)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, Spacing.card)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .transition(.opacity)
-        }
-      }
-      .frame(height: 38)
-      .background(InputBackground())
-      .padding(.top, Spacing.section)
-
-      MessageSlot {
-        if let error, code == nil {
-          Text(error).font(Typography.caption).foregroundStyle(.orange).lineLimit(2).transition(.opacity)
-        }
-      }
-      .padding(.top, 6)
-
       Button {
         if let code { copy(code) } else { create() }
       } label: {
@@ -1456,6 +1475,32 @@ struct InviteView: View {
       .controlSize(.large)
       .tint(accent)
       .disabled(code == nil && working)
+      .padding(.top, Spacing.section)
+
+      // Under the button, so nothing sits empty between the text and the button: the
+      // link once there is one, or why there isn't. The room is always kept.
+      ZStack {
+        if let code {
+          Text(code)
+            .font(Typography.body.monospaced())
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .textSelection(.enabled)
+            .padding(.horizontal, Spacing.card)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .transition(.opacity)
+        } else if let error {
+          Text(error)
+            .font(Typography.caption)
+            .foregroundStyle(.orange)
+            .multilineTextAlignment(.center)
+            .lineLimit(2)
+            .transition(.opacity)
+        }
+      }
+      .frame(height: 38)
+      .frame(maxWidth: .infinity)
+      .background(InputBackground().opacity(code == nil ? 0 : 1))
       .padding(.top, 10)
 
       Spacer(minLength: 8)
@@ -1491,6 +1536,90 @@ struct InviteView: View {
     Task {
       do { code = try await store.invite() }
       catch { self.error = error.localizedDescription }
+      working = false
+    }
+  }
+}
+
+// An invite from someone else, once this Mac is in a circle: paste it and join theirs
+// too. Laid out like InviteView.
+struct AcceptInviteView: View {
+  @EnvironmentObject var store: Store
+  let back: () -> Void
+  @State private var error: String?
+  @State private var working = false
+  @FocusState private var focused: Bool
+
+  private var hasLink: Bool { Store.inviteLink(in: store.acceptInvite) != nil }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      BackHeader(title: "", back: back)
+      Spacer(minLength: 8)
+      Hero(icon: "envelope.open", title: "Accept an invite",
+           subtitle: "Paste a friend's link. You two lend to each other, and you keep the people you have.")
+
+      TextField("Invite link", text: $store.acceptInvite)
+        .textFieldStyle(.plain)
+        .font(Typography.body)
+        .padding(.horizontal, Spacing.card)
+        .frame(height: 38)
+        .background(InputBackground())
+        .focused($focused)
+        .disabled(working)
+        .onSubmit(join)
+        .padding(.top, Spacing.section)
+
+      Button(action: join) {
+        Text(working ? "Joining…" : "Join").frame(maxWidth: .infinity)
+      }
+      .buttonStyle(.borderedProminent)
+      .controlSize(.large)
+      .tint(accent)
+      .disabled(!hasLink || working)
+      .padding(.top, 10)
+
+      // Progress and errors go under the button, so the field and the button sit together.
+      MessageSlot(alignment: .top) {
+        if working {
+          HStack(spacing: 6) {
+            ProgressView().controlSize(.small)
+            Text("Reaching their Mac…").font(Typography.caption).foregroundStyle(.secondary)
+          }
+          .transition(.opacity)
+        } else if let error {
+          Text(error)
+            .font(Typography.caption)
+            .foregroundStyle(.orange)
+            .multilineTextAlignment(.center)
+            .lineLimit(2)
+            .transition(.opacity)
+        }
+      }
+      .padding(.top, 8)
+
+      Spacer(minLength: 8)
+    }
+    .padding(.horizontal, Spacing.edge)
+    .padding(.bottom, 10)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .animation(.easeInOut(duration: 0.15), value: working)
+    .animation(.easeInOut(duration: 0.15), value: error)
+    .onAppear { focused = true }
+    .onChange(of: store.acceptInvite) { error = nil }
+  }
+
+  private func join() {
+    guard hasLink, !working else { return }
+    working = true
+    error = nil
+    Task {
+      do {
+        try await store.accept()
+        back()
+      } catch {
+        self.error = error.localizedDescription
+      }
       working = false
     }
   }
@@ -1703,8 +1832,8 @@ struct LeaveView: View {
     VStack(spacing: 0) {
       BackHeader(title: "", back: back)
       Spacer(minLength: 8)
-      Hero(icon: "rectangle.portrait.and.arrow.right", title: "Leave this circle?",
-           subtitle: "Your Mac stops lending and borrowing, forgets the circle and its key, and Claude Code goes back to using only your own account.")
+      Hero(icon: "arrow.counterclockwise", title: "Reset lembas?",
+           subtitle: "Lending and borrowing stop and your friends are forgotten. Claude Code uses your account.")
       MessageSlot(alignment: .top) {
         if let error = store.saveError {
           Text(error)
@@ -1720,7 +1849,7 @@ struct LeaveView: View {
       Button(role: .destructive) {
         Task { if !(await store.leavePool()) { return } }
       } label: {
-        Text(store.busy ? "Leaving…" : "Leave Circle").frame(maxWidth: .infinity)
+        Text(store.busy ? "Resetting…" : "Reset lembas").frame(maxWidth: .infinity)
       }
       .buttonStyle(.borderedProminent)
       .controlSize(.large)
@@ -1745,7 +1874,7 @@ struct MainView: View {
   @State private var awaySettings = false
   @State private var leaving = false
 
-  private var onHome: Bool { selected == nil && !inviting && !awaySettings && !leaving }
+  private var onHome: Bool { selected == nil && !inviting && !store.accepting && !awaySettings && !leaving }
 
   private func go(_ change: () -> Void) {
     withAnimation(.easeInOut(duration: 0.2), change)
@@ -1772,6 +1901,11 @@ struct MainView: View {
           )
           .padding(.vertical, Spacing.page)
           .transition(.move(edge: .trailing).combined(with: .opacity))
+        } else if store.accepting {
+          // Before the other pages: a link opened from a browser lands here.
+          AcceptInviteView(back: { go { store.accepting = false } })
+            .padding(.vertical, Spacing.page)
+            .transition(.move(edge: .trailing).combined(with: .opacity))
         } else if inviting {
           InviteView(back: { go { inviting = false } })
             .padding(.vertical, Spacing.page)
@@ -1829,15 +1963,12 @@ struct MainView: View {
               }
             }
             if store.canInvite {
-              HoverRow(action: { go { inviting = true } }) {
-                HStack(spacing: 10) {
-                  Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(accent)
-                    .frame(width: 28, height: 28)
-                    .background(Circle().fill(.quaternary))
-                  Text("Invite a friend…").font(Typography.title)
-                }
+              // Both ways in, side by side. The rows' own margins would leave a wide
+              // gap between the two, so they overlap a little; the labels are short
+              // enough for half the popover each.
+              HStack(spacing: -6) {
+                inviteAction("plus", "Invite friend") { inviting = true }
+                inviteAction("envelope.open", "Accept invite") { store.accepting = true }
               }
             }
           }
@@ -1860,6 +1991,19 @@ struct MainView: View {
       }
     }
     .padding(.vertical, 10)
+  }
+
+  private func inviteAction(_ icon: String, _ title: String, open: @escaping () -> Void) -> some View {
+    HoverRow(action: { go(open) }) {
+      HStack(spacing: 8) {
+        Image(systemName: icon)
+          .font(.system(size: 12, weight: .semibold))
+          .foregroundStyle(accent)
+          .frame(width: 28, height: 28)
+          .background(Circle().fill(.quaternary))
+        Text(title).font(Typography.title).lineLimit(1)
+      }
+    }
   }
 
   // Away switch ("I'm done for today" / "I'm back"; also turns on by itself when idle),
@@ -1929,7 +2073,7 @@ struct MainView: View {
         Button("Check for Updates…") { Task { await store.checkForUpdate(force: true) } }
         Text("Version \(Store.currentVersion) (\(Store.currentBuild))")
         Divider()
-        Button("Leave Circle…") { go { leaving = true } }
+        Button("Reset lembas…") { go { leaving = true } }
         Button("Quit lembas") { NSApp.terminate(nil) }
           .keyboardShortcut("q")
       } label: {
@@ -2272,7 +2416,7 @@ struct MenuBarHintView: View {
       Text("lembas is in your menu bar")
         .font(Typography.title)
         .padding(.top, Spacing.section)
-      Text(store.setupInvite.isEmpty ? "Click it to join your pool." : "Click it to join — your invite is filled in.")
+      Text(store.setupInvite.isEmpty && !store.accepting ? "Click it to join your pool." : "Click it to join — your invite is filled in.")
         .font(Typography.body)
         .foregroundStyle(.secondary)
         .multilineTextAlignment(.center)

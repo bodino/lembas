@@ -19,7 +19,7 @@
 //! with the other members of a circle directly over iroh (QUIC with hole
 //! punching, a relay when that fails). With `--control` it takes JSON lines
 //! on stdin (`{"cmd":"status"}`, `invite`, `join`, `lend`, `away`, `remove`,
-//! `sync`) and answers on stdout, one line each, plus a `status` event every
+//! `sync`, `report`, `spent`) and answers on stdout, one line each, plus a `status` event every
 //! half minute; the local port or socket serves borrowed requests as `proxy`
 //! does.
 //!
@@ -441,6 +441,8 @@ async fn run() -> Result<()> {
                     usage_path: if fixture { "/".into() } else { USAGE_PATH.into() },
                     roots: roots.store()?,
                     require_usage: !fixture,
+                    // A test server has no model endpoint to keep to.
+                    lendable: if fixture { None } else { Some(lembas_mpc::peer::model_request) },
                 },
                 relay: !no_relay,
                 bind,
@@ -745,6 +747,8 @@ enum PeerCmd {
         #[serde(default)]
         model: String,
     },
+    /// What a request on this Mac's own login cost, from its agent.
+    Spent { usd: f64 },
     Policy {
         away5h: f64,
         week: f64,
@@ -822,6 +826,10 @@ async fn run_cmd(peer: &Arc<Peer>, cmd: PeerCmd) -> Result<serde_json::Value> {
         }
         PeerCmd::Report { lender, usd, model } => {
             peer.report(member(&lender)?, usd, model).await?;
+            serde_json::Value::Null
+        }
+        PeerCmd::Spent { usd } => {
+            peer.spent(usd)?;
             serde_json::Value::Null
         }
         PeerCmd::Policy { away5h, week, borrow_at, away_after_minutes } => {
@@ -1052,7 +1060,7 @@ where
     let started = Instant::now();
     let link = link(io)?;
     let driver = tokio::spawn(link.driver);
-    let stats = run_pool(link.mpc, link.up, link.down, connector, server_name, tokens, on_spliced, None).await;
+    let stats = run_pool(link.mpc, link.up, link.down, connector, server_name, tokens, None, on_spliced, None).await;
     info!("pool: closing the link");
     drop(link.session);
     let _ = link.close.send(());

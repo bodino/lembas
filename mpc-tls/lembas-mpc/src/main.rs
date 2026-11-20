@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
         announced_server,
         refusing_first(args.refuse_first, fixed_token(TOKEN.to_string())),
         None,
+        None,
         tamper,
     );
     let borrower = async {

@@ -219,10 +219,12 @@ final class Agent {
       if usePool, req.path.hasPrefix("/v1/"), await autoAway.back() { await setAway(false) }
 
       // The native login recently hit a real usage limit: go straight to the pool until
-      // the lock expires, then probe direct again. Only inference calls borrow — Claude
-      // Code's /api/* account and usage screens always reflect the member's own login.
+      // the lock expires, then probe direct again. Only model calls borrow — Claude
+      // Code's /api/* account and usage screens always reflect the member's own login,
+      // and a lender's Mac refuses its login to anything else.
       let limited = forcePool || currentConfig()?.pretendLimited == true ? true : await directLock.active
-      if usePool, limited, req.path.hasPrefix("/v1/") {
+      let borrowable = usePool && lendable(req)
+      if borrowable, limited {
         if await tryPool(req, out) { return }
       }
 
@@ -234,7 +236,10 @@ final class Agent {
       if upstream.statusCode != 429 {
         let tap = UsageTap(contentType: upstream.value(forHTTPHeaderField: "content-type"))
         await relay(bytes, upstream, out, tap: tap)
-        _ = (model, tap.finish())
+        // What it cost, for the peer on this Mac and no further: against what friends
+        // borrowed, it says how much of each window was theirs.
+        let usd = costUsd(model: model, usage: tap.finish())
+        if usd > 0, let peer { Task { _ = try? await peer.command(["cmd": "spent", "usd": usd]) } }
         return
       }
 
@@ -246,7 +251,7 @@ final class Agent {
         return await sendFixed(out, upstream, body) // transient rate limit: Claude Code retries direct
       }
 
-      if usePool {
+      if borrowable {
         let seconds = retryAfterSeconds(upstream) ?? defaultLimitSeconds
         log("native login hit a usage limit; borrowing from the circle for \(Int(seconds))s")
         await directLock.lock(for: seconds)
@@ -401,6 +406,13 @@ actor AutoAway {
   func manual() { byAgent = false }
 }
 
+// What a lender lends its login to (model_request in the helper's peer.rs): a model
+// call, or the count of its tokens.
+func lendable(_ req: HTTPRequest) -> Bool {
+  let path = req.path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? req.path
+  return req.method == "POST" && (path == "/v1/messages" || path == "/v1/messages/count_tokens")
+}
+
 func modelName(_ body: Data) -> String? {
   guard !body.isEmpty, let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
   return object["model"] as? String
@@ -441,7 +453,7 @@ func retryAfterSeconds(_ response: HTTPURLResponse) -> Double? {
   return seconds > 0 ? min(seconds, maxLimitSeconds) : nil
 }
 
-// ---------- local metering: prompts stay here, only USD reaches the pool ----------
+// ---------- local metering: prompts stay here, only USD reaches the peer ----------
 
 // USD per million tokens, most specific prefix first.
 let prices: [(prefix: String, input: Double, output: Double, cacheRead: Double)] = [
