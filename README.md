@@ -4,11 +4,6 @@ Friends back up each other's Claude subscriptions. When you hit your Claude Code
 usage limit, lembas retries on a friend's spare capacity, and when you log off for the
 day, your unused capacity can help them.
 
-> ⚠️ **Read this first.** lembas works by letting a friend's request run on your
-> Claude account, and yours on theirs. That is account sharing and is **not permitted
-> by Anthropic's terms of service**: accounts doing it can be rate-limited or banned.
-> Use it at your own risk.
-
 There is no server. Each person's Mac lends to the others directly, in a **circle**:
 your login never leaves your Mac, a friend's request reaches Anthropic through your Mac
 without your Mac being able to read it, and your friend never sees your login.
@@ -190,6 +185,12 @@ builds, waits for approval, signs and publishes; apps pick it up within a minute
   Claude Code retries; only real usage-limit responses move a request to a friend.
 - The agent serves only Claude Code on this Mac, and only model requests are ever
   borrowed: Claude Code's account and usage screens always show your own login.
+
+## Anthropic's terms
+
+lembas works by letting a friend's request run on your Claude account, and yours on
+theirs. That is account sharing and is **not permitted by Anthropic's terms of
+service**: accounts doing it can be rate-limited or banned. Use it at your own risk.
 
 ## License
 
